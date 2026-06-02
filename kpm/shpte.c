@@ -17,12 +17,19 @@
  * resolved once at arm time and cached, so the handler does no page-table walk /
  * locking -- just a u64 write + TLB flush.
  *
+ *   P2.2  redirect: keep UXN set and reroute the faulting PC to the same offset
+ *         in a userspace clone page (a verbatim copy of the page-isolated,
+ *         PC-relative-free target function). The target's .text is never
+ *         modified (CRC-clean) and no extra executable VMA appears at the
+ *         function's address -- the article's no-trace execute redirect.
+ *
  * Commands (shctl <key> control shpte "<cmd> ..."):
- *   probe                 - resolve kernel symbols, report them
- *   pte  <pid> <hexaddr>  - read + decode the leaf PTE for VA addr in pid
- *   arm  <pid> <hexaddr>  - hook do_page_fault + set UXN on addr's page (self-heal)
- *   disarm                - clear UXN + unhook do_page_fault
- *   dump                  - armed state, target, fault count, live PTE value
+ *   probe                          - resolve kernel symbols, report them
+ *   pte  <pid> <hexaddr>           - read + decode the leaf PTE for VA addr in pid
+ *   arm  <pid> <hexaddr>           - hook do_page_fault + UXN on addr's page (self-heal)
+ *   redirect <pid> <addr> <clone>  - same, but reroute faults into the clone page
+ *   disarm                         - clear UXN + unhook do_page_fault
+ *   dump                           - armed state, mode, target, fault/redirect counts
  *
  * Clean-room: KernelPatch kpm SDK only. PoC: leaks a task ref per arm/pte.
  */
@@ -35,13 +42,14 @@
 #include <hook.h>
 #include <pgtable.h>
 #include <asm/current.h>
+#include <asm/ptrace.h>
 #include <stdint.h>
 
 KPM_NAME("shpte");
-KPM_VERSION("0.2.0");
+KPM_VERSION("0.3.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("stealth-poc");
-KPM_DESCRIPTION("P2: PTE read + UXN net via do_page_fault (P2.1 self-heal)");
+KPM_DESCRIPTION("P2: UXN net via do_page_fault (P2.1 self-heal + P2.2 clone redirect)");
 
 enum { PIDTYPE_PID = 0, PIDTYPE_TGID = 1 };
 
@@ -54,13 +62,17 @@ static int (*fn_task_pid_nr_ns)(void *task, int type, void *ns) = 0;
 static void *g_addr_pf = 0; /* do_page_fault */
 
 /* ---- arm state ---- */
+enum { MODE_SELFHEAL = 0, MODE_REDIRECT = 1 };
 static volatile int g_armed = 0;
 static volatile int g_pf_hooked = 0;
+static volatile int g_mode = MODE_SELFHEAL;
 static volatile int g_target_pid = 0;
 static volatile uint64_t g_target_page = 0;
+static volatile uint64_t g_clone_page = 0; /* MODE_REDIRECT: clone of the target page */
 static uint64_t *g_ptep = 0;        /* cached kernel VA of the leaf PTE */
 static uint64_t g_pte_orig = 0;     /* original PTE value (UXN clear) */
 static volatile long g_faults = 0;
+static volatile long g_redirects = 0;
 
 /* ---- tiny freestanding string/number helpers ---- */
 static char *apps(char *p, char *e, const char *s)
@@ -189,12 +201,21 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
         void *t = (void *)get_current();
         if (fn_task_pid_nr_ns(t, PIDTYPE_TGID, 0) != g_target_pid) return;
     }
-    /* our target code page execute-fault: restore UXN-clear PTE + resume */
-    if (g_ptep) {
-        *(volatile uint64_t *)g_ptep = g_pte_orig;
-        flush_tlb_all();
-    }
     g_faults++;
+
+    if (g_mode == MODE_REDIRECT && g_clone_page) {
+        /* keep UXN set; reroute PC to the same offset in the clone page so the
+         * target's .text is never touched and every call re-faults+reroutes. */
+        struct pt_regs *regs = (struct pt_regs *)fargs->arg2;
+        regs->pc = g_clone_page + (far & 0xfffUL);
+        g_redirects++;
+    } else {
+        /* self-heal: restore UXN-clear PTE so the instruction re-executes */
+        if (g_ptep) {
+            *(volatile uint64_t *)g_ptep = g_pte_orig;
+            flush_tlb_all();
+        }
+    }
     fargs->skip_origin = 1; /* we handled it; don't run the real do_page_fault */
     fargs->ret = 0;
 }
@@ -256,7 +277,8 @@ static long do_pte(uint64_t pid, uint64_t addr, char *p, char *e)
     return 0;
 }
 
-static long do_arm(uint64_t pid, uint64_t addr, char *p, char *e)
+/* shared arm path: mode = MODE_SELFHEAL or MODE_REDIRECT (clone used iff redirect) */
+static long arm_common(uint64_t pid, uint64_t addr, int mode, uint64_t clone, char *p, char *e)
 {
     resolve_syms();
     if (!fn_find_get_task_by_vpid || !fn_get_task_mm || !fn_mmput || !fn_apply_existing || !g_addr_pf ||
@@ -279,9 +301,12 @@ static long do_arm(uint64_t pid, uint64_t addr, char *p, char *e)
 
     g_target_pid = (int)pid;
     g_target_page = base;
+    g_clone_page = (mode == MODE_REDIRECT) ? (clone & ~0xFFFUL) : 0;
+    g_mode = mode;
     g_ptep = (uint64_t *)o.ptep;
     g_pte_orig = o.val;
     g_faults = 0;
+    g_redirects = 0;
 
     /* hook do_page_fault BEFORE arming UXN so the first fault is caught */
     if (!g_pf_hooked) {
@@ -303,10 +328,22 @@ static long do_arm(uint64_t pid, uint64_t addr, char *p, char *e)
     p = appdec(p, e, (long)pid);
     p = apps(p, e, " page=");
     p = apphex(p, e, base);
+    p = apps(p, e, mode == MODE_REDIRECT ? " mode=REDIRECT clone=" : " mode=SELFHEAL");
+    if (mode == MODE_REDIRECT) p = apphex(p, e, g_clone_page);
     p = apps(p, e, " pte_now=");
     p = apphex(p, e, *(volatile uint64_t *)g_ptep);
-    apps(p, e, " (UXN set; faults self-heal)\n");
+    apps(p, e, "\n");
     return 0;
+}
+
+static long do_arm(uint64_t pid, uint64_t addr, char *p, char *e)
+{
+    return arm_common(pid, addr, MODE_SELFHEAL, 0, p, e);
+}
+
+static long do_redirect(uint64_t pid, uint64_t addr, uint64_t clone, char *p, char *e)
+{
+    return arm_common(pid, addr, MODE_REDIRECT, clone, p, e);
 }
 
 static long do_disarm(char *p, char *e)
@@ -322,8 +359,12 @@ static long do_disarm(char *p, char *e)
     }
     p = apps(p, e, "ok: disarmed, faults=");
     p = appdec(p, e, g_faults);
+    p = apps(p, e, " redirects=");
+    p = appdec(p, e, g_redirects);
     apps(p, e, "\n");
     g_ptep = 0;
+    g_mode = MODE_SELFHEAL;
+    g_clone_page = 0;
     return 0;
 }
 
@@ -331,14 +372,20 @@ static long do_state(char *p, char *e)
 {
     p = apps(p, e, "armed=");
     p = appdec(p, e, g_armed);
+    p = apps(p, e, " mode=");
+    p = apps(p, e, g_mode == MODE_REDIRECT ? "REDIRECT" : "SELFHEAL");
     p = apps(p, e, " pf_hooked=");
     p = appdec(p, e, g_pf_hooked);
     p = apps(p, e, " pid=");
     p = appdec(p, e, g_target_pid);
     p = apps(p, e, " page=");
     p = apphex(p, e, g_target_page);
+    p = apps(p, e, " clone=");
+    p = apphex(p, e, g_clone_page);
     p = apps(p, e, " faults=");
     p = appdec(p, e, g_faults);
+    p = apps(p, e, " redirects=");
+    p = appdec(p, e, g_redirects);
     if (g_ptep) {
         p = apps(p, e, "\npte_now=");
         p = apphex(p, e, *(volatile uint64_t *)g_ptep);
@@ -395,6 +442,15 @@ static long shpte_control0(const char *args, char *__user out_msg, int outlen)
             rc = do_pte(pid, addr, p, e);
     } else if (starts(a, "disarm")) {
         rc = do_disarm(p, e);
+    } else if (starts(a, "redirect")) {
+        uint64_t pid = 0, addr = 0, clone = 0;
+        const char *s = parse_ull(a + 8, &pid);
+        s = parse_ull(s, &addr);
+        parse_ull(s, &clone);
+        if (!pid || !addr || !clone)
+            apps(p, e, "usage: redirect <pid> <hexaddr> <cloneaddr>\n"), rc = -1;
+        else
+            rc = do_redirect(pid, addr, clone, p, e);
     } else if (starts(a, "arm")) {
         uint64_t pid = 0, addr = 0;
         const char *s = parse_ull(a + 3, &pid);
@@ -406,7 +462,9 @@ static long shpte_control0(const char *args, char *__user out_msg, int outlen)
     } else if (starts(a, "dump")) {
         rc = do_state(p, e);
     } else {
-        apps(p, e, "usage: probe | pte <pid> <addr> | arm <pid> <addr> | disarm | dump\n");
+        apps(p, e,
+             "usage: probe | pte <pid> <addr> | arm <pid> <addr> | "
+             "redirect <pid> <addr> <clone> | disarm | dump\n");
         rc = -1;
     }
 
