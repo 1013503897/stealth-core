@@ -21,7 +21,10 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 | **P2.0** | Page-table walk: read + decode any process's leaf PTE (`get_task_mm` + `apply_to_existing_page_range`) — read-only foundation for UXN (`shpte`) | ✅ verified |
 | **P2.1** | UXN flip on the target code page + `do_page_fault` interception with **self-healing** resume (validates the page-table-write + fault-hook + safe-EL0-resume machinery) | ✅ verified |
 | **P2.2** | **Single-function no-trace redirect**: keep UXN set, reroute the faulting PC to a verbatim **clone** of a page-isolated, PC-relative-free function (`.text` untouched, no new exec VMA at the func) | ✅ verified |
-| **P3** | Full DBI recompiler — `ADRP`/`ADR`/`B`/`BL`/`B.cond`/`CBZ`/`TBZ`/`LDR`-literal/`BLR`+PAC fixups → arbitrary functions, whole-page (article §5.7) | ⬜ todo |
+| **P3.1** | `offset_map` routing in `do_page_fault` (clone insn idx per orig insn); map read cross-process via `access_process_vm` | ✅ verified |
+| **P3.2** | Userspace DBI recompiler: `ADR`/`ADRP`/`B`/`BL` → absolute (LDR-literal / `BR`/`BLR` x16), builds the offset_map; clone of a PC-relative `hook_me()` runs correctly | ✅ verified |
+| **P3.3** | DBI: conditional + internal branches (`B.cond`/`CBZ`/`TBZ`, clone-relative re-encode) → functions with loops/branches | ⬜ todo |
+| **P3.4** | DBI: `LDR`-literal, `BLR`/`BR`+PAC demote (`BLRAAZ`→`BRAAZ`) for high-version targets | ⬜ todo |
 | **P4** | VMA-less **ghost memory** (article §5.9) + `maps`/`seq_file` hide (§5.8) so the clone page is invisible to `/proc/*/maps` | ⬜ todo |
 
 ## Requirements
@@ -47,11 +50,14 @@ cli/        shctl.c     KPM control CLI (supercall: load/unload/list/info/contro
 tools/      hbtarget.c  self-contained single-thread HWBP test target (pid + &tick, loops)
             mttarget.c  multi-thread target; spawns workers gradually (grow) or churns them (churn)
             dbitarget.c        P2.2 target: page-isolated, PC-relative-free tick() + self-clone
+            dbitarget2.c       P3.2 target + DBI recompiler: PC-relative hook_me() (ADR+B) → clone
             run_mt_test.sh     P1.6 harness (hook every existing thread → dump → unhook → unload)
             run_grow_test.sh   P1.6b harness (hook t0 threads, watch new threads auto-followed)
             run_churn_test.sh  P1.6b harness (churn threads, watch slot GC keep the table bounded)
             run_uxn_test.sh    P2.1 harness (UXN + do_page_fault self-heal)
-            run_redirect_test.sh  P2.2 harness (UXN net + reroute tick into its clone)
+            run_redirect_test.sh    P2.2 harness (UXN net + reroute tick into its verbatim clone)
+            run_redirectmap_test.sh P3.1 harness (offset_map routing, identity map)
+            run_dbi_test.sh         P3.2 harness (DBI-recompiled hook_me runs from the clone)
 vendor/     KernelPatch  (SDK headers + docs; tag 0.13.1)
 ```
 
@@ -117,9 +123,10 @@ thread is followed independently. (If two devices are attached, add `-s <serial>
 
 ## Next
 
-- **P3**: a real DBI recompiler so *arbitrary* functions (not just PC-relative-free leaves) can be
-  cloned — rewrite `ADRP`/`ADR`/`B`/`BL`/`B.cond`/`CBZ`/`TBZ`/`LDR`-literal and demote `BLR*`→`BR*`
-  (preserve PAC), with an `offset_map` for whole-page recompilation (article §5.7). Then route via
-  `offset_map` in the `do_page_fault` handler instead of the current `clone + (far & 0xfff)`.
+- **P3.3/P3.4**: extend the DBI engine (`tools/dbitarget2.c`) to the remaining instruction classes —
+  conditional + internal branches (`B.cond`/`CBZ`/`CBNZ`/`TBZ`/`TBNZ`, re-encoded clone-relative via
+  the offset_map), `LDR`-literal, and `BLR*`/`BR*` PAC demotion (`BLRAAZ`→`BRAAZ`) — so arbitrary
+  functions (loops, branches, high-version PAC code) can be cloned, not just `ADR`/`ADRP`/`B`/`BL`.
 - **P4**: VMA-less ghost memory for the clone (article §5.9) + `seq_file`/`maps` hide (§5.8), so the
-  clone page can't be found by `/proc/*/maps` or `mincore`. Still page-table surgery; expect reboots.
+  clone page can't be found by `/proc/*/maps` or `mincore`. **The current clone is an ordinary RX
+  anon mapping — visible in maps; this is the remaining trace.** Page-table surgery; expect reboots.
