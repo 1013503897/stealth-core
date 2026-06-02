@@ -30,6 +30,10 @@ __attribute__((aligned(0x1000), noinline)) void tick_guard(void)
     asm volatile("nop");
 }
 
+// identity offset_map (1024 entries = one source page): orig insn idx -> clone idx.
+// Used by the P3.1 "redirectmap" path to prove the map plumbing reproduces P2.2.
+static uint32_t omap[1024];
+
 int main(void)
 {
     uintptr_t tk = (uintptr_t)&tick;
@@ -47,7 +51,10 @@ int main(void)
         return 1;
     }
 
-    printf("pid=%d tick=%p page=0x%lx clone=%p\n", getpid(), (void *)&tick, (unsigned long)page, clone);
+    for (int i = 0; i < 1024; i++) omap[i] = (uint32_t)i; // identity map
+
+    printf("pid=%d tick=%p page=0x%lx clone=%p omap=%p nmap=1024\n", getpid(), (void *)&tick,
+           (unsigned long)page, clone, (void *)omap);
     fflush(stdout);
 
     unsigned long c = 0;

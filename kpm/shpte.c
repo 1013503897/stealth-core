@@ -46,10 +46,10 @@
 #include <stdint.h>
 
 KPM_NAME("shpte");
-KPM_VERSION("0.3.0");
+KPM_VERSION("0.4.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("stealth-poc");
-KPM_DESCRIPTION("P2: UXN net via do_page_fault (P2.1 self-heal + P2.2 clone redirect)");
+KPM_DESCRIPTION("P2/P3: UXN net + clone redirect with offset_map routing");
 
 enum { PIDTYPE_PID = 0, PIDTYPE_TGID = 1 };
 
@@ -59,10 +59,19 @@ static void *(*fn_get_task_mm)(void *task) = 0;
 static void (*fn_mmput)(void *mm) = 0;
 static int (*fn_apply_existing)(void *mm, unsigned long addr, unsigned long size, void *fn, void *data) = 0;
 static int (*fn_task_pid_nr_ns)(void *task, int type, void *ns) = 0;
+/* int access_process_vm(struct task_struct *tsk, unsigned long addr, void *buf, int len, uint flags) */
+static int (*fn_access_process_vm)(void *tsk, unsigned long addr, void *buf, int len, unsigned int flags) = 0;
 static void *g_addr_pf = 0; /* do_page_fault */
 
 /* ---- arm state ---- */
-enum { MODE_SELFHEAL = 0, MODE_REDIRECT = 1 };
+enum { MODE_SELFHEAL = 0, MODE_REDIRECT = 1, MODE_REDIRECT_MAP = 2 };
+
+/* offset_map: original instruction index (page offset/4) -> recompiled insn index
+ * in the clone region. One source page = 1024 instructions. Filled from the
+ * target's user memory via access_process_vm at redirect-map time. */
+#define OFFMAP_MAX 1024
+static uint32_t g_offmap[OFFMAP_MAX];
+static volatile int g_nmap = 0;
 static volatile int g_armed = 0;
 static volatile int g_pf_hooked = 0;
 static volatile int g_mode = MODE_SELFHEAL;
@@ -203,11 +212,18 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
     }
     g_faults++;
 
-    if (g_mode == MODE_REDIRECT && g_clone_page) {
-        /* keep UXN set; reroute PC to the same offset in the clone page so the
-         * target's .text is never touched and every call re-faults+reroutes. */
+    if ((g_mode == MODE_REDIRECT || g_mode == MODE_REDIRECT_MAP) && g_clone_page) {
+        /* keep UXN set; reroute PC into the clone region. The target's .text is
+         * never touched and every call re-faults+reroutes. With an offset_map,
+         * recompiled instructions may have shifted, so map orig-insn-idx ->
+         * recompiled-insn-idx; otherwise route to the same page offset. */
         struct pt_regs *regs = (struct pt_regs *)fargs->arg2;
-        regs->pc = g_clone_page + (far & 0xfffUL);
+        uint64_t off = far & 0xfffUL;
+        if (g_mode == MODE_REDIRECT_MAP) {
+            uint32_t idx = (uint32_t)(off >> 2);
+            if (idx < (uint32_t)g_nmap) off = (uint64_t)g_offmap[idx] << 2;
+        }
+        regs->pc = g_clone_page + off;
         g_redirects++;
     } else {
         /* self-heal: restore UXN-clear PTE so the instruction re-executes */
@@ -229,6 +245,7 @@ static void resolve_syms(void)
     if (!fn_apply_existing)
         fn_apply_existing = (void *)kallsyms_lookup_name("apply_to_existing_page_range");
     if (!fn_task_pid_nr_ns) fn_task_pid_nr_ns = (void *)kallsyms_lookup_name("__task_pid_nr_ns");
+    if (!fn_access_process_vm) fn_access_process_vm = (void *)kallsyms_lookup_name("access_process_vm");
     if (!g_addr_pf) g_addr_pf = (void *)kallsyms_lookup_name("do_page_fault");
 }
 
@@ -301,7 +318,7 @@ static long arm_common(uint64_t pid, uint64_t addr, int mode, uint64_t clone, ch
 
     g_target_pid = (int)pid;
     g_target_page = base;
-    g_clone_page = (mode == MODE_REDIRECT) ? (clone & ~0xFFFUL) : 0;
+    g_clone_page = (mode != MODE_SELFHEAL) ? (clone & ~0xFFFUL) : 0;
     g_mode = mode;
     g_ptep = (uint64_t *)o.ptep;
     g_pte_orig = o.val;
@@ -328,8 +345,12 @@ static long arm_common(uint64_t pid, uint64_t addr, int mode, uint64_t clone, ch
     p = appdec(p, e, (long)pid);
     p = apps(p, e, " page=");
     p = apphex(p, e, base);
-    p = apps(p, e, mode == MODE_REDIRECT ? " mode=REDIRECT clone=" : " mode=SELFHEAL");
-    if (mode == MODE_REDIRECT) p = apphex(p, e, g_clone_page);
+    if (mode == MODE_SELFHEAL) {
+        p = apps(p, e, " mode=SELFHEAL");
+    } else {
+        p = apps(p, e, mode == MODE_REDIRECT_MAP ? " mode=REDIRECT_MAP clone=" : " mode=REDIRECT clone=");
+        p = apphex(p, e, g_clone_page);
+    }
     p = apps(p, e, " pte_now=");
     p = apphex(p, e, *(volatile uint64_t *)g_ptep);
     apps(p, e, "\n");
@@ -344,6 +365,39 @@ static long do_arm(uint64_t pid, uint64_t addr, char *p, char *e)
 static long do_redirect(uint64_t pid, uint64_t addr, uint64_t clone, char *p, char *e)
 {
     return arm_common(pid, addr, MODE_REDIRECT, clone, p, e);
+}
+
+/* redirectmap: like redirect, but route via an offset_map read from the target's
+ * user memory (mapaddr points at ninsn u32 entries: orig-insn-idx -> clone-idx). */
+static long do_redirectmap(uint64_t pid, uint64_t addr, uint64_t clone, uint64_t mapaddr, uint64_t ninsn,
+                           char *p, char *e)
+{
+    resolve_syms();
+    if (!fn_access_process_vm || !fn_find_get_task_by_vpid) {
+        apps(p, e, "error: symbols not resolved (run probe)\n");
+        return -1;
+    }
+    if (ninsn == 0 || ninsn > OFFMAP_MAX) {
+        apps(p, e, "error: ninsn out of range (1..1024)\n");
+        return -1;
+    }
+    void *task = fn_find_get_task_by_vpid((int)pid);
+    if (is_err_or_null(task)) {
+        apps(p, e, "error: task not found\n");
+        return -1;
+    }
+    int want = (int)(ninsn * 4);
+    int got = fn_access_process_vm(task, mapaddr, g_offmap, want, 0 /*read*/);
+    if (got != want) {
+        p = apps(p, e, "error: access_process_vm read offset_map got=");
+        p = appdec(p, e, got);
+        p = apps(p, e, " want=");
+        p = appdec(p, e, want);
+        apps(p, e, "\n");
+        return -1;
+    }
+    g_nmap = (int)ninsn;
+    return arm_common(pid, addr, MODE_REDIRECT_MAP, clone, p, e);
 }
 
 static long do_disarm(char *p, char *e)
@@ -365,6 +419,7 @@ static long do_disarm(char *p, char *e)
     g_ptep = 0;
     g_mode = MODE_SELFHEAL;
     g_clone_page = 0;
+    g_nmap = 0;
     return 0;
 }
 
@@ -373,7 +428,9 @@ static long do_state(char *p, char *e)
     p = apps(p, e, "armed=");
     p = appdec(p, e, g_armed);
     p = apps(p, e, " mode=");
-    p = apps(p, e, g_mode == MODE_REDIRECT ? "REDIRECT" : "SELFHEAL");
+    p = apps(p, e, g_mode == MODE_REDIRECT_MAP ? "REDIRECT_MAP" : (g_mode == MODE_REDIRECT ? "REDIRECT" : "SELFHEAL"));
+    p = apps(p, e, " nmap=");
+    p = appdec(p, e, g_nmap);
     p = apps(p, e, " pf_hooked=");
     p = appdec(p, e, g_pf_hooked);
     p = apps(p, e, " pid=");
@@ -408,6 +465,8 @@ static long do_probe(char *p, char *e)
     p = apphex(p, e, (uint64_t)fn_apply_existing);
     p = apps(p, e, "\n__task_pid_nr_ns=");
     p = apphex(p, e, (uint64_t)fn_task_pid_nr_ns);
+    p = apps(p, e, "\naccess_process_vm=");
+    p = apphex(p, e, (uint64_t)fn_access_process_vm);
     p = apps(p, e, "\ndo_page_fault=");
     p = apphex(p, e, (uint64_t)g_addr_pf);
     apps(p, e, "\n");
@@ -442,6 +501,17 @@ static long shpte_control0(const char *args, char *__user out_msg, int outlen)
             rc = do_pte(pid, addr, p, e);
     } else if (starts(a, "disarm")) {
         rc = do_disarm(p, e);
+    } else if (starts(a, "redirectmap")) {
+        uint64_t pid = 0, addr = 0, clone = 0, map = 0, n = 0;
+        const char *s = parse_ull(a + 11, &pid);
+        s = parse_ull(s, &addr);
+        s = parse_ull(s, &clone);
+        s = parse_ull(s, &map);
+        parse_ull(s, &n);
+        if (!pid || !addr || !clone || !map || !n)
+            apps(p, e, "usage: redirectmap <pid> <hexaddr> <cloneaddr> <mapaddr> <ninsn>\n"), rc = -1;
+        else
+            rc = do_redirectmap(pid, addr, clone, map, n, p, e);
     } else if (starts(a, "redirect")) {
         uint64_t pid = 0, addr = 0, clone = 0;
         const char *s = parse_ull(a + 8, &pid);
@@ -464,7 +534,8 @@ static long shpte_control0(const char *args, char *__user out_msg, int outlen)
     } else {
         apps(p, e,
              "usage: probe | pte <pid> <addr> | arm <pid> <addr> | "
-             "redirect <pid> <addr> <clone> | disarm | dump\n");
+             "redirect <pid> <addr> <clone> | redirectmap <pid> <addr> <clone> <map> <n> | "
+             "disarm | dump\n");
         rc = -1;
     }
 
