@@ -30,9 +30,21 @@ Hooking spans kernel and userspace, bridged by a string-command control channel:
 
 ### The KPM_CTL0 command bridge
 `shhwbp` exposes a tiny text protocol through its single `KPM_CTL0` entrypoint
-(`shhwbp_control0`): `probe | hook <pid> <hexaddr> | dump | unhook`. Commands are parsed with
+(`shhwbp_control0`): `probe | hook <hexaddr> <tid> [tid…] | dump | unhook`. Commands are parsed with
 hand-rolled freestanding string helpers (`apps`/`apphex`/`appdec`/`parse_ull`) because there is no
 libc in kernel context. New module capabilities are added as new verbs here, not as new supercalls.
+
+### Per-thread breakpoint table (P1.6)
+HWBP is a *per-thread* CPU debug-register state — a breakpoint on one TID does not fire for sibling
+threads. So `shhwbp` keeps a fixed `struct bp_slot g_slots[MAX_SLOTS]`, one `perf_event` per thread,
+each with its own attr copy, entry↔return state, and **its own `task_work` heads** (sharing one head
+across threads would corrupt the task_work list). The `tw_install`/`tw_move`/`tw_remove` callbacks
+recover their slot via `container_of(head, struct bp_slot, <member>)`; the breakpoint handler maps the
+firing `perf_event` back to its slot by pointer match (`slot_by_bp`). Userspace enumerates
+`/proc/<pid>/task` and passes the TID list (the kernel-side thread-group walk is deliberately
+avoided). PoC limits: a task ref is leaked per slot (keeps `task_struct` alive so the table can't
+UAF), threads must stay alive until unhook, and threads spawned *after* the hook are not yet followed
+(P1.6b: `wake_up_new_task` + RCU/GC).
 
 ### The deferred-work safety model (most important invariant)
 Perf/breakpoint kernel APIs (`register/unregister/modify_user_hw_breakpoint`) and other
@@ -119,5 +131,9 @@ Two independent version pins must match the device, or load/supercall silently f
 - `shpoc.c` — P0 smoke test: hooks `__NR_execve` via the SDK `hook_syscalln` API. Proves the
   toolchain + KPM load path works. No control channel.
 - `shmin.c` — minimal `KPM_CTL0` isolation test (init + fixed-string ctl0 + exit).
-- `shhwbp.c` — P1.5 HWBP hook with the entry↔return state machine and `task_work` deferral
-  (the real PoC; everything above describes it).
+- `shhwbp.c` — P1.5/P1.6 HWBP hook: per-thread breakpoint table + entry↔return state machine with
+  `task_work` deferral (the real PoC; everything above describes it).
+
+Test targets live in `tools/`: `hbtarget.c` (single thread) and `mttarget.c` (main + 4 workers, for
+P1.6). `tools/run_mt_test.sh` is the device-side end-to-end harness; neither target has a build
+script — compile them like `shctl` (`--target=aarch64-linux-android33`).

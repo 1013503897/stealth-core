@@ -1,32 +1,47 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * stealth-poc P1.5 KPM: ARM64 hardware-breakpoint hook with single-breakpoint
- * state machine (entry <-> return), controlled via the KPM control bridge.
+ * stealth-poc P1.6 KPM: ARM64 hardware-breakpoint hook with MULTI-THREAD
+ * following. A per-thread breakpoint table; each thread runs its own
+ * single-breakpoint entry<->return state machine, controlled via the KPM bridge.
  *
- * Why a state machine: arm64's breakpoint_handler only single-steps over the
- * instruction when the perf event uses the DEFAULT overflow handler. We need a
- * custom handler to capture registers, so the kernel won't step for us and a
- * plain execute breakpoint re-triggers forever (livelock). Instead, on an ENTRY
- * hit we move the breakpoint to the return address (LR); on the RETURN hit we
- * move it back to ENTRY. The breakpointed entry instruction is thus uncovered
- * before it re-executes, so the target runs normally -- and we capture both the
- * arguments (X0..X7 at entry) and the return value (X0 at return).
+ * Why per-thread: HWBP is a per-thread CPU debug-register state, NOT process
+ * wide. A breakpoint installed on one TID only fires for that thread; sibling
+ * threads execute the target address with no trap. So to follow a whole process
+ * we keep a table of slots, one perf_event per thread, and install on each TID.
+ * Userspace enumerates /proc/<pid>/task and passes the TID list (the kernel-side
+ * thread-group walk is avoided -- see article 5.1).
  *
- * Safety: register/unregister/modify of the perf breakpoint must NOT be called
- * from the breakpoint-exception handler context (it wedges, holding KP locks).
- * So the handler only snapshots regs + queues task_work; the actual perf calls
- * run via task_work in the target's own context (sleepable) on return-to-user,
- * which also happens BEFORE the faulting instruction re-executes -> no burst.
+ * State machine (per slot, unchanged from P1.5): arm64 only auto-single-steps
+ * over an execute breakpoint with the DEFAULT overflow handler. We use a custom
+ * handler to capture regs, so a plain execute bp re-triggers forever. Instead,
+ * on an ENTRY hit we move that thread's bp to its return address (LR); on the
+ * RETURN hit we move it back to ENTRY. Per-thread isolation is automatic: the
+ * CPU saves/restores debug regs per task, so each thread only ever trips its
+ * OWN bp -- the slots never interfere.
+ *
+ * Safety (unchanged): register/unregister/modify of a perf breakpoint must NOT
+ * run in the breakpoint-exception handler or the supercall context (it wedges,
+ * holding KP locks -> physical reboot). The handler only snapshots regs + queues
+ * task_work on the firing thread; the perf calls run via task_work in that
+ * thread's own context (sleepable) on return-to-user, before the faulting
+ * instruction re-executes. Each slot owns its own task_work heads so concurrent
+ * threads never collide on a shared list node.
  *
  * Commands (shctl <key> control shhwbp "<cmd> ..."):
- *   probe                  - resolve kernel symbols, report them
- *   hook  <pid> <hexaddr>  - queue an execute HWBP at addr in process pid
- *   dump                   - report state, hits, last entry args + return value
- *   unhook                 - queue removal of the breakpoint
+ *   probe                       - resolve kernel symbols, report them
+ *   hook  <hexaddr> <tid> [tid] - queue an execute HWBP at addr on each TID
+ *                                 (additive; re-hooking a live TID is skipped)
+ *   dump                        - per-thread state, hits, last args + return
+ *   unhook                      - queue removal of all breakpoints
+ *
+ * PoC scope: one task ref leaked per slot (keeps the task_struct alive so the
+ * handler/table can't UAF). Threads must stay alive until unhook; new-thread
+ * following (wake_up_new_task) and RCU+deferred GC for thread exit are P1.6
+ * follow-ups, not yet implemented.
  *
  * Clean-room: written against the KernelPatch kpm SDK only; perf/breakpoint and
  * task_work ABI are stable Linux layouts reproduced to call kallsyms-resolved
- * kernel APIs.  PoC: one task ref leaked per hook; unhook needs target alive.
+ * kernel APIs.
  */
 
 #include <compiler.h>
@@ -38,10 +53,17 @@
 #include <stdint.h>
 
 KPM_NAME("shhwbp");
-KPM_VERSION("0.3.0");
+KPM_VERSION("0.4.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("stealth-poc");
-KPM_DESCRIPTION("P1.5: ARM64 HWBP hook + entry/return state machine (no mem mod)");
+KPM_DESCRIPTION("P1.6: ARM64 HWBP hook + per-thread table (multi-thread follow)");
+
+#ifndef offsetof
+#define offsetof(t, m) __builtin_offsetof(t, m)
+#endif
+#ifndef container_of
+#define container_of(ptr, type, member) ((type *)((char *)(ptr) - offsetof(type, member)))
+#endif
 
 /* ---- minimal stable perf / hw_breakpoint ABI ---- */
 #define PERF_TYPE_BREAKPOINT 5u
@@ -86,6 +108,35 @@ struct kp_callback_head {
 
 enum { ST_ENTRY = 0, ST_RETURN = 1 };
 
+/* ---- per-thread breakpoint slot ---- */
+#define MAX_SLOTS 32
+
+struct bp_slot {
+    volatile int active;
+    int tid;
+    void *task;                       /* task_struct* (one ref leaked, on purpose) */
+    void *bp;                         /* perf_event* handle */
+    uint64_t entry_addr;              /* the hooked function entry (return target) */
+    struct kp_perf_event_attr attr;   /* per-slot: bp_addr is rewritten on each move */
+    volatile int state;               /* ST_ENTRY / ST_RETURN */
+    volatile int move_pending;
+    uint64_t next_addr;
+    volatile int next_state;
+    /* per-slot task_work heads: concurrent threads must not share a list node */
+    struct kp_callback_head tw_install;
+    struct kp_callback_head tw_move;
+    struct kp_callback_head tw_remove;
+    /* capture */
+    volatile long entry_hits;
+    volatile long ret_hits;
+    uint64_t args[8];                 /* X0..X7 at entry */
+    uint64_t entry_pc;
+    uint64_t ret_x0;                  /* X0 at return */
+    uint64_t ret_pc;
+    volatile int have_entry;
+    volatile int have_ret;
+};
+
 /* ---- resolved kernel symbols ---- */
 static void *(*fn_register_user_hw_breakpoint)(struct kp_perf_event_attr *, void *, void *, void *) = 0;
 static void (*fn_unregister_hw_breakpoint)(void *) = 0;
@@ -94,26 +145,8 @@ static void *(*fn_find_get_task_by_vpid)(int) = 0;
 static int (*fn_task_work_add)(void *task, void *work, int notify) = 0;
 
 /* ---- state ---- */
-static struct kp_perf_event_attr g_attr;
-static struct kp_callback_head g_tw_hook;
-static struct kp_callback_head g_tw_unhook;
-static struct kp_callback_head g_tw_move;
-static void *g_bp = 0;
-static void *g_task = 0;
-static uint64_t g_entry_addr = 0;
-static volatile int g_state = ST_ENTRY;
-static volatile int g_move_pending = 0;
-static uint64_t g_next_addr = 0;
-static volatile int g_next_state = ST_ENTRY;
+static struct bp_slot g_slots[MAX_SLOTS];
 static volatile long g_hits = 0;
-static volatile long g_entry_hits = 0;
-static volatile long g_ret_hits = 0;
-static uint64_t g_args[8]; /* X0..X7 captured at entry */
-static uint64_t g_entry_pc = 0;
-static uint64_t g_ret_x0 = 0; /* X0 captured at return */
-static uint64_t g_ret_pc = 0;
-static volatile int g_have_entry = 0;
-static volatile int g_have_ret = 0;
 
 /* ---- tiny string/number helpers (freestanding) ---- */
 static char *apps(char *p, char *e, const char *s)
@@ -196,78 +229,109 @@ static int is_err_or_null(void *p)
     return (p == 0) || (v >= 0xfffffffffffff000UL);
 }
 
-static void tw_move(struct kp_callback_head *head); /* fwd decl */
+/* ---- slot table helpers ---- */
+static struct bp_slot *slot_by_bp(void *bp)
+{
+    for (int i = 0; i < MAX_SLOTS; i++)
+        if (g_slots[i].active && g_slots[i].bp == bp) return &g_slots[i];
+    return 0;
+}
+static struct bp_slot *slot_by_tid(int tid)
+{
+    for (int i = 0; i < MAX_SLOTS; i++)
+        if (g_slots[i].active && g_slots[i].tid == tid) return &g_slots[i];
+    return 0;
+}
+static struct bp_slot *slot_free(void)
+{
+    for (int i = 0; i < MAX_SLOTS; i++)
+        if (!g_slots[i].active) return &g_slots[i];
+    return 0;
+}
+static int slot_count(void)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_SLOTS; i++)
+        if (g_slots[i].active) n++;
+    return n;
+}
 
 /* ---- breakpoint handler: snapshot + queue a deferred move; NO perf calls ---- */
+static void tw_move(struct kp_callback_head *head);
+
 static void hwbp_handler(void *bp, void *data, struct pt_regs *regs)
 {
-    (void)bp;
     (void)data;
+    struct bp_slot *s = slot_by_bp(bp);
+    if (!s) return;
     g_hits++;
 
-    if (g_state == ST_ENTRY) {
-        for (int i = 0; i < 8; i++) g_args[i] = regs->regs[i];
-        g_entry_pc = regs->pc;
-        g_have_entry = 1;
-        g_entry_hits++;
-        if (!g_move_pending) {
-            g_next_addr = STRIP_PAC(regs->regs[30]); /* LR -> return address */
-            g_next_state = ST_RETURN;
-            g_move_pending = 1;
-            g_tw_move.next = 0;
-            g_tw_move.func = tw_move;
-            fn_task_work_add(g_task, &g_tw_move, TWA_RESUME);
+    if (s->state == ST_ENTRY) {
+        for (int i = 0; i < 8; i++) s->args[i] = regs->regs[i];
+        s->entry_pc = regs->pc;
+        s->have_entry = 1;
+        s->entry_hits++;
+        if (!s->move_pending) {
+            s->next_addr = STRIP_PAC(regs->regs[30]); /* LR -> return address */
+            s->next_state = ST_RETURN;
+            s->move_pending = 1;
+            s->tw_move.next = 0;
+            s->tw_move.func = tw_move;
+            fn_task_work_add(s->task, &s->tw_move, TWA_RESUME);
         }
     } else { /* ST_RETURN */
-        g_ret_x0 = regs->regs[0];
-        g_ret_pc = regs->pc;
-        g_have_ret = 1;
-        g_ret_hits++;
-        if (!g_move_pending) {
-            g_next_addr = g_entry_addr; /* back to entry */
-            g_next_state = ST_ENTRY;
-            g_move_pending = 1;
-            g_tw_move.next = 0;
-            g_tw_move.func = tw_move;
-            fn_task_work_add(g_task, &g_tw_move, TWA_RESUME);
+        s->ret_x0 = regs->regs[0];
+        s->ret_pc = regs->pc;
+        s->have_ret = 1;
+        s->ret_hits++;
+        if (!s->move_pending) {
+            s->next_addr = s->entry_addr; /* back to entry */
+            s->next_state = ST_ENTRY;
+            s->move_pending = 1;
+            s->tw_move.next = 0;
+            s->tw_move.func = tw_move;
+            fn_task_work_add(s->task, &s->tw_move, TWA_RESUME);
         }
     }
 }
 
-/* runs in target ctx (return-to-user), sleepable: actually move the breakpoint */
+/* all three run in the slot's target task ctx (return-to-user), sleepable */
 static void tw_move(struct kp_callback_head *head)
 {
-    (void)head;
-    if (!g_bp || !fn_modify_user_hw_breakpoint) {
-        g_move_pending = 0;
+    struct bp_slot *s = container_of(head, struct bp_slot, tw_move);
+    if (!s->bp || !fn_modify_user_hw_breakpoint) {
+        s->move_pending = 0;
         return;
     }
-    g_attr.bp_addr = g_next_addr;
-    fn_modify_user_hw_breakpoint(g_bp, &g_attr);
-    g_state = g_next_state;
-    g_move_pending = 0;
+    s->attr.bp_addr = s->next_addr;
+    fn_modify_user_hw_breakpoint(s->bp, &s->attr);
+    s->state = s->next_state;
+    s->move_pending = 0;
 }
 
 static void tw_install(struct kp_callback_head *head)
 {
-    (void)head;
-    void *bp = fn_register_user_hw_breakpoint(&g_attr, (void *)hwbp_handler, 0, g_task);
+    struct bp_slot *s = container_of(head, struct bp_slot, tw_install);
+    void *bp = fn_register_user_hw_breakpoint(&s->attr, (void *)hwbp_handler, s, s->task);
     if (is_err_or_null(bp)) {
-        g_bp = 0;
-        logke("shhwbp: register failed in target ctx ret=%llx\n", (unsigned long long)bp);
+        s->bp = 0;
+        logke("shhwbp: register failed tid=%d ret=%llx\n", s->tid, (unsigned long long)bp);
         return;
     }
-    g_bp = bp;
-    logki("shhwbp: hwbp installed bp=%llx addr=%llx\n", (unsigned long long)bp, (unsigned long long)g_entry_addr);
+    s->bp = bp;
+    logki("shhwbp: installed tid=%d bp=%llx addr=%llx\n", s->tid, (unsigned long long)bp,
+          (unsigned long long)s->entry_addr);
 }
+
 static void tw_remove(struct kp_callback_head *head)
 {
-    (void)head;
-    if (g_bp) {
-        fn_unregister_hw_breakpoint(g_bp);
-        g_bp = 0;
-        logki("shhwbp: hwbp removed\n");
+    struct bp_slot *s = container_of(head, struct bp_slot, tw_remove);
+    if (s->bp && fn_unregister_hw_breakpoint) {
+        fn_unregister_hw_breakpoint(s->bp);
+        s->bp = 0;
     }
+    logki("shhwbp: removed tid=%d entry=%ld ret=%ld\n", s->tid, s->entry_hits, s->ret_hits);
+    s->active = 0; /* slot reusable; task ref intentionally leaked (PoC) */
 }
 
 static void resolve_syms(void)
@@ -283,7 +347,47 @@ static void resolve_syms(void)
     if (!fn_task_work_add) fn_task_work_add = (void *)kallsyms_lookup_name("task_work_add");
 }
 
-static long do_hook(uint64_t pid, uint64_t addr, char *p, char *e)
+/* install one slot for one tid at addr; returns 0 on queued, <0 on error */
+static int do_hook_one(int tid, uint64_t addr)
+{
+    if (slot_by_tid(tid)) return 0; /* already followed; skip silently */
+
+    void *task = fn_find_get_task_by_vpid(tid);
+    if (is_err_or_null(task)) return -1;
+
+    struct bp_slot *s = slot_free();
+    if (!s) return -2;
+
+    /* zero the slot (freestanding: no memset) */
+    char *z = (char *)s;
+    for (unsigned i = 0; i < sizeof(*s); i++) z[i] = 0;
+
+    s->attr.type = PERF_TYPE_BREAKPOINT;
+    s->attr.size = sizeof(s->attr);
+    s->attr.sample_period = 1;
+    s->attr.flags = ATTR_PINNED | ATTR_EXCLUDE_KERNEL | ATTR_EXCLUDE_HV;
+    s->attr.bp_type = HW_BREAKPOINT_X;
+    s->attr.bp_addr = addr;
+    s->attr.bp_len = HW_BREAKPOINT_LEN_4;
+
+    s->tid = tid;
+    s->task = task;
+    s->entry_addr = addr;
+    s->state = ST_ENTRY;
+    s->bp = 0;
+    s->active = 1; /* publish last: handler ignores until active */
+
+    s->tw_install.next = 0;
+    s->tw_install.func = tw_install;
+    int r = fn_task_work_add(task, &s->tw_install, TWA_RESUME);
+    if (r) {
+        s->active = 0;
+        return -3;
+    }
+    return 0;
+}
+
+static long do_hook(const char *args, char *p, char *e)
 {
     resolve_syms();
     if (!fn_register_user_hw_breakpoint || !fn_modify_user_hw_breakpoint || !fn_find_get_task_by_vpid ||
@@ -291,108 +395,106 @@ static long do_hook(uint64_t pid, uint64_t addr, char *p, char *e)
         apps(p, e, "error: symbols not resolved (run probe)\n");
         return -1;
     }
-    if (g_bp || g_task) {
-        apps(p, e, "error: already hooked; unhook first\n");
-        return -1;
-    }
-    void *task = fn_find_get_task_by_vpid((int)pid);
-    if (is_err_or_null(task)) {
-        p = apps(p, e, "error: task not found for pid=");
-        p = appdec(p, e, (long)pid);
-        apps(p, e, "\n");
+
+    uint64_t addr = 0;
+    const char *s = parse_ull(args, &addr);
+    if (!addr) {
+        apps(p, e, "usage: hook <hexaddr> <tid> [tid ...]\n");
         return -1;
     }
 
-    char *z = (char *)&g_attr;
-    for (unsigned i = 0; i < sizeof(g_attr); i++) z[i] = 0;
-    g_attr.type = PERF_TYPE_BREAKPOINT;
-    g_attr.size = sizeof(g_attr);
-    g_attr.sample_period = 1;
-    g_attr.flags = ATTR_PINNED | ATTR_EXCLUDE_KERNEL | ATTR_EXCLUDE_HV;
-    g_attr.bp_type = HW_BREAKPOINT_X;
-    g_attr.bp_addr = addr;
-    g_attr.bp_len = HW_BREAKPOINT_LEN_4;
-
-    g_task = task;
-    g_entry_addr = addr;
-    g_state = ST_ENTRY;
-    g_move_pending = 0;
-    g_hits = g_entry_hits = g_ret_hits = 0;
-    g_have_entry = g_have_ret = 0;
-    g_bp = 0;
-
-    g_tw_hook.next = 0;
-    g_tw_hook.func = tw_install;
-    int r = fn_task_work_add(g_task, &g_tw_hook, TWA_RESUME);
-    if (r) {
-        p = apps(p, e, "error: task_work_add failed rc=");
-        p = appdec(p, e, r);
-        apps(p, e, "\n");
-        g_task = 0;
-        return -1;
+    int queued = 0, skipped = 0, errs = 0;
+    const char *cur = skipsp(s);
+    while (*cur) {
+        uint64_t tid = 0;
+        const char *ns = parse_ull(cur, &tid);
+        if (ns == cur) break; /* no progress -> stop */
+        cur = skipsp(ns);
+        if (!tid) continue;
+        if (slot_by_tid((int)tid)) {
+            skipped++;
+            continue;
+        }
+        int r = do_hook_one((int)tid, addr);
+        if (r == 0)
+            queued++;
+        else
+            errs++;
     }
-    p = apps(p, e, "ok: queued install pid=");
-    p = appdec(p, e, (long)pid);
-    p = apps(p, e, " addr=");
+
+    p = apps(p, e, "ok: addr=");
     p = apphex(p, e, addr);
-    apps(p, e, " (entry/return state machine)\n");
-    return 0;
+    p = apps(p, e, " queued=");
+    p = appdec(p, e, queued);
+    p = apps(p, e, " skipped=");
+    p = appdec(p, e, skipped);
+    p = apps(p, e, " errs=");
+    p = appdec(p, e, errs);
+    p = apps(p, e, " slots=");
+    p = appdec(p, e, slot_count());
+    apps(p, e, "\n");
+    return errs ? -1 : 0;
 }
 
 static long do_unhook(char *p, char *e)
 {
-    if (!g_task) {
+    int n = slot_count();
+    if (!n) {
         apps(p, e, "error: not hooked\n");
         return -1;
     }
-    g_tw_unhook.next = 0;
-    g_tw_unhook.func = tw_remove;
-    int r = fn_task_work_add(g_task, &g_tw_unhook, TWA_RESUME);
-    if (r) {
-        apps(p, e, "error: task_work_add(unhook) failed (target gone?)\n");
-        return -1;
+    int queued = 0;
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        struct bp_slot *s = &g_slots[i];
+        if (!s->active) continue;
+        s->tw_remove.next = 0;
+        s->tw_remove.func = tw_remove;
+        if (fn_task_work_add(s->task, &s->tw_remove, TWA_RESUME) == 0)
+            queued++;
+        else
+            s->active = 0; /* target gone: drop slot (bp auto-reaped on exit) */
     }
-    p = apps(p, e, "ok: queued unhook, entry_hits=");
-    p = appdec(p, e, g_entry_hits);
-    p = apps(p, e, " ret_hits=");
-    p = appdec(p, e, g_ret_hits);
-    apps(p, e, "\n");
-    g_task = 0;
+    p = apps(p, e, "ok: queued unhook for ");
+    p = appdec(p, e, queued);
+    apps(p, e, " thread(s)\n");
     return 0;
 }
 
 static long do_dump(char *p, char *e)
 {
-    p = apps(p, e, "entry_addr=");
-    p = apphex(p, e, g_entry_addr);
-    p = apps(p, e, " bp=");
-    p = apphex(p, e, (uint64_t)g_bp);
-    p = apps(p, e, " state=");
-    p = apps(p, e, g_state == ST_ENTRY ? "ENTRY" : "RETURN");
-    p = apps(p, e, "\nhits=");
+    p = apps(p, e, "slots=");
+    p = appdec(p, e, slot_count());
+    p = apps(p, e, " total_hits=");
     p = appdec(p, e, g_hits);
-    p = apps(p, e, " entry_hits=");
-    p = appdec(p, e, g_entry_hits);
-    p = apps(p, e, " ret_hits=");
-    p = appdec(p, e, g_ret_hits);
-    p = apps(p, e, "\n");
-    if (g_have_entry) {
-        p = apps(p, e, "entry: pc=");
-        p = apphex(p, e, g_entry_pc);
-        for (int i = 0; i < 4; i++) {
-            p = apps(p, e, i == 0 ? " x0=" : (i == 1 ? " x1=" : (i == 2 ? " x2=" : " x3=")));
-            p = apphex(p, e, g_args[i]);
+    apps(p, e, "\n");
+
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        struct bp_slot *s = &g_slots[i];
+        if (!s->active) continue;
+        if (p >= e - 96) {
+            p = apps(p, e, "...(truncated)\n");
+            break;
         }
-        p = apps(p, e, "\n");
+        p = apps(p, e, "tid=");
+        p = appdec(p, e, s->tid);
+        p = apps(p, e, " st=");
+        p = apps(p, e, s->state == ST_ENTRY ? "E" : "R");
+        p = apps(p, e, " e=");
+        p = appdec(p, e, s->entry_hits);
+        p = apps(p, e, " r=");
+        p = appdec(p, e, s->ret_hits);
+        if (s->have_entry) {
+            p = apps(p, e, " x0=");
+            p = apphex(p, e, s->args[0]);
+            p = apps(p, e, " x1=");
+            p = apphex(p, e, s->args[1]);
+        }
+        if (s->have_ret) {
+            p = apps(p, e, " ret=");
+            p = apphex(p, e, s->ret_x0);
+        }
+        apps(p, e, "\n");
     }
-    if (g_have_ret) {
-        p = apps(p, e, "return: pc=");
-        p = apphex(p, e, g_ret_pc);
-        p = apps(p, e, " x0=");
-        p = apphex(p, e, g_ret_x0);
-        p = apps(p, e, "\n");
-    }
-    if (!g_have_entry && !g_have_ret) apps(p, e, "(no hit captured yet)\n");
     return 0;
 }
 
@@ -422,7 +524,7 @@ static long shhwbp_init(const char *args, const char *event, void *__user reserv
 
 static long shhwbp_control0(const char *args, char *__user out_msg, int outlen)
 {
-    char buf[1024];
+    char buf[2048];
     for (int i = 0; i < (int)sizeof(buf); i++) buf[i] = 0;
     char *p = buf;
     char *e = buf + sizeof(buf) - 1;
@@ -431,17 +533,14 @@ static long shhwbp_control0(const char *args, char *__user out_msg, int outlen)
 
     if (starts(a, "probe")) {
         rc = do_probe(p, e);
-    } else if (starts(a, "hook")) {
-        uint64_t pid = 0, addr = 0;
-        const char *s = parse_ull(a + 4, &pid);
-        parse_ull(s, &addr);
-        rc = do_hook(pid, addr, p, e);
     } else if (starts(a, "unhook")) {
         rc = do_unhook(p, e);
+    } else if (starts(a, "hook")) {
+        rc = do_hook(a + 4, p, e);
     } else if (starts(a, "dump")) {
         rc = do_dump(p, e);
     } else {
-        apps(p, e, "usage: probe | hook <pid> <hexaddr> | dump | unhook\n");
+        apps(p, e, "usage: probe | hook <hexaddr> <tid> [tid ...] | dump | unhook\n");
         rc = -1;
     }
 
@@ -455,11 +554,18 @@ static long shhwbp_control0(const char *args, char *__user out_msg, int outlen)
 
 static long shhwbp_exit(void *__user reserved)
 {
-    if (g_bp && fn_unregister_hw_breakpoint) {
-        fn_unregister_hw_breakpoint(g_bp);
-        g_bp = 0;
+    long te = 0, tr = 0;
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        struct bp_slot *s = &g_slots[i];
+        if (s->bp && fn_unregister_hw_breakpoint) {
+            fn_unregister_hw_breakpoint(s->bp);
+            s->bp = 0;
+        }
+        te += s->entry_hits;
+        tr += s->ret_hits;
+        s->active = 0;
     }
-    logki("shhwbp: exit entry_hits=%ld ret_hits=%ld\n", g_entry_hits, g_ret_hits);
+    logki("shhwbp: exit total_entry=%ld total_ret=%ld\n", te, tr);
     return 0;
 }
 
