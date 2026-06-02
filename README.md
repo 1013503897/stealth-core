@@ -18,7 +18,8 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 | **P1.5** | Single-breakpoint **entry↔return state machine** (kills the re-trigger livelock; captures args + return value; target runs transparently) | ✅ verified |
 | **P1.6** | Multi-thread following — per-thread bp table, all **existing** threads (each runs its own state machine, captures its own args) | ✅ verified |
 | **P1.6b** | Follow threads created **after** the hook (`wake_up_new_task`) + slot **GC on thread exit** (`do_exit`); table stays bounded under create/exit churn | ✅ verified |
-| **P2** | PTE/UXN + `do_page_fault` routing + userspace DBI recompile + ghost memory (breaks the 6-breakpoint limit → article's "ultimate" architecture) | ⬜ todo |
+| **P2.0** | Page-table walk: read + decode any process's leaf PTE (`get_task_mm` + `apply_to_existing_page_range`) — read-only foundation for UXN (`shpte`) | ✅ verified |
+| **P2** | UXN flip + `do_page_fault` routing + userspace DBI recompile + VMA-less ghost memory (breaks the 6-breakpoint limit → article's "ultimate" architecture) | ⬜ todo |
 
 ## Requirements
 
@@ -35,6 +36,7 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 ```
 kpm/        shpoc.c     P0 syscall-hook smoke test
             shhwbp.c    P1.5/P1.6 HWBP hook: per-thread bp table + state machine
+            shpte.c     P2 PTE/UXN work (step0: read+decode a user VA's PTE)
             shmin.c     minimal ctl0 isolation test
             build.ps1   build a .kpm with NDK clang  (build.ps1 -Src shhwbp.c)
 cli/        shctl.c     KPM control CLI (supercall: load/unload/list/info/control)
