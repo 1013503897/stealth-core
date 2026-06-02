@@ -19,7 +19,10 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 | **P1.6** | Multi-thread following — per-thread bp table, all **existing** threads (each runs its own state machine, captures its own args) | ✅ verified |
 | **P1.6b** | Follow threads created **after** the hook (`wake_up_new_task`) + slot **GC on thread exit** (`do_exit`); table stays bounded under create/exit churn | ✅ verified |
 | **P2.0** | Page-table walk: read + decode any process's leaf PTE (`get_task_mm` + `apply_to_existing_page_range`) — read-only foundation for UXN (`shpte`) | ✅ verified |
-| **P2** | UXN flip + `do_page_fault` routing + userspace DBI recompile + VMA-less ghost memory (breaks the 6-breakpoint limit → article's "ultimate" architecture) | ⬜ todo |
+| **P2.1** | UXN flip on the target code page + `do_page_fault` interception with **self-healing** resume (validates the page-table-write + fault-hook + safe-EL0-resume machinery) | ✅ verified |
+| **P2.2** | **Single-function no-trace redirect**: keep UXN set, reroute the faulting PC to a verbatim **clone** of a page-isolated, PC-relative-free function (`.text` untouched, no new exec VMA at the func) | ✅ verified |
+| **P3** | Full DBI recompiler — `ADRP`/`ADR`/`B`/`BL`/`B.cond`/`CBZ`/`TBZ`/`LDR`-literal/`BLR`+PAC fixups → arbitrary functions, whole-page (article §5.7) | ⬜ todo |
+| **P4** | VMA-less **ghost memory** (article §5.9) + `maps`/`seq_file` hide (§5.8) so the clone page is invisible to `/proc/*/maps` | ⬜ todo |
 
 ## Requirements
 
@@ -36,16 +39,19 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 ```
 kpm/        shpoc.c     P0 syscall-hook smoke test
             shhwbp.c    P1.5/P1.6 HWBP hook: per-thread bp table + state machine
-            shpte.c     P2 PTE/UXN work (step0: read+decode a user VA's PTE)
+            shpte.c     P2 PTE/UXN: pte read | arm (self-heal) | redirect (clone) | disarm
             shmin.c     minimal ctl0 isolation test
             build.ps1   build a .kpm with NDK clang  (build.ps1 -Src shhwbp.c)
 cli/        shctl.c     KPM control CLI (supercall: load/unload/list/info/control)
             build_shctl.ps1
 tools/      hbtarget.c  self-contained single-thread HWBP test target (pid + &tick, loops)
             mttarget.c  multi-thread target; spawns workers gradually (grow) or churns them (churn)
+            dbitarget.c        P2.2 target: page-isolated, PC-relative-free tick() + self-clone
             run_mt_test.sh     P1.6 harness (hook every existing thread → dump → unhook → unload)
             run_grow_test.sh   P1.6b harness (hook t0 threads, watch new threads auto-followed)
             run_churn_test.sh  P1.6b harness (churn threads, watch slot GC keep the table bounded)
+            run_uxn_test.sh    P2.1 harness (UXN + do_page_fault self-heal)
+            run_redirect_test.sh  P2.2 harness (UXN net + reroute tick into its clone)
 vendor/     KernelPatch  (SDK headers + docs; tag 0.13.1)
 ```
 
@@ -111,5 +117,9 @@ thread is followed independently. (If two devices are attached, add `-s <serial>
 
 ## Next
 
-- **P2**: PTE/UXN + `do_page_fault` interception + userspace DBI recompiler + VMA-less ghost memory.
-  This is the high-risk phase (page-table surgery); expect device reboots during bring-up.
+- **P3**: a real DBI recompiler so *arbitrary* functions (not just PC-relative-free leaves) can be
+  cloned — rewrite `ADRP`/`ADR`/`B`/`BL`/`B.cond`/`CBZ`/`TBZ`/`LDR`-literal and demote `BLR*`→`BR*`
+  (preserve PAC), with an `offset_map` for whole-page recompilation (article §5.7). Then route via
+  `offset_map` in the `do_page_fault` handler instead of the current `clone + (far & 0xfff)`.
+- **P4**: VMA-less ghost memory for the clone (article §5.9) + `seq_file`/`maps` hide (§5.8), so the
+  clone page can't be found by `/proc/*/maps` or `mincore`. Still page-table surgery; expect reboots.

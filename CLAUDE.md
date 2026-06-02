@@ -141,10 +141,16 @@ Two independent version pins must match the device, or load/supercall silently f
 - `shmin.c` — minimal `KPM_CTL0` isolation test (init + fixed-string ctl0 + exit).
 - `shhwbp.c` — P1.5/P1.6 HWBP hook: per-thread breakpoint table + entry↔return state machine with
   `task_work` deferral (the real PoC; everything above describes it).
-- `shpte.c` — P2 PTE/UXN line of work. Step 0 (current): read + decode any process's leaf PTE via
-  `get_task_mm` + `apply_to_existing_page_range` (callback gets the `pte_t*`, so no mm/pgd offsets).
-  PTE bit layout comes from KP's `pgtable.h` (`PTE_UXN` = 1<<54, etc.). Read-only so far; flipping
-  UXN + routing `do_page_fault` is the next, device-risky step.
+- `shpte.c` — P2 PTE/UXN "high-voltage net". Commands: `pte` (read+decode a leaf PTE, read-only),
+  `arm` (set `PTE_UXN` on the target code page + `hook_wrap3(do_page_fault)`, **self-heal** the
+  fault — P2.1), `redirect` (same but keep UXN set and set `regs->pc = clone + (far & 0xfff)` to
+  reroute into a userspace clone page — P2.2), `disarm`/`dump`. PTE resolved via `get_task_mm` +
+  `apply_to_existing_page_range` (callback hands the `pte_t*`, no mm/pgd offsets); bits from KP's
+  `pgtable.h`. The `do_page_fault` callback is hard-gated (armed + exact target page + faulting
+  `tgid` via `__task_pid_nr_ns`/`get_current`) and the PTE pointer is cached at arm time so the hot
+  path does no page walk. `tools/dbitarget.c` is the P2.2 target: `tick()` is page-isolated
+  (`aligned(4096)` + guard) and PC-relative-free so a verbatim page copy is a valid clone. **Next
+  (P3/P4):** a real DBI recompiler (instruction fixups for arbitrary functions) + ghost memory.
 
 Test targets live in `tools/`: `hbtarget.c` (single thread) and `mttarget.c` (main + 4 workers, for
 P1.6). `tools/run_mt_test.sh` is the device-side end-to-end harness; neither target has a build
