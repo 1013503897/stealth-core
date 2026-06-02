@@ -1,0 +1,16 @@
+# Build artifacts
+*.o
+*.kpm
+
+# Compiled Android arm64 binaries (built by build_shctl.ps1 / NDK clang)
+/cli/shctl
+/tools/hbtarget
+/tools/mttarget
+
+# Device-side scratch
+*.out
+
+# External dependency: KernelPatch is checked out separately at tag 0.13.1
+# (see README "Requirements"). Not vendored into this repo to avoid an
+# embedded git repo; re-clone github.com/bmax121/KernelPatch at 0.13.1.
+/vendor/
