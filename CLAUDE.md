@@ -30,9 +30,9 @@ Hooking spans kernel and userspace, bridged by a string-command control channel:
 
 ### The KPM_CTL0 command bridge
 `shhwbp` exposes a tiny text protocol through its single `KPM_CTL0` entrypoint
-(`shhwbp_control0`): `probe | hook <hexaddr> <tid> [tid…] | dump | unhook`. Commands are parsed with
-hand-rolled freestanding string helpers (`apps`/`apphex`/`appdec`/`parse_ull`) because there is no
-libc in kernel context. New module capabilities are added as new verbs here, not as new supercalls.
+(`shhwbp_control0`): `probe | hook <hexaddr> <pid> <tid> [tid…] | dump | unhook`. Commands are parsed
+with hand-rolled freestanding string helpers (`apps`/`apphex`/`appdec`/`parse_ull`) because there is
+no libc in kernel context. New module capabilities are added as new verbs here, not as new supercalls.
 
 ### Per-thread breakpoint table (P1.6)
 HWBP is a *per-thread* CPU debug-register state — a breakpoint on one TID does not fire for sibling
@@ -41,10 +41,18 @@ each with its own attr copy, entry↔return state, and **its own `task_work` hea
 across threads would corrupt the task_work list). The `tw_install`/`tw_move`/`tw_remove` callbacks
 recover their slot via `container_of(head, struct bp_slot, <member>)`; the breakpoint handler maps the
 firing `perf_event` back to its slot by pointer match (`slot_by_bp`). Userspace enumerates
-`/proc/<pid>/task` and passes the TID list (the kernel-side thread-group walk is deliberately
-avoided). PoC limits: a task ref is leaked per slot (keeps `task_struct` alive so the table can't
-UAF), threads must stay alive until unhook, and threads spawned *after* the hook are not yet followed
-(P1.6b: `wake_up_new_task` + RCU/GC).
+`/proc/<pid>/task` and passes the `<pid>` (tgid) + initial TID list (the kernel-side thread-group walk
+is deliberately avoided).
+
+**New-thread following + GC (P1.6b):** while hooked, `shhwbp` inline-hooks (`hook_wrap1`)
+`wake_up_new_task` to catch threads created after the hook — if the new task's tgid matches the
+target (read via `__task_pid_nr_ns`), it arms a slot and defers the perf install to the new thread's
+own context via `task_work` (never registering from the `wake_up_new_task` entry). It also hooks
+`do_exit` to GC the exiting thread's slot (clear `active`/`bp`, **no** `unregister` — the kernel reaps
+the perf_event itself), keeping the table bounded under thread churn. Both wraps are removed on
+`unhook`/module exit. Safety net: a task ref is leaked per slot, `dump` never derefs `task`/`bp`, and
+`unhook` drops a slot without `unregister` if `task_work_add` fails on a dead thread — so even a missed
+GC cannot UAF. Full RCU on the slot table (article §5.1) is judged overkill for this static array.
 
 ### The deferred-work safety model (most important invariant)
 Perf/breakpoint kernel APIs (`register/unregister/modify_user_hw_breakpoint`) and other

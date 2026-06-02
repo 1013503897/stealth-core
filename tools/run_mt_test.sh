@@ -30,7 +30,7 @@ TIDS=$(ls /proc/$PID/task 2>/dev/null | tr '\n' ' ')
 echo "parsed: PID=$PID TICK=$TICK TIDS=[$TIDS]"
 
 echo "== hook all threads =="
-timeout 10 $C control shhwbp "hook $TICK $TIDS"
+timeout 10 $C control shhwbp "hook $TICK $PID $TIDS"
 
 echo "== let it run 3s, then dump =="
 sleep 3

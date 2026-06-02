@@ -17,7 +17,7 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 | **P1** | ARM64 hardware breakpoint hook + register capture (`shhwbp`) | ✅ verified |
 | **P1.5** | Single-breakpoint **entry↔return state machine** (kills the re-trigger livelock; captures args + return value; target runs transparently) | ✅ verified |
 | **P1.6** | Multi-thread following — per-thread bp table, all **existing** threads (each runs its own state machine, captures its own args) | ✅ verified |
-| **P1.6b** | Hook **new** threads (`wake_up_new_task`) + RCU + deferred GC on thread exit (article §5.1) | ⬜ todo |
+| **P1.6b** | Follow threads created **after** the hook (`wake_up_new_task`) + slot **GC on thread exit** (`do_exit`); table stays bounded under create/exit churn | ✅ verified |
 | **P2** | PTE/UXN + `do_page_fault` routing + userspace DBI recompile + ghost memory (breaks the 6-breakpoint limit → article's "ultimate" architecture) | ⬜ todo |
 
 ## Requirements
@@ -40,8 +40,10 @@ kpm/        shpoc.c     P0 syscall-hook smoke test
 cli/        shctl.c     KPM control CLI (supercall: load/unload/list/info/control)
             build_shctl.ps1
 tools/      hbtarget.c  self-contained single-thread HWBP test target (pid + &tick, loops)
-            mttarget.c  multi-thread target (main + 4 workers) for P1.6 following
-            run_mt_test.sh  device-side P1.6 harness (load → hook all threads → dump → unhook → unload)
+            mttarget.c  multi-thread target; spawns workers gradually (grow) or churns them (churn)
+            run_mt_test.sh     P1.6 harness (hook every existing thread → dump → unhook → unload)
+            run_grow_test.sh   P1.6b harness (hook t0 threads, watch new threads auto-followed)
+            run_churn_test.sh  P1.6b harness (churn threads, watch slot GC keep the table bounded)
 vendor/     KernelPatch  (SDK headers + docs; tag 0.13.1)
 ```
 
@@ -61,8 +63,9 @@ adb shell su -c '/data/local/tmp/shctl KEY load /data/local/tmp/shhwbp.kpm'
 adb shell su -c '/data/local/tmp/shctl KEY control shhwbp probe'        # resolve symbols
 adb shell su -c 'setsid /data/local/tmp/hbtarget >/data/local/tmp/hbt.out 2>&1 </dev/null &'
 adb shell cat /data/local/tmp/hbt.out                                   # -> pid=.. tick=0x..
-# hook syntax (P1.6): hook <hexaddr> <tid> [tid ...]; single-thread target => tid == pid
-adb shell su -c '/data/local/tmp/shctl KEY control shhwbp "hook <tickaddr> <pid>"'
+# hook syntax: hook <hexaddr> <pid> <tid> [tid ...]; <pid> is the tgid to follow new
+# threads of; single-thread target => tid == pid, so pass pid twice
+adb shell su -c '/data/local/tmp/shctl KEY control shhwbp "hook <tickaddr> <pid> <pid>"'
 adb shell su -c '/data/local/tmp/shctl KEY control shhwbp dump'         # hits low, x0=arg, return captured
 adb shell su -c '/data/local/tmp/shctl KEY control shhwbp unhook'
 adb shell su -c '/data/local/tmp/shctl KEY unload shhwbp'
@@ -106,8 +109,5 @@ thread is followed independently. (If two devices are attached, add `-s <serial>
 
 ## Next
 
-- **P1.6b**: hook thread *creation* (`wake_up_new_task`) so threads spawned after the hook are also
-  followed, with RCU + deferred GC so a thread exiting mid-fire doesn't UAF (article §5.1). Current
-  P1.6 follows only threads that exist at hook time and intentionally leaks a task ref per slot.
 - **P2**: PTE/UXN + `do_page_fault` interception + userspace DBI recompiler + VMA-less ghost memory.
   This is the high-risk phase (page-table surgery); expect device reboots during bring-up.

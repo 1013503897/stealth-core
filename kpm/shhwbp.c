@@ -32,11 +32,14 @@
  * owning thread's context (sleepable). Each slot owns its task_work heads so
  * concurrent threads never collide on a shared list node.
  *
- * Memory safety vs thread exit: a task ref is leaked per slot (keeps the
- * task_struct alive). dump never derefs task/bp; unhook's tw_remove runs in the
- * owning thread's context and is dropped (no unregister) if task_work_add fails
- * on an exiting thread -- so a thread exiting on its own leaves a stale slot but
- * cannot UAF. Prompt slot GC on thread exit is B2 (do_exit hook), not yet done.
+ * Thread-exit GC (B2): we also inline-hook do_exit. At its entry (exiting task =
+ * current, perf events not yet torn down) we retire that task's slot -- clear bp
+ * (kernel reaps the perf_event itself) and active, no unregister. Pure memory
+ * ops, so safe in that context. Belt-and-suspenders: a task ref is leaked per
+ * slot (task_struct stays alive), dump never derefs task/bp, and unhook drops a
+ * slot without unregister if task_work_add fails on a dead thread -- so even a
+ * missed GC cannot UAF. (Full RCU on the slot table, article 5.1, is overkill
+ * for this static-array PoC and is not implemented.)
  *
  * Commands (shctl <key> control shhwbp "<cmd> ..."):
  *   probe                            - resolve kernel symbols, report them
@@ -55,13 +58,14 @@
 #include <kputils.h>
 #include <hook.h>
 #include <asm/ptrace.h>
+#include <asm/current.h>
 #include <stdint.h>
 
 KPM_NAME("shhwbp");
-KPM_VERSION("0.5.0");
+KPM_VERSION("0.6.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("stealth-poc");
-KPM_DESCRIPTION("P1.6: HWBP per-thread table + follow new threads (wake_up_new_task)");
+KPM_DESCRIPTION("P1.6: HWBP per-thread table + follow new threads + GC on exit");
 
 #ifndef offsetof
 #define offsetof(t, m) __builtin_offsetof(t, m)
@@ -154,6 +158,7 @@ static void *(*fn_find_get_task_by_vpid)(int) = 0;
 static int (*fn_task_work_add)(void *task, void *work, int notify) = 0;
 static int (*fn_task_pid_nr_ns)(void *task, int type, void *ns) = 0;
 static void *g_addr_wake = 0; /* wake_up_new_task */
+static void *g_addr_exit = 0; /* do_exit */
 
 /* ---- state ---- */
 static struct bp_slot g_slots[MAX_SLOTS];
@@ -162,7 +167,9 @@ static uint64_t g_entry_addr = 0;      /* target entry addr, shared by all threa
 static volatile int g_target_tgid = 0;
 static volatile int g_armed = 0;       /* following new threads? */
 static volatile int g_wake_hooked = 0; /* wake_up_new_task wrapped? */
+static volatile int g_exit_hooked = 0; /* do_exit wrapped? */
 static volatile long g_auto_added = 0;
+static volatile long g_auto_removed = 0;
 
 /* ---- tiny string/number helpers (freestanding) ---- */
 static char *apps(char *p, char *e, const char *s)
@@ -402,6 +409,26 @@ static void before_wake(hook_fargs1_t *fargs, void *udata)
     if (slot_arm(tid, task, g_entry_addr, 1) == 0) g_auto_added++;
 }
 
+/* inline-hook callback for do_exit(long code): retire the exiting thread's slot.
+ * Runs at do_exit entry in the exiting task's context (current), BEFORE the
+ * kernel tears down its perf events -- so we must NOT unregister (the kernel
+ * will); we just stop tracking. Pure memory ops, no perf/blocking calls. */
+static void before_exit(hook_fargs1_t *fargs, void *udata)
+{
+    (void)fargs;
+    (void)udata;
+    if (!g_armed || !fn_task_pid_nr_ns) return;
+    void *t = (void *)get_current();
+    if (g_target_tgid && fn_task_pid_nr_ns(t, PIDTYPE_TGID, 0) != g_target_tgid) return;
+    int tid = fn_task_pid_nr_ns(t, PIDTYPE_PID, 0);
+    struct bp_slot *s = slot_by_tid(tid);
+    if (!s) return;
+    s->bp = 0;     /* kernel reaps the perf_event in this same do_exit */
+    s->active = 0; /* retire slot (task ref still leaked) */
+    g_auto_removed++;
+    logki("shhwbp: gc tid=%d on exit (entry=%ld ret=%ld)\n", tid, s->entry_hits, s->ret_hits);
+}
+
 static void resolve_syms(void)
 {
     if (!fn_register_user_hw_breakpoint)
@@ -415,6 +442,7 @@ static void resolve_syms(void)
     if (!fn_task_work_add) fn_task_work_add = (void *)kallsyms_lookup_name("task_work_add");
     if (!fn_task_pid_nr_ns) fn_task_pid_nr_ns = (void *)kallsyms_lookup_name("__task_pid_nr_ns");
     if (!g_addr_wake) g_addr_wake = (void *)kallsyms_lookup_name("wake_up_new_task");
+    if (!g_addr_exit) g_addr_exit = (void *)kallsyms_lookup_name("do_exit");
 }
 
 /* install one slot for one explicit tid at addr; returns 0 on queued, <0 on error */
@@ -446,7 +474,7 @@ static long do_hook(const char *args, char *p, char *e)
     g_entry_addr = addr;
     g_target_tgid = (int)pid;
 
-    /* arm new-thread following: inline-hook wake_up_new_task */
+    /* arm new-thread following: inline-hook wake_up_new_task (create) + do_exit (gc) */
     int wake_ok = 0;
     if (!g_wake_hooked && fn_task_pid_nr_ns && g_addr_wake) {
         hook_err_t he = hook_wrap1(g_addr_wake, (void *)before_wake, 0, 0);
@@ -460,6 +488,14 @@ static long do_hook(const char *args, char *p, char *e)
         wake_ok = 1;
     }
     g_armed = wake_ok;
+
+    if (g_armed && !g_exit_hooked && g_addr_exit) {
+        hook_err_t he = hook_wrap1(g_addr_exit, (void *)before_exit, 0, 0);
+        if (he == HOOK_NO_ERR)
+            g_exit_hooked = 1;
+        else
+            logke("shhwbp: hook_wrap1(do_exit) err=%d (no exit-GC)\n", (int)he);
+    }
 
     int queued = 0, skipped = 0, errs = 0;
     const char *cur = skipsp(s);
@@ -506,6 +542,10 @@ static long do_unhook(char *p, char *e)
         hook_unwrap(g_addr_wake, (void *)before_wake, 0);
         g_wake_hooked = 0;
     }
+    if (g_exit_hooked && g_addr_exit) {
+        hook_unwrap(g_addr_exit, (void *)before_exit, 0);
+        g_exit_hooked = 0;
+    }
 
     int n = slot_count();
     if (!n) {
@@ -541,6 +581,8 @@ static long do_dump(char *p, char *e)
     p = appdec(p, e, g_target_tgid);
     p = apps(p, e, " auto_added=");
     p = appdec(p, e, g_auto_added);
+    p = apps(p, e, " auto_removed=");
+    p = appdec(p, e, g_auto_removed);
     apps(p, e, "\n");
 
     for (int i = 0; i < MAX_SLOTS; i++) {
@@ -588,6 +630,8 @@ static long do_probe(char *p, char *e)
     p = apphex(p, e, (uint64_t)fn_task_pid_nr_ns);
     p = apps(p, e, "\nwake_up_new_task=");
     p = apphex(p, e, (uint64_t)g_addr_wake);
+    p = apps(p, e, "\ndo_exit=");
+    p = apphex(p, e, (uint64_t)g_addr_exit);
     apps(p, e, "\n");
     return 0;
 }
@@ -635,6 +679,10 @@ static long shhwbp_exit(void *__user reserved)
     if (g_wake_hooked && g_addr_wake) {
         hook_unwrap(g_addr_wake, (void *)before_wake, 0);
         g_wake_hooked = 0;
+    }
+    if (g_exit_hooked && g_addr_exit) {
+        hook_unwrap(g_addr_exit, (void *)before_exit, 0);
+        g_exit_hooked = 0;
     }
     long te = 0, tr = 0;
     for (int i = 0; i < MAX_SLOTS; i++) {
