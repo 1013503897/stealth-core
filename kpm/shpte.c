@@ -1,25 +1,30 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * stealth-poc P2 KPM (step 0): page-table / PTE inspection.
+ * stealth-poc P2 KPM: PTE/UXN "high-voltage net" (article 5.6), step by step.
  *
- * Foundation for the "UXN high-voltage net" technique (article 5.6): to hook
- * without touching the target's .text, we will flip the UXN bit on the target
- * code page so any EL0 execute traps into do_page_fault, then route it. Before
- * any of that page-table surgery (which can reboot the device), this step only
- * READS a user VA's leaf PTE and decodes it -- proving we can walk an arbitrary
- * process's page table on this kernel. NOTHING is modified here.
+ *   P2.0  read + decode any process's leaf PTE (no modification).
+ *   P2.1  arm: flip the target code page's UXN bit so EL0 execute faults, hook
+ *         do_page_fault, and SELF-HEAL the fault (clear UXN, re-execute). This
+ *         proves the page-table-write + fault-interception + safe-EL0-resume
+ *         machinery without a clone page, so a gating bug self-heals rather than
+ *         crashing the target. (P2.2 will keep UXN set and redirect PC to a
+ *         recompiled clone instead of self-healing -- the actual no-trace hook.)
  *
- * Approach (clean-room, matches the article's primitives): resolve get_task_mm
- * + apply_to_existing_page_range via kallsyms; apply_to_existing_page_range
- * hands our callback the leaf pte_t* directly, so we avoid hard-coding any
- * mm_struct/pgd struct offsets. KP's pgtable.h gives the ARM64 PTE bit layout.
+ * Safety: do_page_fault is the hottest path in the kernel. The before-callback
+ * is gated hard -- if not armed, return immediately; otherwise only act when the
+ * fault address is on our exact target page AND the faulting task's tgid matches
+ * the target (so we never swallow another process's fault). The PTE pointer is
+ * resolved once at arm time and cached, so the handler does no page-table walk /
+ * locking -- just a u64 write + TLB flush.
  *
  * Commands (shctl <key> control shpte "<cmd> ..."):
- *   probe                  - resolve kernel symbols, report them
- *   pte <pid> <hexaddr>    - read + decode the leaf PTE for VA addr in pid
+ *   probe                 - resolve kernel symbols, report them
+ *   pte  <pid> <hexaddr>  - read + decode the leaf PTE for VA addr in pid
+ *   arm  <pid> <hexaddr>  - hook do_page_fault + set UXN on addr's page (self-heal)
+ *   disarm                - clear UXN + unhook do_page_fault
+ *   dump                  - armed state, target, fault count, live PTE value
  *
- * PoC: leaks one task ref per query (consistent with the rest of the PoC); the
- * mm ref taken by get_task_mm is released with mmput.
+ * Clean-room: KernelPatch kpm SDK only. PoC: leaks a task ref per arm/pte.
  */
 
 #include <compiler.h>
@@ -27,21 +32,35 @@
 #include <log.h>
 #include <kallsyms.h>
 #include <kputils.h>
+#include <hook.h>
 #include <pgtable.h>
+#include <asm/current.h>
 #include <stdint.h>
 
 KPM_NAME("shpte");
-KPM_VERSION("0.1.0");
+KPM_VERSION("0.2.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("stealth-poc");
-KPM_DESCRIPTION("P2 step0: read + decode a user VA's PTE (no modification)");
+KPM_DESCRIPTION("P2: PTE read + UXN net via do_page_fault (P2.1 self-heal)");
+
+enum { PIDTYPE_PID = 0, PIDTYPE_TGID = 1 };
 
 /* ---- resolved kernel symbols ---- */
 static void *(*fn_find_get_task_by_vpid)(int) = 0;
 static void *(*fn_get_task_mm)(void *task) = 0;
 static void (*fn_mmput)(void *mm) = 0;
-/* int apply_to_existing_page_range(mm, addr, size, pte_fn_t fn, void *data) */
 static int (*fn_apply_existing)(void *mm, unsigned long addr, unsigned long size, void *fn, void *data) = 0;
+static int (*fn_task_pid_nr_ns)(void *task, int type, void *ns) = 0;
+static void *g_addr_pf = 0; /* do_page_fault */
+
+/* ---- arm state ---- */
+static volatile int g_armed = 0;
+static volatile int g_pf_hooked = 0;
+static volatile int g_target_pid = 0;
+static volatile uint64_t g_target_page = 0;
+static uint64_t *g_ptep = 0;        /* cached kernel VA of the leaf PTE */
+static uint64_t g_pte_orig = 0;     /* original PTE value (UXN clear) */
+static volatile long g_faults = 0;
 
 /* ---- tiny freestanding string/number helpers ---- */
 static char *apps(char *p, char *e, const char *s)
@@ -126,9 +145,9 @@ static int is_err_or_null(void *p)
 
 /* ---- apply_to_existing_page_range callback: capture the leaf PTE ---- */
 struct pte_out {
-    volatile uint64_t ptep; /* kernel VA of the PTE slot */
-    volatile uint64_t val;  /* raw PTE value */
-    volatile int n;         /* #entries visited */
+    volatile uint64_t ptep;
+    volatile uint64_t val;
+    volatile int n;
 };
 static int pte_cb(void *pte, unsigned long addr, void *data)
 {
@@ -140,6 +159,46 @@ static int pte_cb(void *pte, unsigned long addr, void *data)
     return 0;
 }
 
+/* resolve the leaf PTE for VA `base` in process `pid`; returns ptep/val via out.
+ * Leaks the task ref (PoC); releases the mm ref. */
+static int resolve_pte(uint64_t pid, uint64_t base, struct pte_out *o)
+{
+    o->ptep = 0;
+    o->val = 0;
+    o->n = 0;
+    void *task = fn_find_get_task_by_vpid((int)pid);
+    if (is_err_or_null(task)) return -1;
+    void *mm = fn_get_task_mm(task);
+    if (is_err_or_null(mm)) return -2;
+    int rc = fn_apply_existing(mm, base, 0x1000, (void *)pte_cb, o);
+    fn_mmput(mm);
+    if (o->n == 0) return -3;
+    (void)rc;
+    return 0;
+}
+
+/* ---- do_page_fault before-callback: self-heal the UXN execute fault ----
+ * do_page_fault(unsigned long far, unsigned long esr, struct pt_regs *regs) */
+static void before_pf(hook_fargs3_t *fargs, void *udata)
+{
+    (void)udata;
+    if (!g_armed) return;
+    uint64_t far = fargs->arg0;
+    if ((far & ~0xfffUL) != g_target_page) return;
+    if (fn_task_pid_nr_ns) {
+        void *t = (void *)get_current();
+        if (fn_task_pid_nr_ns(t, PIDTYPE_TGID, 0) != g_target_pid) return;
+    }
+    /* our target code page execute-fault: restore UXN-clear PTE + resume */
+    if (g_ptep) {
+        *(volatile uint64_t *)g_ptep = g_pte_orig;
+        flush_tlb_all();
+    }
+    g_faults++;
+    fargs->skip_origin = 1; /* we handled it; don't run the real do_page_fault */
+    fargs->ret = 0;
+}
+
 static void resolve_syms(void)
 {
     if (!fn_find_get_task_by_vpid)
@@ -148,6 +207,8 @@ static void resolve_syms(void)
     if (!fn_mmput) fn_mmput = (void *)kallsyms_lookup_name("mmput");
     if (!fn_apply_existing)
         fn_apply_existing = (void *)kallsyms_lookup_name("apply_to_existing_page_range");
+    if (!fn_task_pid_nr_ns) fn_task_pid_nr_ns = (void *)kallsyms_lookup_name("__task_pid_nr_ns");
+    if (!g_addr_pf) g_addr_pf = (void *)kallsyms_lookup_name("do_page_fault");
 }
 
 static char *decode_pte(char *p, char *e, uint64_t v)
@@ -158,9 +219,8 @@ static char *decode_pte(char *p, char *e, uint64_t v)
     p = apps(p, e, v & PTE_RDONLY ? " RO" : " RW");
     p = apps(p, e, v & PTE_AF ? " AF" : " !AF");
     p = apps(p, e, v & PTE_PXN ? " PXN" : " pexec");
-    p = apps(p, e, v & PTE_UXN ? " UXN" : " uexec"); /* uexec = EL0-executable */
+    p = apps(p, e, v & PTE_UXN ? " UXN" : " uexec");
     p = apps(p, e, v & PTE_NG ? " nG" : "");
-    p = apps(p, e, v & PTE_DBM ? " DBM/W" : "");
     return p;
 }
 
@@ -171,34 +231,15 @@ static long do_pte(uint64_t pid, uint64_t addr, char *p, char *e)
         apps(p, e, "error: symbols not resolved (run probe)\n");
         return -1;
     }
-    void *task = fn_find_get_task_by_vpid((int)pid);
-    if (is_err_or_null(task)) {
-        apps(p, e, "error: task not found\n");
-        return -1;
-    }
-    void *mm = fn_get_task_mm(task); /* leaks task ref (PoC) */
-    if (is_err_or_null(mm)) {
-        apps(p, e, "error: no mm (kernel thread or exiting?)\n");
-        return -1;
-    }
-
     uint64_t base = addr & ~0xFFFUL;
     struct pte_out o;
-    o.ptep = 0;
-    o.val = 0;
-    o.n = 0;
-    int rc = fn_apply_existing(mm, base, 0x1000, (void *)pte_cb, &o);
-    fn_mmput(mm);
-
-    if (o.n == 0) {
+    int r = resolve_pte(pid, base, &o);
+    if (r) {
         p = apps(p, e, "addr=");
         p = apphex(p, e, addr);
-        p = apps(p, e, " : no leaf PTE (unmapped / not faulted in) rc=");
-        p = appdec(p, e, rc);
-        apps(p, e, "\n");
+        p = apps(p, e, r == -3 ? " : no leaf PTE (unmapped)\n" : " : task/mm lookup failed\n");
         return -1;
     }
-
     p = apps(p, e, "addr=");
     p = apphex(p, e, addr);
     p = apps(p, e, " page=");
@@ -208,9 +249,101 @@ static long do_pte(uint64_t pid, uint64_t addr, char *p, char *e)
     p = apps(p, e, " pte=");
     p = apphex(p, e, o.val);
     p = apps(p, e, " pa=");
-    p = apphex(p, e, o.val & 0x0000fffffffff000UL); /* output addr bits [47:12] */
+    p = apphex(p, e, o.val & 0x0000fffffffff000UL);
     p = apps(p, e, "\nflags:");
     p = decode_pte(p, e, o.val);
+    apps(p, e, "\n");
+    return 0;
+}
+
+static long do_arm(uint64_t pid, uint64_t addr, char *p, char *e)
+{
+    resolve_syms();
+    if (!fn_find_get_task_by_vpid || !fn_get_task_mm || !fn_mmput || !fn_apply_existing || !g_addr_pf ||
+        !fn_task_pid_nr_ns) {
+        apps(p, e, "error: symbols not resolved (run probe)\n");
+        return -1;
+    }
+    if (g_armed) {
+        apps(p, e, "error: already armed; disarm first\n");
+        return -1;
+    }
+
+    uint64_t base = addr & ~0xFFFUL;
+    struct pte_out o;
+    int r = resolve_pte(pid, base, &o);
+    if (r || !(o.val & PTE_VALID)) {
+        apps(p, e, "error: target page not present/valid (run it first)\n");
+        return -1;
+    }
+
+    g_target_pid = (int)pid;
+    g_target_page = base;
+    g_ptep = (uint64_t *)o.ptep;
+    g_pte_orig = o.val;
+    g_faults = 0;
+
+    /* hook do_page_fault BEFORE arming UXN so the first fault is caught */
+    if (!g_pf_hooked) {
+        hook_err_t he = hook_wrap3(g_addr_pf, (void *)before_pf, 0, 0);
+        if (he != HOOK_NO_ERR) {
+            apps(p, e, "error: hook_wrap3(do_page_fault) failed\n");
+            g_ptep = 0;
+            return -1;
+        }
+        g_pf_hooked = 1;
+    }
+    g_armed = 1;
+
+    /* set UXN -> EL0 execute on this page now faults into our handler */
+    *(volatile uint64_t *)g_ptep = g_pte_orig | PTE_UXN;
+    flush_tlb_all();
+
+    p = apps(p, e, "ok: armed pid=");
+    p = appdec(p, e, (long)pid);
+    p = apps(p, e, " page=");
+    p = apphex(p, e, base);
+    p = apps(p, e, " pte_now=");
+    p = apphex(p, e, *(volatile uint64_t *)g_ptep);
+    apps(p, e, " (UXN set; faults self-heal)\n");
+    return 0;
+}
+
+static long do_disarm(char *p, char *e)
+{
+    g_armed = 0;
+    if (g_ptep) {
+        *(volatile uint64_t *)g_ptep = g_pte_orig; /* clear UXN */
+        flush_tlb_all();
+    }
+    if (g_pf_hooked && g_addr_pf) {
+        hook_unwrap(g_addr_pf, (void *)before_pf, 0);
+        g_pf_hooked = 0;
+    }
+    p = apps(p, e, "ok: disarmed, faults=");
+    p = appdec(p, e, g_faults);
+    apps(p, e, "\n");
+    g_ptep = 0;
+    return 0;
+}
+
+static long do_state(char *p, char *e)
+{
+    p = apps(p, e, "armed=");
+    p = appdec(p, e, g_armed);
+    p = apps(p, e, " pf_hooked=");
+    p = appdec(p, e, g_pf_hooked);
+    p = apps(p, e, " pid=");
+    p = appdec(p, e, g_target_pid);
+    p = apps(p, e, " page=");
+    p = apphex(p, e, g_target_page);
+    p = apps(p, e, " faults=");
+    p = appdec(p, e, g_faults);
+    if (g_ptep) {
+        p = apps(p, e, "\npte_now=");
+        p = apphex(p, e, *(volatile uint64_t *)g_ptep);
+        p = decode_pte(p, e, *(volatile uint64_t *)g_ptep);
+    }
     apps(p, e, "\n");
     return 0;
 }
@@ -226,6 +359,10 @@ static long do_probe(char *p, char *e)
     p = apphex(p, e, (uint64_t)fn_mmput);
     p = apps(p, e, "\napply_to_existing_page_range=");
     p = apphex(p, e, (uint64_t)fn_apply_existing);
+    p = apps(p, e, "\n__task_pid_nr_ns=");
+    p = apphex(p, e, (uint64_t)fn_task_pid_nr_ns);
+    p = apps(p, e, "\ndo_page_fault=");
+    p = apphex(p, e, (uint64_t)g_addr_pf);
     apps(p, e, "\n");
     return 0;
 }
@@ -256,8 +393,20 @@ static long shpte_control0(const char *args, char *__user out_msg, int outlen)
             apps(p, e, "usage: pte <pid> <hexaddr>\n"), rc = -1;
         else
             rc = do_pte(pid, addr, p, e);
+    } else if (starts(a, "disarm")) {
+        rc = do_disarm(p, e);
+    } else if (starts(a, "arm")) {
+        uint64_t pid = 0, addr = 0;
+        const char *s = parse_ull(a + 3, &pid);
+        parse_ull(s, &addr);
+        if (!pid || !addr)
+            apps(p, e, "usage: arm <pid> <hexaddr>\n"), rc = -1;
+        else
+            rc = do_arm(pid, addr, p, e);
+    } else if (starts(a, "dump")) {
+        rc = do_state(p, e);
     } else {
-        apps(p, e, "usage: probe | pte <pid> <hexaddr>\n");
+        apps(p, e, "usage: probe | pte <pid> <addr> | arm <pid> <addr> | disarm | dump\n");
         rc = -1;
     }
 
@@ -271,7 +420,18 @@ static long shpte_control0(const char *args, char *__user out_msg, int outlen)
 
 static long shpte_exit(void *__user reserved)
 {
-    logki("shpte: exit\n");
+    /* always restore + unhook so unload can't leave a UXN'd page or live hook */
+    g_armed = 0;
+    if (g_ptep) {
+        *(volatile uint64_t *)g_ptep = g_pte_orig;
+        flush_tlb_all();
+        g_ptep = 0;
+    }
+    if (g_pf_hooked && g_addr_pf) {
+        hook_unwrap(g_addr_pf, (void *)before_pf, 0);
+        g_pf_hooked = 0;
+    }
+    logki("shpte: exit faults=%ld\n", g_faults);
     return 0;
 }
 
