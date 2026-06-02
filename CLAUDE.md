@@ -148,9 +148,14 @@ Two independent version pins must match the device, or load/supercall silently f
   `apply_to_existing_page_range` (callback hands the `pte_t*`, no mm/pgd offsets); bits from KP's
   `pgtable.h`. The `do_page_fault` callback is hard-gated (armed + exact target page + faulting
   `tgid` via `__task_pid_nr_ns`/`get_current`) and the PTE pointer is cached at arm time so the hot
-  path does no page walk. `tools/dbitarget.c` is the P2.2 target: `tick()` is page-isolated
-  (`aligned(4096)` + guard) and PC-relative-free so a verbatim page copy is a valid clone. **Next
-  (P3/P4):** a real DBI recompiler (instruction fixups for arbitrary functions) + ghost memory.
+  path does no page walk. `redirectmap` (P3.1) routes via an `offset_map` (orig-insn-idx → clone-insn-idx) read from the
+  target with `access_process_vm` and cached in `g_offmap[1024]`, so a DBI clone whose instructions
+  shifted still routes correctly. The userspace **DBI recompiler** lives in the targets, not the KPM
+  (the kernel only routes the entry fault): `tools/dbitarget.c` (P2.2, verbatim clone of a
+  PC-relative-free `tick()`), `tools/dbitarget2.c` (P3.2, fixes ADR/ADRP/B/BL), `tools/dbitarget3.c`
+  (P3.3, 3-pass engine: also re-encodes internal B/B.cond/CBZ/TBZ clone-relative for loops/branches).
+  **Next (P3.4/P4):** LDR-literal + BLR/BR PAC demote; then VMA-less ghost memory so the clone (today
+  an ordinary RX anon mapping, still visible in `/proc/*/maps`) becomes invisible.
 
 Test targets live in `tools/`: `hbtarget.c` (single thread) and `mttarget.c` (main + 4 workers, for
 P1.6). `tools/run_mt_test.sh` is the device-side end-to-end harness; neither target has a build
