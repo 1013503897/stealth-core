@@ -158,13 +158,24 @@ Two independent version pins must match the device, or load/supercall silently f
   routes every faulting instruction into a whole-page DBI clone (per-page `offset_map`), overriding
   **one** function's entry (`page+target_off`) to `replace` while the clone's faithful copy of that
   function serves as the `backup` — the process-wide, page-neighbor-safe inline hook for real
-  (page-shared) functions (target `tools/pagetool.c`). `pghook`/`pgdisarm` are the **multi-page** form:
-  a fixed `g_pg[MAX_PG]` table so several such pages can be trapped at once (what an LSPlant frontend
-  needs — many libart funcs on distinct code pages, all hooked simultaneously); the shared `before_pf`
-  routes each fault by `(page, tgid)` to its slot, and the single `do_page_fault` hook is **ref-counted**
-  across the single-page and multi-page paths (`ensure_pf_hooked`/`maybe_unhook_pf`). Both are
-  device-verified (`tools/pgtool.c` + `run_pghook_test.sh`: funcA on one page and funcB on another are
-  hooked at once, each page's neighbor still runs from its clone, one `pgdisarm` drops both).
+  (page-shared) functions (target `tools/pagetool.c`). `pghook`/`pgunhook`/`pgdisarm` are the
+  **multi-page, multi-override** form (L1a): a fixed `g_pg[MAX_PG]` table (`MAX_PG=24`) so many such
+  pages can be trapped at once, and **each slot overrides up to `MAX_OV` function entries on its page**
+  (LSPlant inline-hooks ~20 libart funcs, several SHARING a code page). `pghook` is idempotent-arm +
+  append: the first call on a page arms it (UXN + whole-page clone + offmap), each later call on the
+  same `(pid,page)` appends an `(off→replace)` override. The override table is a **barrier-safe sentinel
+  array** (`OV_NONE` key for inert slots, `pg_set_ov` publishes key-last) so `before_pf` — which scans
+  it in the fault handler, a different thread of the same process — never matches a half-built entry or
+  jumps through a garbage pointer; **no perf/blocking call is added to the supercall/fault path** (just
+  PTE writes + `flush_tlb_all`, as the existing code already did, so no D-state risk). `pgunhook <pid>
+  <page> <off>` removes one override (single sentinel store; the fn reverts to its faithful clone copy)
+  and disarms the page when `nlive` hits 0. The shared `before_pf` routes each fault by `(page, tgid)`
+  to its slot, and the single `do_page_fault` hook is **ref-counted** across the single-page and
+  multi-page paths (`ensure_pf_hooked`/`maybe_unhook_pf`). Device-verified: `tools/pgtool.c` +
+  `run_pghook_test.sh` (single override per page, two pages) **and** `tools/kpmhooktool.c` +
+  `run_kpmhook_test.sh` (3 overrides on one page + a second page, partial/full unhook, page disarm)
+  driven by the **`lib/kpmhook`** userspace glue over the no-superkey bridge — the LSPlant
+  `inline_hooker`/`inline_unhooker` carrier (the seam the Vector integration links against).
   `hidemaps`/`unhidemaps` (P4.1) hook `show_map` and drop the clone's VMA from `/proc/*/maps` output
   (rewind `seq_file->count` + `SEQ_SKIP`; struct offsets taken from the device's kernel BTF).
   `hookto`/`hwhookto <pid> <target> <replace> <clonebytes> <nclone> <template> <ghost_va>` are the

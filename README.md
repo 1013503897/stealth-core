@@ -29,6 +29,7 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 | **P4.1** | `/proc/*/maps` hide: hook `show_map`, drop the clone's entry from the `seq_file` output (article §5.8) — beats CRC scan **and** maps scan together | ✅ verified |
 | **P4.2** | VMA-less **ghost memory**: inject a PTE for the clone with **no VMA** (`vmalloc`+`vmalloc_to_pfn`+`apply_to_page_range`); step A = inject+read (invisible to `maps`/`mincore`), step B = execute the DBI clone from the ghost page (`sync_icache`) — complete no-trace hook, no maps-hide hook needed | ✅ verified |
 | **P5** | Productization groundwork for LSPlant/Vector (and a future Frida-Gum stealth backend): `lib/libdbi` (reusable recompiler) · **HWBP-redirect `inline_hooker`** for real non-page-isolated funcs (`hwhookto`) + UXN variant (`hookto`) with ghost `backup` · no-superkey **syscall bridge** · **TracerPid spoof** (anti-debug) | ✅ verified |
+| **L1a** | LSPlant `inline_hooker` carrier: `pghook` scaled to **many overrides per page** (`MAX_OV`, barrier-safe sentinel table) across **`MAX_PG=24`** pages + `pgunhook` (per-fn `inline_unhooker`); **`lib/kpmhook`** userspace glue maps LSPlant's `InitInfo` callbacks onto the bridge (whole-page DBI clone per page, mmap RX). ~20 simultaneous libart-style hooks, several sharing a page, all from one no-superkey agent | ✅ verified |
 
 ## Requirements
 
@@ -45,10 +46,11 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 ```
 kpm/        shpoc.c     P0 syscall-hook smoke test
             shhwbp.c    P1.5/P1.6 HWBP hook: per-thread bp table + state machine
-            shpte.c     P2/P4/P5 main module. cmds: pte | arm | redirect | redirectmap |
-                        pagehook (whole-page UXN hook) | pghook/pgdisarm (multi-page table) |
-                        hookto/hwhookto (inline_hooker+ghost backup) | ghosttest/ghostredirect/
-                        ghostfree | hidemaps | hidetracer | bridge | disarm | dump
+            shpte.c     P2/P4/P5/L1a main module. cmds: pte | arm | redirect | redirectmap |
+                        pagehook (whole-page UXN hook) | pghook/pgunhook/pgdisarm (multi-page,
+                        multi-override-per-page table) | hookto/hwhookto (inline_hooker+ghost
+                        backup) | ghosttest/ghostredirect/ghostfree | hidemaps | hidetracer |
+                        bridge | disarm | dump
             shmin.c     minimal ctl0 isolation test
             build.ps1   build a .kpm with NDK clang  (build.ps1 -Src shhwbp.c)
 cli/        shctl.c     KPM control CLI (supercall: load/unload/list/info/control)
@@ -83,8 +85,15 @@ tools/      hbtarget.c  self-contained single-thread HWBP test target (pid + &ti
             run_hookto_test.sh / run_hwhook_test.sh / run_bridge_test.sh / run_tracer_test.sh
             run_pagehook_test.sh    P5 harness (single page-shared func hooked, neighbors normal)
             run_pghook_test.sh      P5 harness (two pages hooked simultaneously, neighbors normal)
+            kpmhooktool.c           L1a: in-process agent mimicking LSPlant's call pattern --
+                                    inline-hooks vx1/vx2/vx3 (3 overrides on ONE page) + vy1 (a
+                                    second page) via lib/kpmhook over the no-superkey bridge
+            run_kpmhook_test.sh     L1a harness (arm bridge, run kpmhooktool, observe multi-
+                                    override + partial/full unhook + page disarm)
 lib/        dbi.c/.h    libdbi: reusable AArch64 position-independent function recompiler
             dbi_test.c  host/device-runnable unit test (build_dbi_test.ps1)
+            kpmhook.c/.h L1a: LSPlant InitInfo inline_hooker/unhooker glue -> KPM multi-page
+                        pghook table over the syscall bridge (whole-page DBI clone; Vector links this)
 vendor/     KernelPatch  (SDK headers + docs; tag 0.13.1)
 
 The DBI recompiler is being consolidated into `lib/libdbi` for reuse by the userspace agent
@@ -168,7 +177,13 @@ The intended end-product is a modified **Vector** (JingMatrix's Zygisk ART-hook 
   real libart funcs share pages) + ghost backup; `inline_unhooker` → `hwunhook` + `ghostfree`.
 - JingMatrix's LSPlant `InitInfo` has **no `mem_map`** → the article's `alloc_ghost` is unnecessary.
 - **Layer 1** (native libart hooks at LSPlant init): swap Vector's `inline_hooker`/`unhooker` to call
-  our KPM via the syscall bridge — primitive proven by `hwhooktool`. Needs building Vector (gradle+NDK).
+  our KPM via the syscall bridge. LSPlant installs **~20 simultaneous** libart inline hooks (more than
+  6 HWBPs, more than the old `MAX_PG=8`), so the carrier is **multi-page UXN `pghook`** scaled to many
+  overrides per page across 24 pages. **L1a done + device-verified**: `lib/kpmhook` glue maps LSPlant's
+  `InitInfo` callbacks onto `pghook`/`pgunhook` (proven by `kpmhooktool` — 3 overrides on one page + a
+  second page + partial/full unhook). **Remaining:** wire `lib/kpmhook` into Vector's two `InitInfo`
+  sites (`zygisk/.../module.cpp`, `native/src/core/native_api.cpp`) + the `NativeAPIEntries` ABI, and
+  build Vector (gradle+NDK).
 - **Layer 2** (Java methods): fork LSPlant's `DoHook` to trap the compiled `entry_point` via HWBP/UXN
   instead of swapping the `ArtMethod` pointer (defeats pointer-roaming detection).
 - **Frida-Gum** (optional, larger): re-back Gum's `Interceptor` with `hwhookto` and Stalker's code

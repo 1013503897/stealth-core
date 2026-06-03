@@ -140,17 +140,30 @@ static volatile uint64_t g_redirect_fixed = 0; /* MODE_REDIRECT_FIXED: route ent
 static volatile uint64_t g_hook_off = 0;     /* byte offset of hooked fn in the page */
 static volatile uint64_t g_hook_replace = 0; /* 0 = no override */
 
-/* multi-page hook table: LSPlant inline-hooks several libart functions that live
- * on different pages, all active at once. Each slot UXN-traps one page, routes it
- * to a whole-page clone, and overrides one function's entry -> replace. */
-#define MAX_PG 8
+/* multi-page hook table: LSPlant inline-hooks ~20 libart functions that live on
+ * (and often SHARE) code pages, all active at once. Each slot UXN-traps one page,
+ * routes it to a whole-page clone, and overrides any of MAX_OV function entries on
+ * that page -> their replacements (several hooked funcs can share a page).
+ *
+ * Concurrency: overrides are appended/removed from the sleepable bridge/supercall
+ * context while before_pf (the page-fault handler, another thread of the same
+ * process) scans them. The override table is a fixed array scanned [0,MAX_OV) with
+ * a SENTINEL key for inert slots, so the handler NEVER sees a half-built entry and
+ * NEVER dereferences a garbage replacement: an entry is published key-last (write
+ * ov_replace, store barrier, then ov_off) and retired key-first (single store of
+ * the SENTINEL). ov_replace always holds a valid pointer or a stale-but-valid one
+ * -- never garbage. nlive counts non-inert slots (when it hits 0 the page disarms). */
+#define MAX_PG 24            /* trapped pages live at once (~20 libart funcs grouped by page) */
+#define MAX_OV 8             /* hooked function entries per trapped page */
+#define OV_NONE (~0ULL)      /* sentinel: inert override slot (a real page offset is < 0x1000) */
 struct pghook {
     volatile int active;
     int pid;
     uint64_t page;     /* UXN-trapped page */
     uint64_t clone;    /* whole-page clone base (user VA) */
-    uint64_t hook_off; /* byte offset of hooked fn entry in the page */
-    uint64_t replace;  /* 0 => no override (everything runs from clone) */
+    volatile int nlive;             /* live (non-inert) overrides; 0 => page can disarm */
+    volatile uint64_t ov_off[MAX_OV];     /* page-relative byte offset, or OV_NONE if inert */
+    volatile uint64_t ov_replace[MAX_OV]; /* replacement VA for ov_off[k] */
     int nmap;
     uint64_t *ptep;    /* cached leaf PTE pointer */
     uint64_t pte_orig; /* original PTE (UXN clear) */
@@ -159,6 +172,15 @@ struct pghook {
 };
 static struct pghook g_pg[MAX_PG];
 static volatile int g_npg = 0;
+
+/* publish a new override key-last so a racing before_pf never matches an offset
+ * before its replacement pointer is in place */
+static inline void pg_set_ov(struct pghook *s, int k, uint64_t off, uint64_t replace)
+{
+    s->ov_replace[k] = replace;
+    asm volatile("dmb ishst" ::: "memory"); /* replace visible before the key */
+    s->ov_off[k] = off;
+}
 static uint64_t *g_ptep = 0;        /* cached kernel VA of the leaf PTE */
 static uint64_t g_pte_orig = 0;     /* original PTE value (UXN clear) */
 static volatile long g_faults = 0;
@@ -372,8 +394,11 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
                 fn_task_pid_nr_ns((void *)get_current(), PIDTYPE_TGID, 0) != s->pid)
                 continue; /* same VA in another process -> not our trap */
             uint64_t poff = far & 0xfffUL;
-            if (s->replace && poff == s->hook_off) {
-                regs->pc = s->replace; /* hooked fn entry -> replacement */
+            uint64_t rep = 0;
+            for (int k = 0; k < MAX_OV; k++) /* inert slots hold OV_NONE -> never match poff */
+                if (poff == s->ov_off[k]) { rep = s->ov_replace[k]; break; }
+            if (rep) {
+                regs->pc = rep; /* a hooked fn entry on this page -> its replacement */
             } else {
                 uint64_t off = poff;
                 uint32_t idx = (uint32_t)(off >> 2);
@@ -1243,12 +1268,50 @@ static long do_pghook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t mapa
     page &= ~0xFFFUL;
     clone &= ~0xFFFUL;
 
-    /* reject a duplicate page for the same process (re-arm requires pgdisarm) */
-    for (int i = 0; i < MAX_PG; i++)
-        if (g_pg[i].active && g_pg[i].pid == (int)pid && g_pg[i].page == page) {
-            apps(p, e, "error: page already hooked (pgdisarm first)\n");
+    /* LSPlant hooks one function at a time; several can land on the SAME page. If
+     * this page is already armed for the process, just APPEND the (off -> replace)
+     * override to its slot (no re-arm) -- the whole-page clone is already in place. */
+    for (int i = 0; i < MAX_PG; i++) {
+        struct pghook *s = &g_pg[i];
+        if (!s->active || s->pid != (int)pid || s->page != page) continue;
+        if (s->clone != clone) {
+            apps(p, e, "error: page armed with a different clone (pgdisarm first)\n");
             return -1;
         }
+        if (replace) {
+            /* dedup: re-hooking the same offset updates its replacement in place */
+            int k = -1, free = -1;
+            for (int j = 0; j < MAX_OV; j++) {
+                if (s->ov_off[j] == target_off) { k = j; break; }
+                if (free < 0 && s->ov_off[j] == OV_NONE) free = j;
+            }
+            if (k < 0) k = free; /* claim an inert slot */
+            if (k < 0) {
+                apps(p, e, "error: page override table full\n");
+                return -1;
+            }
+            int fresh = (s->ov_off[k] != target_off);
+            pg_set_ov(s, k, target_off, replace); /* key-last publish (see pg_set_ov) */
+            if (fresh) s->nlive++;
+        }
+        p = apps(p, e, "ok: pghook slot=");
+        p = appdec(p, e, i);
+        p = apps(p, e, " (appended) pid=");
+        p = appdec(p, e, (long)pid);
+        p = apps(p, e, " page=");
+        p = apphex(p, e, page);
+        p = apps(p, e, " backup=");
+        p = apphex(p, e, clone + (uint64_t)s->offmap[target_off / 4] * 4);
+        p = apps(p, e, " hook_off=");
+        p = apphex(p, e, target_off);
+        p = apps(p, e, " replace=");
+        p = apphex(p, e, replace);
+        p = apps(p, e, " nlive=");
+        p = appdec(p, e, s->nlive);
+        apps(p, e, "\n");
+        return 0;
+    }
+
     int si = -1;
     for (int i = 0; i < MAX_PG; i++)
         if (!g_pg[i].active) {
@@ -1285,8 +1348,13 @@ static long do_pghook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t mapa
     s->pid = (int)pid;
     s->page = page;
     s->clone = clone;
-    s->hook_off = target_off;
-    s->replace = replace;
+    for (int k = 0; k < MAX_OV; k++) s->ov_off[k] = OV_NONE; /* all slots inert */
+    s->nlive = 0;
+    if (replace) {
+        s->ov_replace[0] = replace;
+        s->ov_off[0] = target_off; /* not yet active/UXN -> no fault can race this */
+        s->nlive = 1;
+    }
     s->nmap = (int)ninsn;
     s->ptep = (uint64_t *)o.ptep;
     s->pte_orig = o.val;
@@ -1350,6 +1418,67 @@ static long do_pgdisarm(char *p, char *e)
     p = appdec(p, e, total);
     apps(p, e, "\n");
     return 0;
+}
+
+/* pgunhook <pid> <page> <off>: remove ONE override from a page slot (mirrors
+ * LSPlant inline_unhooker). The function reverts to running from its faithful
+ * clone copy. When the slot's last override is removed, fully disarm that page
+ * (restore the original PTE, flush, free the slot) -- same teardown as pgdisarm
+ * but for a single page. Runs in the sleepable bridge/supercall context. */
+static long do_pgunhook(uint64_t pid, uint64_t page, uint64_t off, char *p, char *e)
+{
+    page &= ~0xFFFUL;
+    for (int i = 0; i < MAX_PG; i++) {
+        struct pghook *s = &g_pg[i];
+        if (!s->active || s->pid != (int)pid || s->page != page) continue;
+
+        int k = -1;
+        for (int j = 0; j < MAX_OV; j++)
+            if (s->ov_off[j] == off) { k = j; break; }
+        if (k < 0) {
+            apps(p, e, "error: offset not hooked on this page\n");
+            return -1;
+        }
+        /* retire key-first: a single store of OV_NONE makes the slot inert for the
+         * racing before_pf scan (the offset then reverts to its faithful clone copy);
+         * ov_replace is left as-is (stale-but-valid, never matched again) */
+        s->ov_off[k] = OV_NONE;
+        s->nlive--;
+
+        if (s->nlive > 0) {
+            p = apps(p, e, "ok: pgunhook slot=");
+            p = appdec(p, e, i);
+            p = apps(p, e, " off=");
+            p = apphex(p, e, off);
+            p = apps(p, e, " nlive=");
+            p = appdec(p, e, s->nlive);
+            p = apps(p, e, " (page still armed)\n");
+            return 0;
+        }
+
+        /* last override gone -> disarm the whole page (restore PTE, free slot) */
+        long red = s->redirects;
+        if (s->ptep) {
+            *(volatile uint64_t *)s->ptep = s->pte_orig; /* clear UXN */
+            flush_tlb_all();
+        }
+        s->active = 0;
+        s->ptep = 0;
+        if (g_npg > 0) g_npg--;
+        maybe_unhook_pf();
+        p = apps(p, e, "ok: pgunhook slot=");
+        p = appdec(p, e, i);
+        p = apps(p, e, " disarmed page=");
+        p = apphex(p, e, page);
+        p = apps(p, e, " redirects=");
+        p = appdec(p, e, red);
+        p = apps(p, e, " npg=");
+        p = appdec(p, e, g_npg);
+        apps(p, e, "\n");
+        return 0;
+    }
+    apps(p, e, "error: page not armed for this pid\n");
+    return -1;
 }
 
 static long do_disarm(char *p, char *e)
@@ -1425,12 +1554,19 @@ static long do_state(char *p, char *e)
         p = apphex(p, e, s->page);
         p = apps(p, e, " clone=");
         p = apphex(p, e, s->clone);
-        p = apps(p, e, " hook_off=");
-        p = apphex(p, e, s->hook_off);
-        p = apps(p, e, " replace=");
-        p = apphex(p, e, s->replace);
+        p = apps(p, e, " nlive=");
+        p = appdec(p, e, s->nlive);
         p = apps(p, e, " redirects=");
         p = appdec(p, e, s->redirects);
+        for (int k = 0; k < MAX_OV; k++) {
+            if (s->ov_off[k] == OV_NONE) continue; /* skip inert slots */
+            p = apps(p, e, "\n   ov[");
+            p = appdec(p, e, k);
+            p = apps(p, e, "] off=");
+            p = apphex(p, e, s->ov_off[k]);
+            p = apps(p, e, " -> ");
+            p = apphex(p, e, s->ov_replace[k]);
+        }
     }
     if (g_ptep) {
         p = apps(p, e, "\npte_now=");
@@ -1590,6 +1726,15 @@ static long shpte_run(const char *args, char *buf, int bufcap)
             rc = do_pagehook(pid, page, clone, map, n, toff, rep, p, e);
     } else if (starts(a, "pgdisarm")) {
         rc = do_pgdisarm(p, e);
+    } else if (starts(a, "pgunhook")) {
+        uint64_t pid = 0, page = 0, off = 0;
+        const char *s = parse_ull(a + 8, &pid);
+        s = parse_ull(s, &page);
+        parse_ull(s, &off);
+        if (!pid || !page)
+            apps(p, e, "usage: pgunhook <pid> <page> <off>\n"), rc = -1;
+        else
+            rc = do_pgunhook(pid, page, off, p, e);
     } else if (starts(a, "pghook")) {
         uint64_t pid = 0, page = 0, clone = 0, map = 0, n = 0, toff = 0, rep = 0;
         const char *s = parse_ull(a + 6, &pid);
@@ -1701,7 +1846,7 @@ static long shpte_run(const char *args, char *buf, int bufcap)
     } else {
         apps(p, e,
              "usage: probe | pte | arm | redirect | redirectmap | pagehook | "
-             "pghook | pgdisarm | hookto | hwhookto | hidemaps | unhidemaps | "
+             "pghook | pgunhook | pgdisarm | hookto | hwhookto | hidemaps | unhidemaps | "
              "ghosttest | ghostredirect | ghostfree | bridge | unbridge | disarm | dump\n");
         rc = -1;
     }
