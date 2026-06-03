@@ -24,6 +24,16 @@ __attribute__((noinline)) void funcB(int n)
 __attribute__((noinline)) void funcC(int n) { printf("[C] n=%d cube=%d\n", n, n * n * n); }
 __attribute__((aligned(0x1000), noinline)) void pg_guard(void) { asm volatile("nop"); }
 
+// replacement for funcA (lives on a DIFFERENT page, so it is not UXN-trapped).
+// Calls backup (= the clone's faithful copy of funcA) to run the original.
+static void (*g_backupA)(int) = 0;
+__attribute__((noinline)) void replaceA(int n)
+{
+    printf("[HOOK A] intercept n=%d -> backup:\n", n);
+    if (g_backupA) g_backupA(n);
+    printf("[HOOK A] done n=%d\n", n);
+}
+
 static uint32_t clonebuf[6144]; // 1024 insns can expand up to ~5x
 static uint32_t omap[1024];
 
@@ -44,9 +54,12 @@ int main(void)
     __builtin___clear_cache((char *)clone, (char *)clone + sz);
     if (mprotect(clone, sz, PROT_READ | PROT_EXEC)) { printf("mprotect failed\n"); return 1; }
 
-    printf("pid=%d page=0x%lx same_page=%d funcA=%p funcB=%p funcC=%p clone=%p clone_insns=%d omap=%p nmap=1024\n",
-           getpid(), (unsigned long)page, same, (void *)&funcA, (void *)&funcB, (void *)&funcC, clone, n,
-           (void *)omap);
+    // backup for funcA = its faithful copy in the clone (funcA is at page+0 -> omap[0])
+    g_backupA = (void (*)(int))((char *)clone + (size_t)omap[0] * 4);
+
+    printf("pid=%d page=0x%lx same_page=%d funcA=%p funcB=%p funcC=%p replaceA=%p clone=%p clone_insns=%d omap=%p nmap=1024\n",
+           getpid(), (unsigned long)page, same, (void *)&funcA, (void *)&funcB, (void *)&funcC,
+           (void *)&replaceA, clone, n, (void *)omap);
     fflush(stdout);
 
     for (int i = 0;; i++) {

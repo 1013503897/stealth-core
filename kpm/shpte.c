@@ -135,6 +135,10 @@ static volatile int g_target_pid = 0;
 static volatile uint64_t g_target_page = 0;
 static volatile uint64_t g_clone_page = 0;     /* MODE_REDIRECT*: clone of the target page */
 static volatile uint64_t g_redirect_fixed = 0; /* MODE_REDIRECT_FIXED: route entry -> here */
+/* pagehook: on a whole-page MODE_REDIRECT_MAP clone, route ONE function's entry
+ * (page + g_hook_off) to g_hook_replace; everything else runs from the clone. */
+static volatile uint64_t g_hook_off = 0;     /* byte offset of hooked fn in the page */
+static volatile uint64_t g_hook_replace = 0; /* 0 = no override */
 static uint64_t *g_ptep = 0;        /* cached kernel VA of the leaf PTE */
 static uint64_t g_pte_orig = 0;     /* original PTE value (UXN clear) */
 static volatile long g_faults = 0;
@@ -306,13 +310,19 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
         /* keep UXN set; reroute PC into the clone region. The target's .text is
          * never touched and every call re-faults+reroutes. With an offset_map,
          * recompiled instructions may have shifted, so map orig-insn-idx ->
-         * recompiled-insn-idx; otherwise route to the same page offset. */
-        uint64_t off = far & 0xfffUL;
-        if (g_mode == MODE_REDIRECT_MAP) {
-            uint32_t idx = (uint32_t)(off >> 2);
-            if (idx < (uint32_t)g_nmap) off = (uint64_t)g_offmap[idx] << 2;
+         * recompiled-insn-idx; otherwise route to the same page offset. pagehook:
+         * one function's entry routes to `replace` instead of the clone. */
+        uint64_t poff = far & 0xfffUL;
+        if (g_mode == MODE_REDIRECT_MAP && g_hook_replace && poff == g_hook_off) {
+            regs->pc = g_hook_replace; /* hooked fn entry -> replacement */
+        } else {
+            uint64_t off = poff;
+            if (g_mode == MODE_REDIRECT_MAP) {
+                uint32_t idx = (uint32_t)(off >> 2);
+                if (idx < (uint32_t)g_nmap) off = (uint64_t)g_offmap[idx] << 2;
+            }
+            regs->pc = g_clone_page + off;
         }
-        regs->pc = g_clone_page + off;
         g_redirects++;
     } else {
         /* self-heal: restore UXN-clear PTE so the instruction re-executes */
@@ -1092,6 +1102,49 @@ static long do_redirectmap(uint64_t pid, uint64_t addr, uint64_t clone, uint64_t
     return arm_common(pid, addr, MODE_REDIRECT_MAP, clone, p, e);
 }
 
+/* pagehook: whole-page UXN hook of ONE function that may share its page with
+ * others. The whole page is recompiled into `clone` (offmap); we UXN-trap the
+ * page and route every fault into the clone, EXCEPT the hooked function's entry
+ * (page+target_off) which routes to `replace`. The faithful clone copy of the
+ * target (clone + offmap[target_off/4]*4) is the `backup` for calling the original.
+ * This is the process-wide, page-neighbor-safe inline hook for real libart funcs. */
+static long do_pagehook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t mapaddr, uint64_t ninsn,
+                        uint64_t target_off, uint64_t replace, char *p, char *e)
+{
+    resolve_syms();
+    if (!fn_access_process_vm || !fn_find_get_task_by_vpid) {
+        apps(p, e, "error: symbols not resolved (run probe)\n");
+        return -1;
+    }
+    if (ninsn == 0 || ninsn > OFFMAP_MAX || (target_off & 3) || target_off >= 0x1000) {
+        apps(p, e, "error: bad ninsn/target_off\n");
+        return -1;
+    }
+    void *task = fn_find_get_task_by_vpid((int)pid);
+    if (is_err_or_null(task)) {
+        apps(p, e, "error: task not found\n");
+        return -1;
+    }
+    int want = (int)(ninsn * 4);
+    if (fn_access_process_vm(task, mapaddr, g_offmap, want, 0) != want) {
+        apps(p, e, "error: read offset_map failed\n");
+        return -1;
+    }
+    g_nmap = (int)ninsn;
+    g_hook_off = target_off;
+    g_hook_replace = replace;
+    long rc = arm_common(pid, page, MODE_REDIRECT_MAP, clone, p, e);
+    /* append the backup pointer = clone copy of the target (offmap is now loaded) */
+    char *q = p;
+    while (*q) q++;
+    q = apps(q, e, "backup=");
+    q = apphex(q, e, (clone & ~0xFFFUL) + (uint64_t)g_offmap[target_off / 4] * 4);
+    q = apps(q, e, " hook_off=");
+    q = apphex(q, e, target_off);
+    apps(q, e, "\n");
+    return rc;
+}
+
 static long do_disarm(char *p, char *e)
 {
     g_armed = 0;
@@ -1112,6 +1165,8 @@ static long do_disarm(char *p, char *e)
     g_mode = MODE_SELFHEAL;
     g_clone_page = 0;
     g_redirect_fixed = 0;
+    g_hook_off = 0;
+    g_hook_replace = 0;
     g_nmap = 0;
     return 0;
 }
@@ -1294,6 +1349,21 @@ static long shpte_run(const char *args, char *buf, int bufcap)
             apps(p, e, "usage: redirectmap <pid> <hexaddr> <cloneaddr> <mapaddr> <ninsn>\n"), rc = -1;
         else
             rc = do_redirectmap(pid, addr, clone, map, n, p, e);
+    } else if (starts(a, "pagehook")) {
+        uint64_t pid = 0, page = 0, clone = 0, map = 0, n = 0, toff = 0, rep = 0;
+        const char *s = parse_ull(a + 8, &pid);
+        s = parse_ull(s, &page);
+        s = parse_ull(s, &clone);
+        s = parse_ull(s, &map);
+        s = parse_ull(s, &n);
+        s = parse_ull(s, &toff);
+        parse_ull(s, &rep);
+        if (!pid || !page || !clone || !map || !n || !rep)
+            apps(p, e,
+                 "usage: pagehook <pid> <page> <clone> <map> <ninsn> <target_off> <replace>\n"),
+                rc = -1;
+        else
+            rc = do_pagehook(pid, page, clone, map, n, toff, rep, p, e);
     } else if (starts(a, "redirect")) {
         uint64_t pid = 0, addr = 0, clone = 0;
         const char *s = parse_ull(a + 8, &pid);
