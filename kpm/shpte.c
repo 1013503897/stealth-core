@@ -109,8 +109,9 @@ static int (*fn_apply_existing)(void *mm, unsigned long addr, unsigned long size
 static int (*fn_task_pid_nr_ns)(void *task, int type, void *ns) = 0;
 /* int access_process_vm(struct task_struct *tsk, unsigned long addr, void *buf, int len, uint flags) */
 static int (*fn_access_process_vm)(void *tsk, unsigned long addr, void *buf, int len, unsigned int flags) = 0;
-static void *g_addr_pf = 0;       /* do_page_fault */
-static void *g_addr_show_map = 0; /* show_map (/proc/pid/maps per-VMA) */
+static void *g_addr_pf = 0;        /* do_page_fault */
+static void *g_addr_show_map = 0;  /* show_map (/proc/pid/maps per-VMA) */
+static void *g_addr_status = 0;    /* proc_pid_status (/proc/pid/status) */
 /* int apply_to_page_range(mm, addr, size, pte_fn_t fn, void *data) -- allocating */
 static int (*fn_apply)(void *mm, unsigned long addr, unsigned long size, void *fn, void *data) = 0;
 /* vmalloc + vmalloc_to_pfn: avoids KP-unexported virt_to_phys/linear_voffset */
@@ -142,6 +143,9 @@ static volatile long g_redirects = 0;
 static volatile int g_maps_hooked = 0;
 static volatile uint64_t g_hide_page = 0; /* VMA vm_start to drop from maps */
 static volatile long g_maps_hidden = 0;
+/* TracerPid spoof state (anti-debug / anti-ptrace-detection) */
+static volatile int g_tracer_hooked = 0;
+static volatile long g_tracer_spoofed = 0;
 /* P4.2 ghost-memory state */
 static void *g_ghost_kaddr = 0; /* vmalloc page backing the ghost VA */
 static volatile uint64_t g_ghost_va = 0;
@@ -347,6 +351,46 @@ static void after_showmap(hook_fargs2_t *fargs, void *udata)
     g_maps_hidden++;
 }
 
+/* ---- TracerPid spoof: rewrite "TracerPid:\t<n>" -> "TracerPid:\t0" in the
+ * /proc/pid/status output (length-preserving), so anti-debug checks see 0. ---- */
+static void before_status(hook_fargs4_t *fargs, void *udata)
+{
+    (void)udata;
+    if (!g_tracer_hooked) return;
+    void *m = (void *)fargs->arg0;
+    fargs->local.data0 = *(volatile uint64_t *)((char *)m + SEQ_COUNT_OFF);
+}
+static void after_status(hook_fargs4_t *fargs, void *udata)
+{
+    (void)udata;
+    if (!g_tracer_hooked) return;
+    void *m = (void *)fargs->arg0;
+    char *buf = *(char **)((char *)m + 0); /* seq_file.buf @ +0 */
+    if (!buf) return;
+    uint64_t start = fargs->local.data0;
+    uint64_t end = *(volatile uint64_t *)((char *)m + SEQ_COUNT_OFF);
+    static const char pat[] = "TracerPid:";
+    for (uint64_t i = start; i + 10 <= end; i++) {
+        int m2 = 1;
+        for (int k = 0; k < 10; k++)
+            if (buf[i + k] != pat[k]) {
+                m2 = 0;
+                break;
+            }
+        if (!m2) continue;
+        uint64_t j = i + 10;
+        while (j < end && (buf[j] == '\t' || buf[j] == ' ')) j++;
+        int first = 1;
+        while (j < end && buf[j] >= '0' && buf[j] <= '9') {
+            buf[j] = first ? '0' : ' '; /* "12345" -> "0    " (reader parses 0) */
+            first = 0;
+            j++;
+        }
+        g_tracer_spoofed++;
+        break;
+    }
+}
+
 static void resolve_syms(void)
 {
     if (!fn_find_get_task_by_vpid)
@@ -359,6 +403,7 @@ static void resolve_syms(void)
     if (!fn_access_process_vm) fn_access_process_vm = (void *)kallsyms_lookup_name("access_process_vm");
     if (!g_addr_pf) g_addr_pf = (void *)kallsyms_lookup_name("do_page_fault");
     if (!g_addr_show_map) g_addr_show_map = (void *)kallsyms_lookup_name("show_map");
+    if (!g_addr_status) g_addr_status = (void *)kallsyms_lookup_name("proc_pid_status");
     if (!fn_apply) fn_apply = (void *)kallsyms_lookup_name("apply_to_page_range");
     if (!fn_vmalloc) fn_vmalloc = (void *)kallsyms_lookup_name("vmalloc");
     if (!fn_vfree) fn_vfree = (void *)kallsyms_lookup_name("vfree");
@@ -863,6 +908,36 @@ static long do_unhidemaps(char *p, char *e)
     return 0;
 }
 
+static long do_hidetracer(char *p, char *e)
+{
+    resolve_syms();
+    if (!g_addr_status) {
+        apps(p, e, "error: proc_pid_status not resolved\n");
+        return -1;
+    }
+    if (!g_tracer_hooked) {
+        if (hook_wrap4(g_addr_status, (void *)before_status, (void *)after_status, 0) != HOOK_NO_ERR) {
+            apps(p, e, "error: hook_wrap4(proc_pid_status) failed\n");
+            return -1;
+        }
+        g_tracer_hooked = 1;
+    }
+    apps(p, e, "ok: TracerPid spoof on (all /proc/*/status show 0)\n");
+    return 0;
+}
+
+static long do_unhidetracer(char *p, char *e)
+{
+    if (g_tracer_hooked && g_addr_status) {
+        hook_unwrap(g_addr_status, (void *)before_status, (void *)after_status);
+        g_tracer_hooked = 0;
+    }
+    p = apps(p, e, "ok: TracerPid spoof off, spoofed=");
+    p = appdec(p, e, g_tracer_spoofed);
+    apps(p, e, "\n");
+    return 0;
+}
+
 static char *decode_pte(char *p, char *e, uint64_t v)
 {
     p = apps(p, e, v & PTE_VALID ? " VALID" : " !VALID");
@@ -1070,6 +1145,8 @@ static long do_state(char *p, char *e)
     p = apphex(p, e, g_hide_page);
     p = apps(p, e, " maps_hidden=");
     p = appdec(p, e, g_maps_hidden);
+    p = apps(p, e, " tracer_spoof=");
+    p = appdec(p, e, g_tracer_hooked);
     p = apps(p, e, " ghost_va=");
     p = apphex(p, e, g_ghost_va);
     p = apps(p, e, " hwbp_armed=");
@@ -1240,6 +1317,10 @@ static long shpte_run(const char *args, char *buf, int bufcap)
         rc = do_hidemaps(page, p, e); /* page optional: defaults to active clone */
     } else if (starts(a, "unhidemaps")) {
         rc = do_unhidemaps(p, e);
+    } else if (starts(a, "hidetracer")) {
+        rc = do_hidetracer(p, e);
+    } else if (starts(a, "unhidetracer")) {
+        rc = do_unhidetracer(p, e);
     } else if (starts(a, "ghostredirect")) {
         uint64_t pid = 0, fn = 0, gva = 0, cb = 0, nc = 0, mp = 0, ni = 0, tv = 0;
         const char *s = parse_ull(a + 13, &pid);
@@ -1344,6 +1425,10 @@ static long shpte_exit(void *__user reserved)
     if (g_maps_hooked && g_addr_show_map) {
         hook_unwrap(g_addr_show_map, (void *)before_showmap, (void *)after_showmap);
         g_maps_hooked = 0;
+    }
+    if (g_tracer_hooked && g_addr_status) {
+        hook_unwrap(g_addr_status, (void *)before_status, (void *)after_status);
+        g_tracer_hooked = 0;
     }
     if (g_bridge_hooked) {
         fp_unhook_syscalln(__NR_personality, (void *)before_bridge, 0);
