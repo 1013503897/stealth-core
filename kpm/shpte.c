@@ -313,6 +313,18 @@ static int inject_cb(void *ptep, unsigned long addr, void *data)
     return 0;
 }
 
+/* make freshly-written code visible to EL0 execution: clean D-cache to PoU +
+ * invalidate I-cache (PIPT, so by the kernel VA covers the user mapping too). */
+static void sync_icache(void *addr, unsigned long size)
+{
+    unsigned long s = (unsigned long)addr & ~63UL;
+    unsigned long en = (unsigned long)addr + size;
+    for (unsigned long a = s; a < en; a += 64) asm volatile("dc cvau, %0" ::"r"(a) : "memory");
+    asm volatile("dsb ish" ::: "memory");
+    for (unsigned long a = s; a < en; a += 64) asm volatile("ic ivau, %0" ::"r"(a) : "memory");
+    asm volatile("dsb ish\nisb" ::: "memory");
+}
+
 /* P4.2: inject a kernel page at a no-VMA user VA. Attributes are copied from an
  * existing user page (template_va) so memory type/AP/SH/AttrIndx/UXN exactly
  * match a known-good page -- no hard-coded MAIR index. The page is mapped to the
@@ -342,16 +354,20 @@ static long do_ghosttest(uint64_t pid, uint64_t ghost_va, uint64_t template_va, 
         return -1;
     }
 
-    /* 1. ghost_va must currently have NO leaf PTE (don't clobber a live mapping) */
+    /* 1. ghost_va must currently have NO valid leaf PTE (don't clobber a live map) */
     struct pte_out chk;
+    chk.n = 0;
+    chk.val = 0;
     fn_apply_existing(mm, ghost_va, 0x1000, (void *)pte_cb, &chk);
-    if (chk.n > 0) {
+    if (chk.n > 0 && (chk.val & PTE_VALID)) {
         fn_mmput(mm);
         apps(p, e, "error: ghost_va already mapped; pick a free VA\n");
         return -1;
     }
     /* 2. template attributes from an existing mapped user page */
     struct pte_out tpl;
+    tpl.n = 0;
+    tpl.val = 0;
     fn_apply_existing(mm, template_va & ~0xFFFUL, 0x1000, (void *)pte_cb, &tpl);
     if (tpl.n == 0 || !(tpl.val & PTE_VALID)) {
         fn_mmput(mm);
@@ -424,6 +440,105 @@ static long do_ghostfree(char *p, char *e)
     g_ghost_pid = 0;
     apps(p, e, "ok: ghost freed (PTE cleared + page released)\n");
     return 0;
+}
+
+static long arm_common(uint64_t pid, uint64_t addr, int mode, uint64_t clone, char *p, char *e); /* fwd */
+
+/* P4.2 step B: place the (position-independent) DBI clone into a VMA-less ghost
+ * page and redirect the UXN-trapped function there. The clone then executes from
+ * memory the OS doesn't know exists -- invisible to maps AND mincore, with no
+ * maps-hide hook. Teardown = disarm (restore UXN/unhook) + ghostfree. */
+static long do_ghostredirect(uint64_t pid, uint64_t func, uint64_t ghost_va, uint64_t clonebytes,
+                             uint64_t nins_clone, uint64_t mapaddr, uint64_t ninsn, uint64_t template_va,
+                             char *p, char *e)
+{
+    resolve_syms();
+    if (!fn_vmalloc || !fn_vfree || !fn_vmalloc_to_pfn || !fn_apply || !fn_apply_existing ||
+        !fn_access_process_vm || !fn_get_task_mm || !fn_mmput || !fn_find_get_task_by_vpid) {
+        apps(p, e, "error: symbols not resolved (run probe)\n");
+        return -1;
+    }
+    if (g_armed || g_ghost_kaddr) {
+        apps(p, e, "error: busy; disarm + ghostfree first\n");
+        return -1;
+    }
+    if (nins_clone == 0 || nins_clone * 4 > 0x1000) {
+        apps(p, e, "error: clone must fit one page\n");
+        return -1;
+    }
+    if (ninsn == 0 || ninsn > OFFMAP_MAX) {
+        apps(p, e, "error: ninsn out of range\n");
+        return -1;
+    }
+    ghost_va &= ~0xFFFUL;
+
+    void *task = fn_find_get_task_by_vpid((int)pid);
+    if (is_err_or_null(task)) {
+        apps(p, e, "error: task not found\n");
+        return -1;
+    }
+    void *mm = fn_get_task_mm(task);
+    if (is_err_or_null(mm)) {
+        apps(p, e, "error: no mm\n");
+        return -1;
+    }
+    struct pte_out chk;
+    chk.n = 0;
+    chk.val = 0;
+    fn_apply_existing(mm, ghost_va, 0x1000, (void *)pte_cb, &chk);
+    if (chk.n > 0 && (chk.val & PTE_VALID)) {
+        fn_mmput(mm);
+        apps(p, e, "error: ghost_va already mapped\n");
+        return -1;
+    }
+    struct pte_out tpl;
+    tpl.n = 0;
+    tpl.val = 0;
+    fn_apply_existing(mm, template_va & ~0xFFFUL, 0x1000, (void *)pte_cb, &tpl);
+    if (tpl.n == 0 || !(tpl.val & PTE_VALID)) {
+        fn_mmput(mm);
+        apps(p, e, "error: template_va not mapped (need an exec page)\n");
+        return -1;
+    }
+    uint64_t attrs = tpl.val & ~PFN_MASK;
+
+    /* vmalloc the ghost page, copy the clone bytes in, sync I-cache for exec */
+    void *kaddr = fn_vmalloc(0x1000);
+    if (is_err_or_null(kaddr)) {
+        fn_mmput(mm);
+        apps(p, e, "error: vmalloc failed\n");
+        return -1;
+    }
+    int want = (int)(nins_clone * 4);
+    if (fn_access_process_vm(task, clonebytes, kaddr, want, 0) != want) {
+        fn_vfree(kaddr);
+        fn_mmput(mm);
+        apps(p, e, "error: copy clone bytes failed\n");
+        return -1;
+    }
+    sync_icache(kaddr, 0x1000);
+
+    uint64_t pfn = fn_vmalloc_to_pfn(kaddr);
+    uint64_t pte_val = ((pfn << 12) & PFN_MASK) | attrs;
+    int ir = fn_apply(mm, ghost_va, 0x1000, (void *)inject_cb, &pte_val);
+    flush_tlb_all();
+    fn_mmput(mm);
+    if (ir) {
+        fn_vfree(kaddr);
+        apps(p, e, "error: apply_to_page_range failed\n");
+        return -1;
+    }
+    g_ghost_kaddr = kaddr;
+    g_ghost_va = ghost_va;
+    g_ghost_pid = (int)pid;
+
+    /* read the offset_map, then arm the UXN redirect to the ghost VA */
+    if (fn_access_process_vm(task, mapaddr, g_offmap, (int)(ninsn * 4), 0) != (int)(ninsn * 4)) {
+        apps(p, e, "error: read offset_map failed (ghost left; ghostfree)\n");
+        return -1;
+    }
+    g_nmap = (int)ninsn;
+    return arm_common(pid, func, MODE_REDIRECT_MAP, ghost_va, p, e);
 }
 
 static long do_hidemaps(uint64_t page, char *p, char *e)
@@ -766,6 +881,23 @@ static long shpte_control0(const char *args, char *__user out_msg, int outlen)
         rc = do_hidemaps(page, p, e); /* page optional: defaults to active clone */
     } else if (starts(a, "unhidemaps")) {
         rc = do_unhidemaps(p, e);
+    } else if (starts(a, "ghostredirect")) {
+        uint64_t pid = 0, fn = 0, gva = 0, cb = 0, nc = 0, mp = 0, ni = 0, tv = 0;
+        const char *s = parse_ull(a + 13, &pid);
+        s = parse_ull(s, &fn);
+        s = parse_ull(s, &gva);
+        s = parse_ull(s, &cb);
+        s = parse_ull(s, &nc);
+        s = parse_ull(s, &mp);
+        s = parse_ull(s, &ni);
+        parse_ull(s, &tv);
+        if (!pid || !fn || !gva || !cb || !nc || !mp || !ni || !tv)
+            apps(p, e,
+                 "usage: ghostredirect <pid> <func> <ghost_va> <clonebytes> <nclone> <map> <ninsn> "
+                 "<template_va>\n"),
+                rc = -1;
+        else
+            rc = do_ghostredirect(pid, fn, gva, cb, nc, mp, ni, tv, p, e);
     } else if (starts(a, "ghosttest")) {
         uint64_t pid = 0, gva = 0, tva = 0;
         const char *s = parse_ull(a + 9, &pid);
