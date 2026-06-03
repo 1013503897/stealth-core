@@ -81,7 +81,7 @@ static void (*fn_vfree)(void *addr) = 0;
 static unsigned long (*fn_vmalloc_to_pfn)(void *addr) = 0;
 
 /* ---- arm state ---- */
-enum { MODE_SELFHEAL = 0, MODE_REDIRECT = 1, MODE_REDIRECT_MAP = 2 };
+enum { MODE_SELFHEAL = 0, MODE_REDIRECT = 1, MODE_REDIRECT_MAP = 2, MODE_REDIRECT_FIXED = 3 };
 
 /* offset_map: original instruction index (page offset/4) -> recompiled insn index
  * in the clone region. One source page = 1024 instructions. Filled from the
@@ -94,7 +94,8 @@ static volatile int g_pf_hooked = 0;
 static volatile int g_mode = MODE_SELFHEAL;
 static volatile int g_target_pid = 0;
 static volatile uint64_t g_target_page = 0;
-static volatile uint64_t g_clone_page = 0; /* MODE_REDIRECT: clone of the target page */
+static volatile uint64_t g_clone_page = 0;     /* MODE_REDIRECT*: clone of the target page */
+static volatile uint64_t g_redirect_fixed = 0; /* MODE_REDIRECT_FIXED: route entry -> here */
 static uint64_t *g_ptep = 0;        /* cached kernel VA of the leaf PTE */
 static uint64_t g_pte_orig = 0;     /* original PTE value (UXN clear) */
 static volatile long g_faults = 0;
@@ -236,13 +237,19 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
         if (fn_task_pid_nr_ns(t, PIDTYPE_TGID, 0) != g_target_pid) return;
     }
     g_faults++;
+    struct pt_regs *regs = (struct pt_regs *)fargs->arg2;
 
-    if ((g_mode == MODE_REDIRECT || g_mode == MODE_REDIRECT_MAP) && g_clone_page) {
+    if (g_mode == MODE_REDIRECT_FIXED) {
+        /* inline_hooker: route the target's entry to a fixed `replace` function
+         * (LR untouched -> replace returns to the original caller); replace can
+         * call the original via the ghost-clone `backup`. */
+        regs->pc = g_redirect_fixed;
+        g_redirects++;
+    } else if ((g_mode == MODE_REDIRECT || g_mode == MODE_REDIRECT_MAP) && g_clone_page) {
         /* keep UXN set; reroute PC into the clone region. The target's .text is
          * never touched and every call re-faults+reroutes. With an offset_map,
          * recompiled instructions may have shifted, so map orig-insn-idx ->
          * recompiled-insn-idx; otherwise route to the same page offset. */
-        struct pt_regs *regs = (struct pt_regs *)fargs->arg2;
         uint64_t off = far & 0xfffUL;
         if (g_mode == MODE_REDIRECT_MAP) {
             uint32_t idx = (uint32_t)(off >> 2);
@@ -541,6 +548,97 @@ static long do_ghostredirect(uint64_t pid, uint64_t func, uint64_t ghost_va, uin
     return arm_common(pid, func, MODE_REDIRECT_MAP, ghost_va, p, e);
 }
 
+/* alloc a ghost page, copy `nbytes` clone bytes from the target's `clonebytes`,
+ * sync I-cache, inject a no-VMA PTE at ghost_va (attrs from template_va). Sets
+ * g_ghost_*. Caller holds task+mm and does mmput. Returns 0 or <0. */
+static int ghost_inject(int pid, void *task, void *mm, uint64_t ghost_va, uint64_t clonebytes, int nbytes,
+                        uint64_t template_va)
+{
+    if (g_ghost_kaddr) return -1;
+    if (nbytes <= 0 || nbytes > 0x1000) return -2;
+    ghost_va &= ~0xFFFUL;
+    struct pte_out chk;
+    chk.n = 0;
+    chk.val = 0;
+    fn_apply_existing(mm, ghost_va, 0x1000, (void *)pte_cb, &chk);
+    if (chk.n > 0 && (chk.val & PTE_VALID)) return -3;
+    struct pte_out tpl;
+    tpl.n = 0;
+    tpl.val = 0;
+    fn_apply_existing(mm, template_va & ~0xFFFUL, 0x1000, (void *)pte_cb, &tpl);
+    if (tpl.n == 0 || !(tpl.val & PTE_VALID)) return -4;
+    uint64_t attrs = tpl.val & ~PFN_MASK;
+    void *kaddr = fn_vmalloc(0x1000);
+    if (is_err_or_null(kaddr)) return -5;
+    if (fn_access_process_vm(task, clonebytes, kaddr, nbytes, 0) != nbytes) {
+        fn_vfree(kaddr);
+        return -6;
+    }
+    sync_icache(kaddr, 0x1000);
+    uint64_t pfn = fn_vmalloc_to_pfn(kaddr);
+    uint64_t pte_val = ((pfn << 12) & PFN_MASK) | attrs;
+    if (fn_apply(mm, ghost_va, 0x1000, (void *)inject_cb, &pte_val)) {
+        fn_vfree(kaddr);
+        return -7;
+    }
+    flush_tlb_all();
+    g_ghost_kaddr = kaddr;
+    g_ghost_va = ghost_va;
+    g_ghost_pid = pid;
+    return 0;
+}
+
+/* inline_hooker primitive (for LSPlant): route `target`'s entry to `replace`, and
+ * stash a ghost clone of `target` at ghost_va as the `backup` the caller can call
+ * to run the original. target.text is never modified; backup lives in VMA-less
+ * memory. Teardown = disarm + ghostfree. */
+static long do_hookto(uint64_t pid, uint64_t target, uint64_t replace, uint64_t clonebytes,
+                      uint64_t nclone, uint64_t template_va, uint64_t ghost_va, char *p, char *e)
+{
+    resolve_syms();
+    if (!fn_vmalloc || !fn_vfree || !fn_vmalloc_to_pfn || !fn_apply || !fn_apply_existing ||
+        !fn_access_process_vm || !fn_get_task_mm || !fn_mmput || !fn_find_get_task_by_vpid || !g_addr_pf ||
+        !fn_task_pid_nr_ns) {
+        apps(p, e, "error: symbols not resolved (run probe)\n");
+        return -1;
+    }
+    if (g_armed || g_ghost_kaddr) {
+        apps(p, e, "error: busy; disarm + ghostfree first\n");
+        return -1;
+    }
+    if (nclone == 0 || nclone * 4 > 0x1000) {
+        apps(p, e, "error: backup clone must fit one page\n");
+        return -1;
+    }
+    void *task = fn_find_get_task_by_vpid((int)pid);
+    if (is_err_or_null(task)) {
+        apps(p, e, "error: task not found\n");
+        return -1;
+    }
+    void *mm = fn_get_task_mm(task);
+    if (is_err_or_null(mm)) {
+        apps(p, e, "error: no mm\n");
+        return -1;
+    }
+    int gr = ghost_inject((int)pid, task, mm, ghost_va, clonebytes, (int)(nclone * 4), template_va);
+    fn_mmput(mm);
+    if (gr) {
+        p = apps(p, e, "error: ghost backup inject failed rc=");
+        p = appdec(p, e, gr);
+        apps(p, e, "\n");
+        return -1;
+    }
+    g_redirect_fixed = replace;
+    long rc = arm_common(pid, target, MODE_REDIRECT_FIXED, 0, p, e);
+    /* append the backup pointer after arm_common's message (buf is zero-filled) */
+    char *q = p;
+    while (*q) q++;
+    q = apps(q, e, "backup=");
+    q = apphex(q, e, g_ghost_va);
+    apps(q, e, " (call backup to run original)\n");
+    return rc;
+}
+
 static long do_hidemaps(uint64_t page, char *p, char *e)
 {
     resolve_syms();
@@ -677,6 +775,9 @@ static long arm_common(uint64_t pid, uint64_t addr, int mode, uint64_t clone, ch
     p = apphex(p, e, base);
     if (mode == MODE_SELFHEAL) {
         p = apps(p, e, " mode=SELFHEAL");
+    } else if (mode == MODE_REDIRECT_FIXED) {
+        p = apps(p, e, " mode=REDIRECT_FIXED replace=");
+        p = apphex(p, e, g_redirect_fixed);
     } else {
         p = apps(p, e, mode == MODE_REDIRECT_MAP ? " mode=REDIRECT_MAP clone=" : " mode=REDIRECT clone=");
         p = apphex(p, e, g_clone_page);
@@ -749,6 +850,7 @@ static long do_disarm(char *p, char *e)
     g_ptep = 0;
     g_mode = MODE_SELFHEAL;
     g_clone_page = 0;
+    g_redirect_fixed = 0;
     g_nmap = 0;
     return 0;
 }
@@ -758,7 +860,10 @@ static long do_state(char *p, char *e)
     p = apps(p, e, "armed=");
     p = appdec(p, e, g_armed);
     p = apps(p, e, " mode=");
-    p = apps(p, e, g_mode == MODE_REDIRECT_MAP ? "REDIRECT_MAP" : (g_mode == MODE_REDIRECT ? "REDIRECT" : "SELFHEAL"));
+    p = apps(p, e, g_mode == MODE_REDIRECT_MAP ? "REDIRECT_MAP"
+                   : g_mode == MODE_REDIRECT ? "REDIRECT"
+                   : g_mode == MODE_REDIRECT_FIXED ? "REDIRECT_FIXED"
+                   : "SELFHEAL");
     p = apps(p, e, " nmap=");
     p = appdec(p, e, g_nmap);
     p = apps(p, e, " pf_hooked=");
@@ -909,6 +1014,21 @@ static long shpte_control0(const char *args, char *__user out_msg, int outlen)
             rc = do_ghosttest(pid, gva, tva, p, e);
     } else if (starts(a, "ghostfree")) {
         rc = do_ghostfree(p, e);
+    } else if (starts(a, "hookto")) {
+        uint64_t pid = 0, tgt = 0, rep = 0, cb = 0, nc = 0, tv = 0, gv = 0;
+        const char *s = parse_ull(a + 6, &pid);
+        s = parse_ull(s, &tgt);
+        s = parse_ull(s, &rep);
+        s = parse_ull(s, &cb);
+        s = parse_ull(s, &nc);
+        s = parse_ull(s, &tv);
+        parse_ull(s, &gv);
+        if (!pid || !tgt || !rep || !cb || !nc || !tv || !gv)
+            apps(p, e,
+                 "usage: hookto <pid> <target> <replace> <clonebytes> <nclone> <template> <ghost_va>\n"),
+                rc = -1;
+        else
+            rc = do_hookto(pid, tgt, rep, cb, nc, tv, gv, p, e);
     } else if (starts(a, "dump")) {
         rc = do_state(p, e);
     } else {
