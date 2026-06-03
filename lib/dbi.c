@@ -76,6 +76,62 @@ static int insn_size(uint32_t insn, uint64_t pc, uint64_t fbase, uint64_t fend)
     return 1;
 }
 
+/* emit the recompiled form of one instruction at clone index `o`; returns new o.
+ * Internal branches (target in [base,fend)) are re-encoded clone-relative via
+ * offmap; ADR/ADRP/external branches/LDR-literal become absolute sequences. For
+ * LDR-literal, the pool value is read only if lit_addr is within [lit_lo,lit_hi)
+ * (so whole-page recompiles don't deref data misread as a literal load -> 0). */
+static int emit_one(uint32_t *out, int o, uint32_t insn, uint64_t pc, uint64_t base, uint64_t fend,
+                    const uint32_t *offmap, uintptr_t lit_lo, uintptr_t lit_hi)
+{
+    int rd = insn & 0x1f;
+    if (is_adrp(insn)) {
+        int64_t imm = sext(((insn >> 5) & 0x7ffff) << 2 | ((insn >> 29) & 3), 21);
+        uint64_t t = (pc & ~0xfffULL) + ((uint64_t)imm << 12);
+        out[o++] = enc_ldr_lit64(rd, 8); out[o++] = enc_b(12);
+        out[o++] = (uint32_t)t; out[o++] = (uint32_t)(t >> 32);
+    } else if (is_adr(insn)) {
+        int64_t imm = sext(((insn >> 5) & 0x7ffff) << 2 | ((insn >> 29) & 3), 21);
+        uint64_t t = pc + (uint64_t)imm;
+        out[o++] = enc_ldr_lit64(rd, 8); out[o++] = enc_b(12);
+        out[o++] = (uint32_t)t; out[o++] = (uint32_t)(t >> 32);
+    } else if (is_ldrlit(insn)) {
+        int64_t imm = sext((insn >> 5) & 0x7ffff, 19);
+        uintptr_t lit_addr = (uintptr_t)(pc + ((uint64_t)imm << 2));
+        int opc = (insn >> 30) & 3;
+        uint64_t val = 0;
+        if (lit_addr >= lit_lo && lit_addr < lit_hi)
+            val = (opc == 1) ? *(volatile uint64_t *)lit_addr : (uint64_t) * (volatile uint32_t *)lit_addr;
+        out[o++] = (insn & 0xFF00001Fu) | (2u << 5); /* same opc/Rt, imm19 -> [pc,#8] */
+        out[o++] = enc_b(12);
+        out[o++] = (uint32_t)val; out[o++] = (uint32_t)(val >> 32);
+    } else if (is_bl(insn)) {
+        o += emit_far(&out[o], btarget(insn, pc), 1);
+    } else if (is_b(insn)) {
+        uint64_t t = btarget(insn, pc);
+        if (t >= base && t < fend) {
+            int rel = (int)offmap[(int)((t - base) / 4)] - o;
+            out[o] = enc_b(rel * 4);
+            o++;
+        } else {
+            o += emit_far(&out[o], t, 0);
+        }
+    } else if (is_bcond(insn) || is_cbz(insn) || is_tbz(insn)) {
+        uint64_t t = btarget(insn, pc);
+        if (t >= base && t < fend) {
+            int rel = (int)offmap[(int)((t - base) / 4)] - o;
+            out[o++] = is_tbz(insn) ? reenc_imm14(insn, rel) : reenc_imm19(insn, rel);
+        } else {
+            out[o] = is_tbz(insn) ? reenc_imm14(invert_cond(insn), 5) : reenc_imm19(invert_cond(insn), 5);
+            o++;
+            o += emit_far(&out[o], t, 0);
+        }
+    } else {
+        out[o++] = insn; /* verbatim */
+    }
+    return o;
+}
+
 int dbi_recompile(uintptr_t base, const uint32_t *src, int src_max, uint32_t *out, int out_cap,
                   uint32_t *offmap, int offmap_cap)
 {
@@ -103,55 +159,36 @@ int dbi_recompile(uintptr_t base, const uint32_t *src, int src_max, uint32_t *ou
     if (acc > out_cap) return DBI_ERR_RANGE;
     for (int i = nsrc; i < offmap_cap; i++) offmap[i] = (uint32_t)i;
 
-    /* pass 2: emit */
+    /* pass 2: emit (single function in-process -> literal pool always readable) */
     int o = 0;
-    for (int i = 0; i < nsrc; i++) {
-        uint32_t insn = src[i];
-        uint64_t pc = base + (uint64_t)i * 4;
-        int rd = insn & 0x1f;
-        if (is_adrp(insn)) {
-            int64_t imm = sext(((insn >> 5) & 0x7ffff) << 2 | ((insn >> 29) & 3), 21);
-            uint64_t t = (pc & ~0xfffULL) + ((uint64_t)imm << 12);
-            out[o++] = enc_ldr_lit64(rd, 8); out[o++] = enc_b(12);
-            out[o++] = (uint32_t)t; out[o++] = (uint32_t)(t >> 32);
-        } else if (is_adr(insn)) {
-            int64_t imm = sext(((insn >> 5) & 0x7ffff) << 2 | ((insn >> 29) & 3), 21);
-            uint64_t t = pc + (uint64_t)imm;
-            out[o++] = enc_ldr_lit64(rd, 8); out[o++] = enc_b(12);
-            out[o++] = (uint32_t)t; out[o++] = (uint32_t)(t >> 32);
-        } else if (is_ldrlit(insn)) {
-            int64_t imm = sext((insn >> 5) & 0x7ffff, 19);
-            uint64_t lit_addr = pc + ((uint64_t)imm << 2);
-            int opc = (insn >> 30) & 3;
-            uint64_t val = (opc == 1) ? *(volatile uint64_t *)lit_addr
-                                      : (uint64_t) * (volatile uint32_t *)lit_addr;
-            out[o++] = (insn & 0xFF00001Fu) | (2u << 5); /* same opc/Rt, imm19 -> [pc,#8] */
-            out[o++] = enc_b(12);
-            out[o++] = (uint32_t)val; out[o++] = (uint32_t)(val >> 32);
-        } else if (is_bl(insn)) {
-            o += emit_far(&out[o], btarget(insn, pc), 1);
-        } else if (is_b(insn)) {
-            uint64_t t = btarget(insn, pc);
-            if (t >= base && t < fend) {
-                int rel = (int)offmap[(int)((t - base) / 4)] - o;
-                out[o] = enc_b(rel * 4);
-                o++;
-            } else {
-                o += emit_far(&out[o], t, 0);
-            }
-        } else if (is_bcond(insn) || is_cbz(insn) || is_tbz(insn)) {
-            uint64_t t = btarget(insn, pc);
-            if (t >= base && t < fend) {
-                int rel = (int)offmap[(int)((t - base) / 4)] - o;
-                out[o++] = is_tbz(insn) ? reenc_imm14(insn, rel) : reenc_imm19(insn, rel);
-            } else {
-                out[o] = is_tbz(insn) ? reenc_imm14(invert_cond(insn), 5) : reenc_imm19(invert_cond(insn), 5);
-                o++;
-                o += emit_far(&out[o], t, 0);
-            }
-        } else {
-            out[o++] = insn; /* verbatim */
-        }
+    for (int i = 0; i < nsrc; i++)
+        o = emit_one(out, o, src[i], base + (uint64_t)i * 4, base, fend, offmap, 0, (uintptr_t)-1);
+    return o;
+}
+
+/* Whole-page (or arbitrary range) recompile: recompile ALL `n` instructions of
+ * [base, base+n*4) without stopping at RET -- so every function on a page is
+ * cloned and the original page can be UXN-trapped while neighbors still run from
+ * the clone. Internal branches (within the range) re-encode clone-relative;
+ * external go absolute. LDR-literal pool reads are bounded to [lit_lo,lit_hi) so
+ * data words misdecoded as loads don't fault the recompiler. offmap[i] = clone
+ * insn index of original insn i (for the do_page_fault router). */
+int dbi_recompile_range(uintptr_t base, const uint32_t *src, int n, uint32_t *out, int out_cap,
+                        uint32_t *offmap, int offmap_cap, uintptr_t lit_lo, uintptr_t lit_hi)
+{
+    if (n <= 0) return DBI_ERR_EMPTY;
+    if (n > offmap_cap) return DBI_ERR_OFFMAP;
+    uint64_t fend = base + (uint64_t)n * 4;
+
+    int acc = 0;
+    for (int i = 0; i < n; i++) {
+        offmap[i] = (uint32_t)acc;
+        acc += insn_size(src[i], base + (uint64_t)i * 4, base, fend);
     }
+    if (acc > out_cap) return DBI_ERR_RANGE;
+
+    int o = 0;
+    for (int i = 0; i < n; i++)
+        o = emit_one(out, o, src[i], base + (uint64_t)i * 4, base, fend, offmap, lit_lo, lit_hi);
     return o;
 }

@@ -41,6 +41,17 @@ enum {
 int dbi_recompile(uintptr_t base, const uint32_t *src, int src_max, uint32_t *out, int out_cap,
                   uint32_t *offmap, int offmap_cap);
 
+/*
+ * Whole-page / arbitrary-range recompile: recompile ALL `n` instructions of
+ * [base, base+n*4) (no stop at RET), so every function on a page is cloned and
+ * the original page can be UXN-trapped while page-neighbors still run from the
+ * clone. `lit_lo`/`lit_hi` bound LDR-literal pool reads (pass the readable source
+ * range) so data words misdecoded as literal loads are not dereferenced. offmap[i]
+ * = clone insn index of original insn i. Returns clone size in insns or DBI_ERR_*.
+ */
+int dbi_recompile_range(uintptr_t base, const uint32_t *src, int n, uint32_t *out, int out_cap,
+                        uint32_t *offmap, int offmap_cap, uintptr_t lit_lo, uintptr_t lit_hi);
+
 #ifdef __cplusplus
 }
 #endif
