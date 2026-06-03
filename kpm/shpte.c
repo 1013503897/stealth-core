@@ -62,6 +62,43 @@ KPM_DESCRIPTION("P2/P3/P4: UXN redirect + maps hide + VMA-less ghost memory");
 #define GHOST_MAGIC 0xDEADBEEFCAFEF00DULL
 #define PFN_MASK 0x0000FFFFFFFFF000ULL /* PTE output-address bits [47:12] */
 
+/* ---- minimal perf / hw_breakpoint ABI (HWBP-redirect inline_hooker) ---- */
+#define PERF_TYPE_BREAKPOINT 5u
+#define HW_BREAKPOINT_X 4u
+#define HW_BREAKPOINT_LEN_4 4u
+#define ATTR_PINNED (1ull << 2)
+#define ATTR_EXCLUDE_KERNEL (1ull << 5)
+#define ATTR_EXCLUDE_HV (1ull << 6)
+struct kp_perf_event_attr {
+    uint32_t type;
+    uint32_t size;
+    uint64_t config;
+    uint64_t sample_period;
+    uint64_t sample_type;
+    uint64_t read_format;
+    uint64_t flags;
+    uint32_t wakeup;
+    uint32_t bp_type;
+    uint64_t bp_addr;
+    uint64_t bp_len;
+    uint64_t branch_sample_type;
+    uint64_t sample_regs_user;
+    uint32_t sample_stack_user;
+    int32_t clockid;
+    uint64_t sample_regs_intr;
+    uint32_t aux_watermark;
+    uint16_t sample_max_stack;
+    uint16_t __res2;
+    uint32_t aux_sample_size;
+    uint32_t __res3;
+    uint64_t sig_data;
+};
+struct kp_callback_head {
+    struct kp_callback_head *next;
+    void (*func)(struct kp_callback_head *);
+};
+#define TWA_RESUME 1
+
 enum { PIDTYPE_PID = 0, PIDTYPE_TGID = 1 };
 
 /* ---- resolved kernel symbols ---- */
@@ -112,6 +149,18 @@ static volatile int g_ghost_pid = 0;
 /* syscall bridge: lets an injected agent drive the KPM without the superkey */
 #define BRIDGE_MAGIC 0x5348505442524447ULL /* "SHPTBRDG" */
 static volatile int g_bridge_hooked = 0;
+/* HWBP-redirect inline_hooker: per-instruction trap, so it doesn't disturb other
+ * functions sharing the target's page (real libart funcs aren't page-isolated) */
+static void *(*fn_reg_hwbp)(struct kp_perf_event_attr *, void *, void *, void *) = 0;
+static void (*fn_unreg_hwbp)(void *) = 0;
+static int (*fn_task_work_add)(void *, void *, int) = 0;
+static struct kp_perf_event_attr g_hwbp_attr;
+static void *g_hwbp = 0;
+static void *g_hwbp_task = 0;
+static volatile uint64_t g_hwbp_replace = 0;
+static struct kp_callback_head g_hwbp_tw_install, g_hwbp_tw_remove;
+static volatile int g_hwbp_armed = 0;
+static volatile long g_hw_redirects = 0;
 
 /* ---- tiny freestanding string/number helpers ---- */
 static char *apps(char *p, char *e, const char *s)
@@ -314,6 +363,45 @@ static void resolve_syms(void)
     if (!fn_vmalloc) fn_vmalloc = (void *)kallsyms_lookup_name("vmalloc");
     if (!fn_vfree) fn_vfree = (void *)kallsyms_lookup_name("vfree");
     if (!fn_vmalloc_to_pfn) fn_vmalloc_to_pfn = (void *)kallsyms_lookup_name("vmalloc_to_pfn");
+    if (!fn_reg_hwbp) fn_reg_hwbp = (void *)kallsyms_lookup_name("register_user_hw_breakpoint");
+    if (!fn_unreg_hwbp) fn_unreg_hwbp = (void *)kallsyms_lookup_name("unregister_hw_breakpoint");
+    if (!fn_task_work_add) fn_task_work_add = (void *)kallsyms_lookup_name("task_work_add");
+}
+
+/* HWBP overflow handler: reroute the trapped target entry to `replace`. No perf
+ * calls here (would wedge); just set PC. Backup is a ghost clone, so calling the
+ * original from `replace` does NOT re-trip this breakpoint (no livelock). */
+static void hwbp_handler(void *bp, void *data, struct pt_regs *regs)
+{
+    (void)bp;
+    (void)data;
+    if (!g_hwbp_armed || !g_hwbp_replace) return;
+    regs->pc = g_hwbp_replace;
+    g_hw_redirects++;
+}
+
+/* run in the target task's own context (sleepable): the perf register/unregister */
+static void tw_hwinstall(struct kp_callback_head *h)
+{
+    (void)h;
+    void *bp = fn_reg_hwbp(&g_hwbp_attr, (void *)hwbp_handler, 0, g_hwbp_task);
+    if (is_err_or_null(bp)) {
+        g_hwbp = 0;
+        logke("shpte: hwbp register failed ret=%llx\n", (unsigned long long)bp);
+        return;
+    }
+    g_hwbp = bp;
+    logki("shpte: hwbp installed addr=%llx -> replace=%llx\n", (unsigned long long)g_hwbp_attr.bp_addr,
+          (unsigned long long)g_hwbp_replace);
+}
+static void tw_hwremove(struct kp_callback_head *h)
+{
+    (void)h;
+    if (g_hwbp && fn_unreg_hwbp) {
+        fn_unreg_hwbp(g_hwbp);
+        g_hwbp = 0;
+    }
+    logki("shpte: hwbp removed redirects=%ld\n", g_hw_redirects);
 }
 
 /* apply_to_page_range callback: write a hand-crafted PTE value (*data) */
@@ -643,6 +731,100 @@ static long do_hookto(uint64_t pid, uint64_t target, uint64_t replace, uint64_t 
     return rc;
 }
 
+/* HWBP variant of hookto: traps ONLY the target's entry instruction (per-thread
+ * hardware breakpoint), so functions sharing the target's page are untouched --
+ * the correct primitive for real libart functions (LSPlant inline_hooker). The
+ * perf register is deferred to the target's own context via task_work. backup is
+ * a ghost clone, as in hookto. Teardown = hwunhook + ghostfree. */
+static long do_hwhookto(uint64_t pid, uint64_t target, uint64_t replace, uint64_t clonebytes,
+                        uint64_t nclone, uint64_t template_va, uint64_t ghost_va, char *p, char *e)
+{
+    resolve_syms();
+    if (!fn_reg_hwbp || !fn_unreg_hwbp || !fn_task_work_add || !fn_vmalloc || !fn_vfree ||
+        !fn_vmalloc_to_pfn || !fn_apply || !fn_apply_existing || !fn_access_process_vm || !fn_get_task_mm ||
+        !fn_mmput || !fn_find_get_task_by_vpid) {
+        apps(p, e, "error: symbols not resolved (run probe)\n");
+        return -1;
+    }
+    if (g_hwbp_armed || g_hwbp || g_ghost_kaddr) {
+        apps(p, e, "error: busy; hwunhook + ghostfree first\n");
+        return -1;
+    }
+    if (nclone == 0 || nclone * 4 > 0x1000) {
+        apps(p, e, "error: backup clone must fit one page\n");
+        return -1;
+    }
+    void *task = fn_find_get_task_by_vpid((int)pid);
+    if (is_err_or_null(task)) {
+        apps(p, e, "error: task not found\n");
+        return -1;
+    }
+    void *mm = fn_get_task_mm(task);
+    if (is_err_or_null(mm)) {
+        apps(p, e, "error: no mm\n");
+        return -1;
+    }
+    int gr = ghost_inject((int)pid, task, mm, ghost_va, clonebytes, (int)(nclone * 4), template_va);
+    fn_mmput(mm);
+    if (gr) {
+        p = apps(p, e, "error: ghost backup inject failed rc=");
+        p = appdec(p, e, gr);
+        apps(p, e, "\n");
+        return -1;
+    }
+
+    char *z = (char *)&g_hwbp_attr;
+    for (unsigned i = 0; i < sizeof(g_hwbp_attr); i++) z[i] = 0;
+    g_hwbp_attr.type = PERF_TYPE_BREAKPOINT;
+    g_hwbp_attr.size = sizeof(g_hwbp_attr);
+    g_hwbp_attr.sample_period = 1;
+    g_hwbp_attr.flags = ATTR_PINNED | ATTR_EXCLUDE_KERNEL | ATTR_EXCLUDE_HV;
+    g_hwbp_attr.bp_type = HW_BREAKPOINT_X;
+    g_hwbp_attr.bp_addr = target;
+    g_hwbp_attr.bp_len = HW_BREAKPOINT_LEN_4;
+    g_hwbp_task = task; /* leaked ref keeps task alive for the bp */
+    g_hwbp_replace = replace;
+    g_hwbp = 0;
+    g_hw_redirects = 0;
+    g_hwbp_armed = 1;
+
+    g_hwbp_tw_install.next = 0;
+    g_hwbp_tw_install.func = tw_hwinstall;
+    if (fn_task_work_add(task, &g_hwbp_tw_install, TWA_RESUME)) {
+        g_hwbp_armed = 0;
+        apps(p, e, "error: task_work_add(hwinstall) failed\n");
+        return -1;
+    }
+    p = apps(p, e, "ok: hwhookto queued target=");
+    p = apphex(p, e, target);
+    p = apps(p, e, " -> replace=");
+    p = apphex(p, e, replace);
+    p = apps(p, e, " backup=");
+    p = apphex(p, e, g_ghost_va);
+    apps(p, e, " (HWBP: page-neighbors untouched)\n");
+    return 0;
+}
+
+static long do_hwunhook(char *p, char *e)
+{
+    if (!g_hwbp_armed && !g_hwbp) {
+        apps(p, e, "error: hwbp not armed\n");
+        return -1;
+    }
+    g_hwbp_armed = 0;
+    if (g_hwbp_task && fn_task_work_add) {
+        g_hwbp_tw_remove.next = 0;
+        g_hwbp_tw_remove.func = tw_hwremove;
+        fn_task_work_add(g_hwbp_task, &g_hwbp_tw_remove, TWA_RESUME);
+    }
+    p = apps(p, e, "ok: queued hwunhook, redirects=");
+    p = appdec(p, e, g_hw_redirects);
+    apps(p, e, " (then ghostfree)\n");
+    g_hwbp_task = 0;
+    g_hwbp_replace = 0;
+    return 0;
+}
+
 static long do_hidemaps(uint64_t page, char *p, char *e)
 {
     resolve_syms();
@@ -890,6 +1072,10 @@ static long do_state(char *p, char *e)
     p = appdec(p, e, g_maps_hidden);
     p = apps(p, e, " ghost_va=");
     p = apphex(p, e, g_ghost_va);
+    p = apps(p, e, " hwbp_armed=");
+    p = appdec(p, e, g_hwbp_armed);
+    p = apps(p, e, " hw_redirects=");
+    p = appdec(p, e, g_hw_redirects);
     if (g_ptep) {
         p = apps(p, e, "\npte_now=");
         p = apphex(p, e, *(volatile uint64_t *)g_ptep);
@@ -1097,6 +1283,23 @@ static long shpte_run(const char *args, char *buf, int bufcap)
                 rc = -1;
         else
             rc = do_hookto(pid, tgt, rep, cb, nc, tv, gv, p, e);
+    } else if (starts(a, "hwhookto")) {
+        uint64_t pid = 0, tgt = 0, rep = 0, cb = 0, nc = 0, tv = 0, gv = 0;
+        const char *s = parse_ull(a + 8, &pid);
+        s = parse_ull(s, &tgt);
+        s = parse_ull(s, &rep);
+        s = parse_ull(s, &cb);
+        s = parse_ull(s, &nc);
+        s = parse_ull(s, &tv);
+        parse_ull(s, &gv);
+        if (!pid || !tgt || !rep || !cb || !nc || !tv || !gv)
+            apps(p, e,
+                 "usage: hwhookto <pid> <target> <replace> <clonebytes> <nclone> <template> <ghost_va>\n"),
+                rc = -1;
+        else
+            rc = do_hwhookto(pid, tgt, rep, cb, nc, tv, gv, p, e);
+    } else if (starts(a, "hwunhook")) {
+        rc = do_hwunhook(p, e);
     } else if (starts(a, "unbridge")) {
         rc = do_unbridge(p, e);
     } else if (starts(a, "bridge")) {
@@ -1145,6 +1348,11 @@ static long shpte_exit(void *__user reserved)
     if (g_bridge_hooked) {
         fp_unhook_syscalln(__NR_personality, (void *)before_bridge, 0);
         g_bridge_hooked = 0;
+    }
+    g_hwbp_armed = 0;
+    if (g_hwbp && fn_unreg_hwbp) {
+        fn_unreg_hwbp(g_hwbp);
+        g_hwbp = 0;
     }
     if (g_ghost_kaddr) {
         /* clear the injected PTE then free, so we don't leave a dangling map/leak */
