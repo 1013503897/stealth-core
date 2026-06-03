@@ -43,6 +43,7 @@
 #include <pgtable.h>
 #include <asm/current.h>
 #include <asm/ptrace.h>
+#include <syscall.h>
 #include <stdint.h>
 
 KPM_NAME("shpte");
@@ -108,6 +109,9 @@ static volatile long g_maps_hidden = 0;
 static void *g_ghost_kaddr = 0; /* vmalloc page backing the ghost VA */
 static volatile uint64_t g_ghost_va = 0;
 static volatile int g_ghost_pid = 0;
+/* syscall bridge: lets an injected agent drive the KPM without the superkey */
+#define BRIDGE_MAGIC 0x5348505442524447ULL /* "SHPTBRDG" */
+static volatile int g_bridge_hooked = 0;
 
 /* ---- tiny freestanding string/number helpers ---- */
 static char *apps(char *p, char *e, const char *s)
@@ -931,12 +935,76 @@ static long shpte_init(const char *args, const char *event, void *__user reserve
     return 0;
 }
 
-static long shpte_control0(const char *args, char *__user out_msg, int outlen)
+static long shpte_run(const char *args, char *buf, int bufcap); /* fwd */
+
+/* syscall bridge: an injected agent (no superkey) drives the KPM via
+ *   syscall(__NR_personality, BRIDGE_MAGIC, cmd_ptr, cmd_len, out_ptr, out_len)
+ * It runs in the agent's own process context (sleepable), like a supercall.
+ * Real personality() calls (arg0 != magic) pass straight through. */
+static void before_bridge(hook_fargs6_t *fargs, void *udata)
 {
+    (void)udata;
+    if ((uint64_t)syscall_argn(fargs, 0) != BRIDGE_MAGIC) return; /* not ours -> passthrough */
+    const char *ucmd = (const char *)syscall_argn(fargs, 1);
+    void *uout = (void *)syscall_argn(fargs, 3);
+    long outlen = (long)syscall_argn(fargs, 4);
+
+    char cmd[256];
     char buf[1024];
-    for (int i = 0; i < (int)sizeof(buf); i++) buf[i] = 0;
+    long n = compat_strncpy_from_user(cmd, ucmd, sizeof(cmd));
+    if (n < 0) {
+        fargs->ret = -1;
+        fargs->skip_origin = 1;
+        return;
+    }
+    cmd[sizeof(cmd) - 1] = 0;
+    long rc = shpte_run(cmd, buf, (int)sizeof(buf));
+    int len = 0;
+    while (buf[len] && len < (int)sizeof(buf) - 1) len++;
+    if (uout && outlen > 0) {
+        if (len >= outlen) len = (int)outlen - 1;
+        buf[len] = 0;
+        compat_copy_to_user(uout, buf, len + 1);
+    }
+    fargs->ret = rc;
+    fargs->skip_origin = 1; /* swallow the personality() call */
+}
+
+static long do_bridge(char *p, char *e)
+{
+    if (g_bridge_hooked) {
+        apps(p, e, "ok: bridge already on\n");
+        return 0;
+    }
+    hook_err_t err = fp_hook_syscalln(__NR_personality, 6, (void *)before_bridge, 0, 0);
+    if (err != HOOK_NO_ERR) {
+        p = apps(p, e, "error: hook __NR_personality failed err=");
+        p = appdec(p, e, (int)err);
+        apps(p, e, "\n");
+        return -1;
+    }
+    g_bridge_hooked = 1;
+    apps(p, e, "ok: syscall bridge on (personality + magic)\n");
+    return 0;
+}
+
+static long do_unbridge(char *p, char *e)
+{
+    if (g_bridge_hooked) {
+        fp_unhook_syscalln(__NR_personality, (void *)before_bridge, 0);
+        g_bridge_hooked = 0;
+    }
+    apps(p, e, "ok: syscall bridge off\n");
+    return 0;
+}
+
+/* dispatch a command string into `buf` (kernel buffer), returns rc. Shared by the
+ * KPM_CTL0 entry (superkey path) and the syscall bridge (no-superkey agent path). */
+static long shpte_run(const char *args, char *buf, int bufcap)
+{
+    for (int i = 0; i < bufcap; i++) buf[i] = 0;
     char *p = buf;
-    char *e = buf + sizeof(buf) - 1;
+    char *e = buf + bufcap - 1;
     long rc = 0;
     const char *a = skipsp(args ? args : "");
 
@@ -1029,17 +1097,26 @@ static long shpte_control0(const char *args, char *__user out_msg, int outlen)
                 rc = -1;
         else
             rc = do_hookto(pid, tgt, rep, cb, nc, tv, gv, p, e);
+    } else if (starts(a, "unbridge")) {
+        rc = do_unbridge(p, e);
+    } else if (starts(a, "bridge")) {
+        rc = do_bridge(p, e);
     } else if (starts(a, "dump")) {
         rc = do_state(p, e);
     } else {
         apps(p, e,
-             "usage: probe | pte <pid> <addr> | arm <pid> <addr> | "
-             "redirect <pid> <addr> <clone> | redirectmap <pid> <addr> <clone> <map> <n> | "
-             "hidemaps [page] | unhidemaps | ghosttest <pid> <ghost_va> <template_va> | "
-             "ghostfree | disarm | dump\n");
+             "usage: probe | pte | arm | redirect | redirectmap | hookto | "
+             "hidemaps | unhidemaps | ghosttest | ghostredirect | ghostfree | "
+             "bridge | unbridge | disarm | dump\n");
         rc = -1;
     }
+    return rc;
+}
 
+static long shpte_control0(const char *args, char *__user out_msg, int outlen)
+{
+    char buf[1024];
+    long rc = shpte_run(args, buf, (int)sizeof(buf));
     int len = 0;
     while (buf[len] && len < (int)sizeof(buf) - 1) len++;
     if (len >= outlen) len = outlen - 1;
@@ -1064,6 +1141,10 @@ static long shpte_exit(void *__user reserved)
     if (g_maps_hooked && g_addr_show_map) {
         hook_unwrap(g_addr_show_map, (void *)before_showmap, (void *)after_showmap);
         g_maps_hooked = 0;
+    }
+    if (g_bridge_hooked) {
+        fp_unhook_syscalln(__NR_personality, (void *)before_bridge, 0);
+        g_bridge_hooked = 0;
     }
     if (g_ghost_kaddr) {
         /* clear the injected PTE then free, so we don't leave a dangling map/leak */
