@@ -153,22 +153,29 @@ static volatile uint64_t g_hook_replace = 0; /* 0 = no override */
  * ov_replace, store barrier, then ov_off) and retired key-first (single store of
  * the SENTINEL). ov_replace always holds a valid pointer or a stale-but-valid one
  * -- never garbage. nlive counts non-inert slots (when it hits 0 the page disarms). */
-#define MAX_PG 24            /* trapped pages live at once (~20 libart funcs grouped by page) */
-#define MAX_OV 8             /* hooked function entries per trapped page */
-#define OV_NONE (~0ULL)      /* sentinel: inert override slot (a real page offset is < 0x1000) */
+#define MAX_PG 16            /* trapped REGIONS live at once (LSPlant ~20 funcs grouped by region) */
+#define MAX_OV 8             /* hooked function entries per trapped region */
+#define MAX_RGN 16           /* RV-2: max pages in one clean-bounded region (covers all but a few huge libart fns) */
+#define OV_NONE (~0ULL)      /* sentinel: inert override slot (a real region offset is < npages*0x1000) */
+/* RV-2: each slot now traps a clean-bounded MULTI-PAGE region [page, page+npages) and
+ * routes it to one whole-region clone. The clone covers complete functions (region
+ * boundaries fall in inter-function gaps), so a function spanning a page is wholly in
+ * the clone and RETs normally -- no spill. ov_off/the fault offset are REGION-relative
+ * (far - page), not page-relative. offmap is vmalloc'd (region-sized, too big for BSS). */
 struct pghook {
     volatile int active;
     int pid;
-    uint64_t page;     /* UXN-trapped page */
-    uint64_t clone;    /* whole-page clone base (user VA) */
-    volatile int nlive;             /* live (non-inert) overrides; 0 => page can disarm */
-    volatile uint64_t ov_off[MAX_OV];     /* page-relative byte offset, or OV_NONE if inert */
+    uint64_t page;     /* region base (R_lo) -- first UXN-trapped page */
+    volatile int npages; /* pages in the region [page, page+npages*0x1000) */
+    uint64_t clone;    /* whole-region clone base (user VA) */
+    volatile int nlive;             /* live (non-inert) overrides; 0 => region can disarm */
+    volatile uint64_t ov_off[MAX_OV];     /* REGION-relative byte offset, or OV_NONE if inert */
     volatile uint64_t ov_replace[MAX_OV]; /* replacement VA for ov_off[k] */
-    int nmap;
-    uint64_t *ptep;    /* cached leaf PTE pointer */
-    uint64_t pte_orig; /* original PTE (UXN clear) */
+    int nmap;                /* region instruction count = npages*1024 */
+    uint32_t *offmap;        /* vmalloc'd, nmap entries: orig insn idx -> clone insn idx */
+    uint64_t *ptep[MAX_RGN]; /* cached leaf PTE pointer per region page */
+    uint64_t pte_orig[MAX_RGN]; /* original PTE (UXN clear) per region page */
     volatile long redirects;
-    uint32_t offmap[OFFMAP_MAX];
 };
 static struct pghook g_pg[MAX_PG];
 static volatile int g_npg = 0;
@@ -382,27 +389,28 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
         return;
     }
 
-    /* ---- multi-page hook table (pghook) ----
-     * Several pages can be UXN-trapped at once (LSPlant hooks many libart funcs
-     * on different pages). Each slot routes its page exactly like pagehook does,
-     * but with its own clone / offset_map / single-fn override. */
+    /* ---- multi-page hook table (pghook, RV-2 region slots) ----
+     * Each slot UXN-traps a clean-bounded MULTI-PAGE region and routes it to one
+     * whole-region clone. The faulting offset is REGION-relative (far - s->page), so
+     * a function spanning a page is wholly in the clone and runs to its own RET. */
     if (g_npg > 0) {
         for (int i = 0; i < MAX_PG; i++) {
             struct pghook *s = &g_pg[i];
-            if (!s->active || s->page != fpage) continue;
+            if (!s->active) continue;
+            if (fpage < s->page || fpage >= s->page + (uint64_t)s->npages * 0x1000UL) continue;
             if (fn_task_pid_nr_ns &&
                 fn_task_pid_nr_ns((void *)get_current(), PIDTYPE_TGID, 0) != s->pid)
                 continue; /* same VA in another process -> not our trap */
-            uint64_t poff = far & 0xfffUL;
+            uint64_t roff = far - s->page; /* region-relative byte offset */
             uint64_t rep = 0;
-            for (int k = 0; k < MAX_OV; k++) /* inert slots hold OV_NONE -> never match poff */
-                if (poff == s->ov_off[k]) { rep = s->ov_replace[k]; break; }
+            for (int k = 0; k < MAX_OV; k++) /* inert slots hold OV_NONE -> never match roff */
+                if (roff == s->ov_off[k]) { rep = s->ov_replace[k]; break; }
             if (rep) {
-                regs->pc = rep; /* a hooked fn entry on this page -> its replacement */
+                regs->pc = rep; /* a hooked fn entry in this region -> its replacement */
             } else {
-                uint64_t off = poff;
+                uint64_t off = roff;
                 uint32_t idx = (uint32_t)(off >> 2);
-                if (idx < (uint32_t)s->nmap) off = (uint64_t)s->offmap[idx] << 2;
+                if (s->offmap && idx < (uint32_t)s->nmap) off = (uint64_t)s->offmap[idx] << 2;
                 regs->pc = s->clone + off; /* everything else runs from the clone */
             }
             s->redirects++;
@@ -1261,10 +1269,13 @@ static long do_pghook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t mapa
         apps(p, e, "error: symbols not resolved (run probe)\n");
         return -1;
     }
-    if (ninsn == 0 || ninsn > OFFMAP_MAX || (target_off & 3) || target_off >= 0x1000) {
-        apps(p, e, "error: bad ninsn/target_off\n");
+    /* ninsn is the REGION instruction count = npages*1024; target_off is region-relative */
+    if (ninsn == 0 || (ninsn & 1023) || ninsn > (uint64_t)(MAX_RGN * 1024) || (target_off & 3) ||
+        target_off >= ninsn * 4) {
+        apps(p, e, "error: bad ninsn (must be Nx1024, <= MAX_RGN pages) / target_off\n");
         return -1;
     }
+    int npages = (int)(ninsn / 1024);
     page &= ~0xFFFUL;
     clone &= ~0xFFFUL;
 
@@ -1324,29 +1335,56 @@ static long do_pghook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t mapa
     }
     struct pghook *s = &g_pg[si];
 
-    /* resolve the leaf PTE for the page (must be present/valid) */
-    struct pte_out o;
-    int r = resolve_pte(pid, page, &o);
-    if (r || !(o.val & PTE_VALID)) {
-        apps(p, e, "error: target page not present/valid (run it first)\n");
-        return -1;
-    }
-    /* read this slot's offset_map from the target's user memory */
     void *task = fn_find_get_task_by_vpid((int)pid);
     if (is_err_or_null(task)) {
         apps(p, e, "error: task not found\n");
         return -1;
     }
+    /* resolve + cache the leaf PTE of EVERY page in the region (all must be present) */
+    uint64_t *ptep[MAX_RGN];
+    uint64_t pte_orig[MAX_RGN];
+    for (int j = 0; j < npages; j++) {
+        struct pte_out o;
+        int r = resolve_pte(pid, page + (uint64_t)j * 0x1000, &o);
+        if (r || !(o.val & PTE_VALID)) {
+            apps(p, e, "error: a region page is not present/valid (run it first)\n");
+            return -1;
+        }
+        ptep[j] = (uint64_t *)o.ptep;
+        pte_orig[j] = o.val;
+    }
+    /* vmalloc the region offmap (too big for BSS) and read it from the target */
+    if (!fn_vmalloc || !fn_vfree) {
+        apps(p, e, "error: vmalloc not resolved\n");
+        return -1;
+    }
     int want = (int)(ninsn * 4);
-    if (fn_access_process_vm(task, mapaddr, s->offmap, want, 0) != want) {
-        apps(p, e, "error: read offset_map failed\n");
+    uint32_t *offmap = fn_vmalloc((unsigned long)want);
+    if (!offmap) {
+        apps(p, e, "error: offmap vmalloc failed\n");
+        return -1;
+    }
+    int got = (int)fn_access_process_vm(task, mapaddr, offmap, want, 0);
+    if (got != want) {
+        fn_vfree(offmap);
+        p = apps(p, e, "error: read offset_map failed got=");
+        p = appdec(p, e, got);
+        p = apps(p, e, " want=");
+        p = appdec(p, e, want);
+        p = apps(p, e, " mapaddr=");
+        p = apphex(p, e, mapaddr);
+        apps(p, e, "\n");
         return -1;
     }
     /* ensure do_page_fault is hooked (shared, ref-counted with the single-page path) */
-    if (ensure_pf_hooked(p, e) != 0) return -1;
+    if (ensure_pf_hooked(p, e) != 0) {
+        fn_vfree(offmap);
+        return -1;
+    }
 
     s->pid = (int)pid;
     s->page = page;
+    s->npages = npages;
     s->clone = clone;
     for (int k = 0; k < MAX_OV; k++) s->ov_off[k] = OV_NONE; /* all slots inert */
     s->nlive = 0;
@@ -1356,14 +1394,18 @@ static long do_pghook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t mapa
         s->nlive = 1;
     }
     s->nmap = (int)ninsn;
-    s->ptep = (uint64_t *)o.ptep;
-    s->pte_orig = o.val;
+    s->offmap = offmap;
+    for (int j = 0; j < npages; j++) {
+        s->ptep[j] = ptep[j];
+        s->pte_orig[j] = pte_orig[j];
+    }
     s->redirects = 0;
     s->active = 1; /* publish the fully-populated slot before arming UXN */
     g_npg++;
 
-    /* arm UXN on the page -> EL0 execute now faults into before_pf */
-    *(volatile uint64_t *)s->ptep = o.val | PTE_UXN;
+    /* arm UXN on EVERY region page -> EL0 execute now faults into before_pf */
+    for (int j = 0; j < npages; j++)
+        *(volatile uint64_t *)s->ptep[j] = s->pte_orig[j] | PTE_UXN;
     flush_tlb_all();
 
     p = apps(p, e, "ok: pghook slot=");
@@ -1372,6 +1414,8 @@ static long do_pghook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t mapa
     p = appdec(p, e, (long)pid);
     p = apps(p, e, " page=");
     p = apphex(p, e, page);
+    p = apps(p, e, " npages=");
+    p = appdec(p, e, npages);
     p = apps(p, e, " clone=");
     p = apphex(p, e, clone);
     p = apps(p, e, " backup=");
@@ -1393,13 +1437,14 @@ static long do_pgdisarm(char *p, char *e)
 {
     long total = 0;
     int n = 0;
-    /* clear UXN on every armed page first, keeping the slots active so a fault
-     * racing the teardown is still routed; then ONE flush; then drop the slots
+    /* clear UXN on every armed region's pages first, keeping the slots active so a
+     * fault racing the teardown is still routed; then ONE flush; then drop the slots
      * (after the flush no page is trapped, so deactivation can't strand a fault) */
     for (int i = 0; i < MAX_PG; i++) {
         struct pghook *s = &g_pg[i];
         if (!s->active) continue;
-        if (s->ptep) *(volatile uint64_t *)s->ptep = s->pte_orig; /* clear UXN */
+        for (int j = 0; j < s->npages; j++)
+            if (s->ptep[j]) *(volatile uint64_t *)s->ptep[j] = s->pte_orig[j]; /* clear UXN */
         n++;
     }
     if (n) flush_tlb_all();
@@ -1408,7 +1453,9 @@ static long do_pgdisarm(char *p, char *e)
         if (!s->active) continue;
         total += s->redirects;
         s->active = 0;
-        s->ptep = 0;
+        s->npages = 0;
+        if (s->offmap && fn_vfree) fn_vfree(s->offmap);
+        s->offmap = 0;
     }
     g_npg = 0;
     maybe_unhook_pf();
@@ -1452,23 +1499,24 @@ static long do_pgunhook(uint64_t pid, uint64_t page, uint64_t off, char *p, char
             p = apphex(p, e, off);
             p = apps(p, e, " nlive=");
             p = appdec(p, e, s->nlive);
-            p = apps(p, e, " (page still armed)\n");
+            p = apps(p, e, " (region still armed)\n");
             return 0;
         }
 
-        /* last override gone -> disarm the whole page (restore PTE, free slot) */
+        /* last override gone -> disarm the whole region (restore every PTE, free slot) */
         long red = s->redirects;
-        if (s->ptep) {
-            *(volatile uint64_t *)s->ptep = s->pte_orig; /* clear UXN */
-            flush_tlb_all();
-        }
+        for (int j = 0; j < s->npages; j++)
+            if (s->ptep[j]) *(volatile uint64_t *)s->ptep[j] = s->pte_orig[j]; /* clear UXN */
+        flush_tlb_all();
         s->active = 0;
-        s->ptep = 0;
+        s->npages = 0;
+        if (s->offmap && fn_vfree) fn_vfree(s->offmap);
+        s->offmap = 0;
         if (g_npg > 0) g_npg--;
         maybe_unhook_pf();
         p = apps(p, e, "ok: pgunhook slot=");
         p = appdec(p, e, i);
-        p = apps(p, e, " disarmed page=");
+        p = apps(p, e, " disarmed region=");
         p = apphex(p, e, page);
         p = apps(p, e, " redirects=");
         p = appdec(p, e, red);
@@ -1477,7 +1525,7 @@ static long do_pgunhook(uint64_t pid, uint64_t page, uint64_t off, char *p, char
         apps(p, e, "\n");
         return 0;
     }
-    apps(p, e, "error: page not armed for this pid\n");
+    apps(p, e, "error: region not armed for this pid\n");
     return -1;
 }
 
@@ -1552,6 +1600,8 @@ static long do_state(char *p, char *e)
         p = appdec(p, e, s->pid);
         p = apps(p, e, " page=");
         p = apphex(p, e, s->page);
+        p = apps(p, e, " npages=");
+        p = appdec(p, e, s->npages);
         p = apps(p, e, " clone=");
         p = apphex(p, e, s->clone);
         p = apps(p, e, " nlive=");
@@ -1879,15 +1929,18 @@ static long shpte_exit(void *__user reserved)
      * as do_pgdisarm) */
     {
         int restored = 0;
-        for (int i = 0; i < MAX_PG; i++)
-            if (g_pg[i].active && g_pg[i].ptep) {
-                *(volatile uint64_t *)g_pg[i].ptep = g_pg[i].pte_orig;
-                restored++;
-            }
+        for (int i = 0; i < MAX_PG; i++) {
+            if (!g_pg[i].active) continue;
+            for (int j = 0; j < g_pg[i].npages; j++)
+                if (g_pg[i].ptep[j]) *(volatile uint64_t *)g_pg[i].ptep[j] = g_pg[i].pte_orig[j];
+            restored++;
+        }
         if (restored) flush_tlb_all();
         for (int i = 0; i < MAX_PG; i++) {
             g_pg[i].active = 0;
-            g_pg[i].ptep = 0;
+            g_pg[i].npages = 0;
+            if (g_pg[i].offmap && fn_vfree) fn_vfree(g_pg[i].offmap);
+            g_pg[i].offmap = 0;
         }
         g_npg = 0;
     }

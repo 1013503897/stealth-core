@@ -32,6 +32,7 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 | **L1a** | LSPlant `inline_hooker` carrier: `pghook` scaled to **many overrides per page** (`MAX_OV`, barrier-safe sentinel table) across **`MAX_PG=24`** pages + `pgunhook` (per-fn `inline_unhooker`); **`lib/kpmhook`** userspace glue maps LSPlant's `InitInfo` callbacks onto the bridge (whole-page DBI clone per page, mmap RX). ~20 simultaneous libart-style hooks, several sharing a page, all from one no-superkey agent | ✅ verified |
 | **L1b** | **Vector wiring** (`../Vector`): `native_api.h` `HookInline`/`UnhookInline` (the funnel for both `lsplant::InitInfo` sites + the `NativeAPIEntries` ABI) try `kpm_inline_hooker`/`unhooker` first, **fall back to Dobby** when the bridge is unarmed; `lib/kpmhook`+`lib/dbi` vendored into `native/src/kpm`; `:zygisk:assembleDebug` → `libzygisk.so` | ✅ built (not yet runtime-verified) |
 | **L1c** | **Page-span census** (`tools/libartcensus.c`, zero-risk on-disk ELF scan): real libart `.text` has **12.2% of functions spanning page boundaries (lower bound), 46.5% of code bytes in spanning runs, max fn ~27 pages** → the single-page whole-page clone is **unusable for real libart**; **multi-page clones are mandatory** (scopes RV-2) | ✅ measured |
+| **RV-2** | **Clean-bounded multi-page region clones**: a `pghook` slot now traps a contiguous page **region** whose `R_hi` falls in an inter-function gap, cloned in one piece — so a function spanning a page boundary (or a page-neighbor that does) is wholly in the clone and `RET`s normally. Region-relative routing + `fn_vmalloc`'d offmap in the KPM; clean-`R_hi` scan + region clone in `lib/kpmhook`. Verified by `tools/rgntool.c`: a ~1100-insn page-spanning fn runs its FULL body via a 2-page clone (backup returns `n+1100`), its 2nd-page neighbor runs normally; single-page (`npages=1`) regressions stay green | ✅ verified |
 
 ## Requirements
 
@@ -95,6 +96,9 @@ tools/      hbtarget.c  self-contained single-thread HWBP test target (pid + &ti
             libartcensus.c          L1c: zero-risk page-span census of a system lib's .text
                                     (on-disk ELF scan; quantifies how many functions span page
                                     boundaries -> whether multi-page clones are needed)
+            rgntool.c               RV-2: multi-page region clone test (a ~1100-insn page-spanning
+                                    fn + a 2nd-page neighbor, via lib/kpmhook over the bridge)
+            run_rgn_test.sh         RV-2 harness (spanning fn full body via the region clone)
 lib/        dbi.c/.h    libdbi: reusable AArch64 position-independent function recompiler
             dbi_test.c  host/device-runnable unit test (build_dbi_test.ps1)
             kpmhook.c/.h L1a: LSPlant InitInfo inline_hooker/unhooker glue -> KPM multi-page
@@ -188,11 +192,12 @@ The intended end-product is a modified **Vector** (JingMatrix's Zygisk ART-hook 
   built**: `native_api.h` `HookInline`/`UnhookInline` route through `lib/kpmhook` with a Dobby fallback;
   `:zygisk:assembleDebug` links it. **L1c census** (`tools/libartcensus.c`) shows **46.5% of libart
   code bytes live in page-spanning functions** → the single-page whole-page clone is unusable for real
-  libart. **Remaining (RV-2): multi-page function clones** in `lib/dbi`+`lib/kpmhook`+`kpm/shpte.c`
-  (clone a function's full multi-page extent; UXN-trap every page it/its neighbors touch; offmap across
-  pages), likely plus multi-slot `hwhookto` for a few hot targets; then a contained in-app verification
-  (one gated process, `system_server` on Dobby). Note: the property process-gate can't be read by an
-  `untrusted_app` (SELinux) — RV-2 needs a working per-process gate.
+  libart. **RV-2 done + device-verified**: a `pghook` slot now traps a clean-bounded multi-page **region**
+  (`R_hi` in an inter-function gap) cloned in one piece, so page-spanning functions/neighbors run wholly
+  from the clone (`tools/rgntool.c`). **Remaining:** a contained *in-app* verification (one gated process,
+  `system_server` on Dobby) — blocked on a working per-process gate (the `persist.*` prop can't be read by
+  an `untrusted_app`) and the SELinux `system_file` block on swapping the deployed module payload; plus
+  multi-slot `hwhookto` for the few functions too large for a clean region.
 - **Layer 2** (Java methods): fork LSPlant's `DoHook` to trap the compiled `entry_point` via HWBP/UXN
   instead of swapping the `ArtMethod` pointer (defeats pointer-roaming detection).
 - **Frida-Gum** (optional, larger): re-back Gum's `Interceptor` with `hwhookto` and Stalker's code

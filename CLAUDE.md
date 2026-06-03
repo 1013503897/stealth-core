@@ -159,11 +159,16 @@ Two independent version pins must match the device, or load/supercall silently f
   **one** function's entry (`page+target_off`) to `replace` while the clone's faithful copy of that
   function serves as the `backup` — the process-wide, page-neighbor-safe inline hook for real
   (page-shared) functions (target `tools/pagetool.c`). `pghook`/`pgunhook`/`pgdisarm` are the
-  **multi-page, multi-override** form (L1a): a fixed `g_pg[MAX_PG]` table (`MAX_PG=24`) so many such
-  pages can be trapped at once, and **each slot overrides up to `MAX_OV` function entries on its page**
-  (LSPlant inline-hooks ~20 libart funcs, several SHARING a code page). `pghook` is idempotent-arm +
-  append: the first call on a page arms it (UXN + whole-page clone + offmap), each later call on the
-  same `(pid,page)` appends an `(off→replace)` override. The override table is a **barrier-safe sentinel
+  **multi-page-REGION, multi-override** form (L1a + RV-2): a fixed `g_pg[MAX_PG]` table (`MAX_PG=16`) where
+  each slot UXN-traps a **clean-bounded contiguous page region** `[page, page+npages)` (`npages ≤ MAX_RGN=16`)
+  cloned in ONE piece, and overrides up to `MAX_OV` function entries in it. RV-2 (region clone) is what makes
+  it usable for REAL libart: the L1c census found 46.5% of libart code bytes live in page-spanning functions,
+  so a single whole-PAGE clone breaks a function (target or page-neighbor) that spills past the page; a region
+  whose `R_hi` falls in an inter-function gap contains every function wholly, so each `RET`s normally (no
+  spill, no trampoline). Offsets and the fault offset are **region-relative** (`far - page`); the per-region
+  offmap is `fn_vmalloc`'d (too big for BSS). `pghook` is idempotent-arm + append: the first call on a region
+  arms it (UXN every page + region clone + offmap), each later call on the same `(pid,base)` appends an
+  `(off→replace)` override. The override table is a **barrier-safe sentinel
   array** (`OV_NONE` key for inert slots, `pg_set_ov` publishes key-last) so `before_pf` — which scans
   it in the fault handler, a different thread of the same process — never matches a half-built entry or
   jumps through a garbage pointer; **no perf/blocking call is added to the supercall/fault path** (just
