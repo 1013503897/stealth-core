@@ -77,7 +77,12 @@ tools/      hbtarget.c  self-contained single-thread HWBP test target (pid + &ti
             hooktool.c / hwhooktool.c   P5 inline_hooker tests (UXN isolated / HWBP non-isolated)
             bridgetool.c            P5 syscall-bridge test (drive KPM with no superkey)
             tracertest.c            P5 TracerPid spoof test (ptrace a child, read its status)
+            pagetool.c              P5 whole-page UXN hook: funcA/B/C share a page (single `pagehook`)
+            pgtool.c                P5 MULTI-page table: funcA/funcB on different pages, both
+                                    hooked at once (`pghook` x2 + `pgdisarm`)
             run_hookto_test.sh / run_hwhook_test.sh / run_bridge_test.sh / run_tracer_test.sh
+            run_pagehook_test.sh    P5 harness (single page-shared func hooked, neighbors normal)
+            run_pghook_test.sh      P5 harness (two pages hooked simultaneously, neighbors normal)
 lib/        dbi.c/.h    libdbi: reusable AArch64 position-independent function recompiler
             dbi_test.c  host/device-runnable unit test (build_dbi_test.ps1)
 vendor/     KernelPatch  (SDK headers + docs; tag 0.13.1)

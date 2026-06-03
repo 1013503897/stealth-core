@@ -162,7 +162,9 @@ Two independent version pins must match the device, or load/supercall silently f
   a fixed `g_pg[MAX_PG]` table so several such pages can be trapped at once (what an LSPlant frontend
   needs — many libart funcs on distinct code pages, all hooked simultaneously); the shared `before_pf`
   routes each fault by `(page, tgid)` to its slot, and the single `do_page_fault` hook is **ref-counted**
-  across the single-page and multi-page paths (`ensure_pf_hooked`/`maybe_unhook_pf`).
+  across the single-page and multi-page paths (`ensure_pf_hooked`/`maybe_unhook_pf`). Both are
+  device-verified (`tools/pgtool.c` + `run_pghook_test.sh`: funcA on one page and funcB on another are
+  hooked at once, each page's neighbor still runs from its clone, one `pgdisarm` drops both).
   `hidemaps`/`unhidemaps` (P4.1) hook `show_map` and drop the clone's VMA from `/proc/*/maps` output
   (rewind `seq_file->count` + `SEQ_SKIP`; struct offsets taken from the device's kernel BTF).
   `hookto`/`hwhookto <pid> <target> <replace> <clonebytes> <nclone> <template> <ghost_va>` are the
