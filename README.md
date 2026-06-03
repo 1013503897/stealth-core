@@ -23,9 +23,11 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 | **P2.2** | **Single-function no-trace redirect**: keep UXN set, reroute the faulting PC to a verbatim **clone** of a page-isolated, PC-relative-free function (`.text` untouched, no new exec VMA at the func) | ✅ verified |
 | **P3.1** | `offset_map` routing in `do_page_fault` (clone insn idx per orig insn); map read cross-process via `access_process_vm` | ✅ verified |
 | **P3.2** | Userspace DBI recompiler: `ADR`/`ADRP`/`B`/`BL` → absolute (LDR-literal / `BR`/`BLR` x16), builds the offset_map; clone of a PC-relative `hook_me()` runs correctly | ✅ verified |
-| **P3.3** | DBI: conditional + internal branches (`B.cond`/`CBZ`/`TBZ`, clone-relative re-encode) → functions with loops/branches | ⬜ todo |
-| **P3.4** | DBI: `LDR`-literal, `BLR`/`BR`+PAC demote (`BLRAAZ`→`BRAAZ`) for high-version targets | ⬜ todo |
-| **P4** | VMA-less **ghost memory** (article §5.9) + `maps`/`seq_file` hide (§5.8) so the clone page is invisible to `/proc/*/maps` | ⬜ todo |
+| **P3.3** | DBI: conditional + internal branches (`B.cond`/`CBZ`/`TBZ`, clone-relative re-encode) → functions with loops/branches | ✅ verified |
+| **P3.4** | DBI: `LDR`-literal (re-point the load to a clone-local copy of the value) | ✅ verified |
+| **P3.5** | DBI: `BLRAAZ`/`BRAAZ` PAC-call demote (article §5.7); stock NDK doesn't emit it, PAC-ret `paciasp`/`retaa` are PC-independent and pass through verbatim | ⬜ todo |
+| **P4.1** | `/proc/*/maps` hide: filter the clone's entry out of the `seq_file` path (article §5.8) | ⬜ todo |
+| **P4.2** | VMA-less **ghost memory**: inject a PTE for the clone with no VMA (article §5.9) so it's invisible to `maps`/`mincore` | ⬜ todo |
 
 ## Requirements
 
@@ -51,6 +53,8 @@ tools/      hbtarget.c  self-contained single-thread HWBP test target (pid + &ti
             mttarget.c  multi-thread target; spawns workers gradually (grow) or churns them (churn)
             dbitarget.c        P2.2 target: page-isolated, PC-relative-free tick() + self-clone
             dbitarget2.c       P3.2 target + DBI recompiler: PC-relative hook_me() (ADR+B) → clone
+            dbitarget3.c       P3.3 target: work() with a loop (internal B.cond/B) → clone
+            dbitarget4.c       P3.4 target: lwork() with an LDR-literal → clone
             run_mt_test.sh     P1.6 harness (hook every existing thread → dump → unhook → unload)
             run_grow_test.sh   P1.6b harness (hook t0 threads, watch new threads auto-followed)
             run_churn_test.sh  P1.6b harness (churn threads, watch slot GC keep the table bounded)
@@ -58,6 +62,8 @@ tools/      hbtarget.c  self-contained single-thread HWBP test target (pid + &ti
             run_redirect_test.sh    P2.2 harness (UXN net + reroute tick into its verbatim clone)
             run_redirectmap_test.sh P3.1 harness (offset_map routing, identity map)
             run_dbi_test.sh         P3.2 harness (DBI-recompiled hook_me runs from the clone)
+            run_dbi3_test.sh        P3.3 harness (recompiled work() loop runs correctly)
+            run_dbi4_test.sh        P3.4 harness (recompiled lwork() LDR-literal runs correctly)
 vendor/     KernelPatch  (SDK headers + docs; tag 0.13.1)
 ```
 
@@ -123,10 +129,10 @@ thread is followed independently. (If two devices are attached, add `-s <serial>
 
 ## Next
 
-- **P3.3/P3.4**: extend the DBI engine (`tools/dbitarget2.c`) to the remaining instruction classes —
-  conditional + internal branches (`B.cond`/`CBZ`/`CBNZ`/`TBZ`/`TBNZ`, re-encoded clone-relative via
-  the offset_map), `LDR`-literal, and `BLR*`/`BR*` PAC demotion (`BLRAAZ`→`BRAAZ`) — so arbitrary
-  functions (loops, branches, high-version PAC code) can be cloned, not just `ADR`/`ADRP`/`B`/`BL`.
-- **P4**: VMA-less ghost memory for the clone (article §5.9) + `seq_file`/`maps` hide (§5.8), so the
-  clone page can't be found by `/proc/*/maps` or `mincore`. **The current clone is an ordinary RX
-  anon mapping — visible in maps; this is the remaining trace.** Page-table surgery; expect reboots.
+- **P3.5**: `BLRAAZ`/`BRAAZ` PAC-call demotion (article §5.7) — clear bit 21 to demote the PAC'd
+  indirect call to a branch (keeps target-pointer auth, stops LR clobber) and set LR to the clone's
+  next insn. Stock NDK doesn't emit PAC'd calls, so this needs a pauth-built target to exercise.
+- **P4**: the clone is still **visible in `/proc/*/maps`** (an ordinary RX anon mapping) — the one
+  remaining trace. **P4.1** hides it by filtering the `seq_file`/`show_map` path (§5.8); **P4.2** goes
+  further with VMA-less ghost memory — inject a PTE for the clone with no VMA (§5.9) so it can't be
+  found by `maps` or `mincore`. P4.2 is page-table surgery; expect reboots during bring-up.
