@@ -154,6 +154,15 @@ Two independent version pins must match the device, or load/supercall silently f
   (the kernel only routes the entry fault): `tools/dbitarget.c` (P2.2, verbatim clone of a
   PC-relative-free `tick()`), `tools/dbitarget2.c` (P3.2, fixes ADR/ADRP/B/BL), `tools/dbitarget3.c`
   (P3.3, 3-pass engine: also re-encodes internal B/B.cond/CBZ/TBZ clone-relative for loops/branches).
+  `pagehook <pid> <page> <clone> <map> <ninsn> <target_off> <replace>` UXN-traps a **whole page** and
+  routes every faulting instruction into a whole-page DBI clone (per-page `offset_map`), overriding
+  **one** function's entry (`page+target_off`) to `replace` while the clone's faithful copy of that
+  function serves as the `backup` — the process-wide, page-neighbor-safe inline hook for real
+  (page-shared) functions (target `tools/pagetool.c`). `pghook`/`pgdisarm` are the **multi-page** form:
+  a fixed `g_pg[MAX_PG]` table so several such pages can be trapped at once (what an LSPlant frontend
+  needs — many libart funcs on distinct code pages, all hooked simultaneously); the shared `before_pf`
+  routes each fault by `(page, tgid)` to its slot, and the single `do_page_fault` hook is **ref-counted**
+  across the single-page and multi-page paths (`ensure_pf_hooked`/`maybe_unhook_pf`).
   `hidemaps`/`unhidemaps` (P4.1) hook `show_map` and drop the clone's VMA from `/proc/*/maps` output
   (rewind `seq_file->count` + `SEQ_SKIP`; struct offsets taken from the device's kernel BTF).
   `hookto`/`hwhookto <pid> <target> <replace> <clonebytes> <nclone> <template> <ghost_va>` are the

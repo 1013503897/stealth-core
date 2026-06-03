@@ -139,6 +139,26 @@ static volatile uint64_t g_redirect_fixed = 0; /* MODE_REDIRECT_FIXED: route ent
  * (page + g_hook_off) to g_hook_replace; everything else runs from the clone. */
 static volatile uint64_t g_hook_off = 0;     /* byte offset of hooked fn in the page */
 static volatile uint64_t g_hook_replace = 0; /* 0 = no override */
+
+/* multi-page hook table: LSPlant inline-hooks several libart functions that live
+ * on different pages, all active at once. Each slot UXN-traps one page, routes it
+ * to a whole-page clone, and overrides one function's entry -> replace. */
+#define MAX_PG 8
+struct pghook {
+    volatile int active;
+    int pid;
+    uint64_t page;     /* UXN-trapped page */
+    uint64_t clone;    /* whole-page clone base (user VA) */
+    uint64_t hook_off; /* byte offset of hooked fn entry in the page */
+    uint64_t replace;  /* 0 => no override (everything runs from clone) */
+    int nmap;
+    uint64_t *ptep;    /* cached leaf PTE pointer */
+    uint64_t pte_orig; /* original PTE (UXN clear) */
+    volatile long redirects;
+    uint32_t offmap[OFFMAP_MAX];
+};
+static struct pghook g_pg[MAX_PG];
+static volatile int g_npg = 0;
 static uint64_t *g_ptep = 0;        /* cached kernel VA of the leaf PTE */
 static uint64_t g_pte_orig = 0;     /* original PTE value (UXN clear) */
 static volatile long g_faults = 0;
@@ -290,49 +310,109 @@ static int resolve_pte(uint64_t pid, uint64_t base, struct pte_out *o)
 static void before_pf(hook_fargs3_t *fargs, void *udata)
 {
     (void)udata;
-    if (!g_armed) return;
+    if (!g_armed && g_npg == 0) return;
     uint64_t far = fargs->arg0;
-    if ((far & ~0xfffUL) != g_target_page) return;
-    if (fn_task_pid_nr_ns) {
-        void *t = (void *)get_current();
-        if (fn_task_pid_nr_ns(t, PIDTYPE_TGID, 0) != g_target_pid) return;
-    }
-    g_faults++;
+    uint64_t fpage = far & ~0xfffUL;
     struct pt_regs *regs = (struct pt_regs *)fargs->arg2;
 
-    if (g_mode == MODE_REDIRECT_FIXED) {
-        /* inline_hooker: route the target's entry to a fixed `replace` function
-         * (LR untouched -> replace returns to the original caller); replace can
-         * call the original via the ghost-clone `backup`. */
-        regs->pc = g_redirect_fixed;
-        g_redirects++;
-    } else if ((g_mode == MODE_REDIRECT || g_mode == MODE_REDIRECT_MAP) && g_clone_page) {
-        /* keep UXN set; reroute PC into the clone region. The target's .text is
-         * never touched and every call re-faults+reroutes. With an offset_map,
-         * recompiled instructions may have shifted, so map orig-insn-idx ->
-         * recompiled-insn-idx; otherwise route to the same page offset. pagehook:
-         * one function's entry routes to `replace` instead of the clone. */
-        uint64_t poff = far & 0xfffUL;
-        if (g_mode == MODE_REDIRECT_MAP && g_hook_replace && poff == g_hook_off) {
-            regs->pc = g_hook_replace; /* hooked fn entry -> replacement */
-        } else {
-            uint64_t off = poff;
-            if (g_mode == MODE_REDIRECT_MAP) {
-                uint32_t idx = (uint32_t)(off >> 2);
-                if (idx < (uint32_t)g_nmap) off = (uint64_t)g_offmap[idx] << 2;
+    /* ---- single-page path (arm / redirect / redirectmap / pagehook) ----
+     * cheap fast-path: page compare first, only then compute the faulting tgid
+     * (do_page_fault runs for every fault system-wide while we're hooked). On a
+     * page match with a mismatched tgid (same VA, different process) we fall
+     * through to the multi-page scan rather than claiming the fault. */
+    if (g_armed && fpage == g_target_page &&
+        (!fn_task_pid_nr_ns ||
+         fn_task_pid_nr_ns((void *)get_current(), PIDTYPE_TGID, 0) == g_target_pid)) {
+        g_faults++;
+        if (g_mode == MODE_REDIRECT_FIXED) {
+            /* inline_hooker: route the target's entry to a fixed `replace` function
+             * (LR untouched -> replace returns to the original caller); replace can
+             * call the original via the ghost-clone `backup`. */
+            regs->pc = g_redirect_fixed;
+            g_redirects++;
+        } else if ((g_mode == MODE_REDIRECT || g_mode == MODE_REDIRECT_MAP) && g_clone_page) {
+            /* keep UXN set; reroute PC into the clone region. The target's .text is
+             * never touched and every call re-faults+reroutes. With an offset_map,
+             * recompiled instructions may have shifted, so map orig-insn-idx ->
+             * recompiled-insn-idx; otherwise route to the same page offset. pagehook:
+             * one function's entry routes to `replace` instead of the clone. */
+            uint64_t poff = far & 0xfffUL;
+            if (g_mode == MODE_REDIRECT_MAP && g_hook_replace && poff == g_hook_off) {
+                regs->pc = g_hook_replace; /* hooked fn entry -> replacement */
+            } else {
+                uint64_t off = poff;
+                if (g_mode == MODE_REDIRECT_MAP) {
+                    uint32_t idx = (uint32_t)(off >> 2);
+                    if (idx < (uint32_t)g_nmap) off = (uint64_t)g_offmap[idx] << 2;
+                }
+                regs->pc = g_clone_page + off;
             }
-            regs->pc = g_clone_page + off;
+            g_redirects++;
+        } else {
+            /* self-heal: restore UXN-clear PTE so the instruction re-executes */
+            if (g_ptep) {
+                *(volatile uint64_t *)g_ptep = g_pte_orig;
+                flush_tlb_all();
+            }
         }
-        g_redirects++;
-    } else {
-        /* self-heal: restore UXN-clear PTE so the instruction re-executes */
-        if (g_ptep) {
-            *(volatile uint64_t *)g_ptep = g_pte_orig;
-            flush_tlb_all();
+        fargs->skip_origin = 1; /* we handled it; don't run the real do_page_fault */
+        fargs->ret = 0;
+        return;
+    }
+
+    /* ---- multi-page hook table (pghook) ----
+     * Several pages can be UXN-trapped at once (LSPlant hooks many libart funcs
+     * on different pages). Each slot routes its page exactly like pagehook does,
+     * but with its own clone / offset_map / single-fn override. */
+    if (g_npg > 0) {
+        for (int i = 0; i < MAX_PG; i++) {
+            struct pghook *s = &g_pg[i];
+            if (!s->active || s->page != fpage) continue;
+            if (fn_task_pid_nr_ns &&
+                fn_task_pid_nr_ns((void *)get_current(), PIDTYPE_TGID, 0) != s->pid)
+                continue; /* same VA in another process -> not our trap */
+            uint64_t poff = far & 0xfffUL;
+            if (s->replace && poff == s->hook_off) {
+                regs->pc = s->replace; /* hooked fn entry -> replacement */
+            } else {
+                uint64_t off = poff;
+                uint32_t idx = (uint32_t)(off >> 2);
+                if (idx < (uint32_t)s->nmap) off = (uint64_t)s->offmap[idx] << 2;
+                regs->pc = s->clone + off; /* everything else runs from the clone */
+            }
+            s->redirects++;
+            fargs->skip_origin = 1;
+            fargs->ret = 0;
+            return;
         }
     }
-    fargs->skip_origin = 1; /* we handled it; don't run the real do_page_fault */
-    fargs->ret = 0;
+    /* not one of ours: let the real do_page_fault run */
+}
+
+/* shared do_page_fault hook lifecycle: single-page (arm_common) and multi-page
+ * (do_pghook) both route through before_pf, so the hook is reference-counted by
+ * (g_armed, g_npg) -- install on first arm, remove only when both are inactive. */
+static int ensure_pf_hooked(char *p, char *e)
+{
+    if (g_pf_hooked) return 0;
+    if (!g_addr_pf) {
+        apps(p, e, "error: do_page_fault not resolved (run probe)\n");
+        return -1;
+    }
+    hook_err_t he = hook_wrap3(g_addr_pf, (void *)before_pf, 0, 0);
+    if (he != HOOK_NO_ERR) {
+        apps(p, e, "error: hook_wrap3(do_page_fault) failed\n");
+        return -1;
+    }
+    g_pf_hooked = 1;
+    return 0;
+}
+static void maybe_unhook_pf(void)
+{
+    if (!g_armed && g_npg == 0 && g_pf_hooked && g_addr_pf) {
+        hook_unwrap(g_addr_pf, (void *)before_pf, 0);
+        g_pf_hooked = 0;
+    }
 }
 
 /* ---- P4.1: hide the clone VMA from /proc/pid/maps ----
@@ -1025,14 +1105,9 @@ static long arm_common(uint64_t pid, uint64_t addr, int mode, uint64_t clone, ch
     g_redirects = 0;
 
     /* hook do_page_fault BEFORE arming UXN so the first fault is caught */
-    if (!g_pf_hooked) {
-        hook_err_t he = hook_wrap3(g_addr_pf, (void *)before_pf, 0, 0);
-        if (he != HOOK_NO_ERR) {
-            apps(p, e, "error: hook_wrap3(do_page_fault) failed\n");
-            g_ptep = 0;
-            return -1;
-        }
-        g_pf_hooked = 1;
+    if (ensure_pf_hooked(p, e) != 0) {
+        g_ptep = 0;
+        return -1;
     }
     g_armed = 1;
 
@@ -1145,6 +1220,138 @@ static long do_pagehook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t ma
     return rc;
 }
 
+/* pghook: add ONE page to the multi-page hook table. Routing is identical to
+ * pagehook (whole-page clone via per-slot offset_map + optional single-fn entry
+ * override), but several pages can be armed simultaneously -- this is what an
+ * LSPlant-style frontend needs, where multiple libart functions live on distinct
+ * code pages and must all be trapped at once. Each call consumes one slot;
+ * `replace` is optional (0 => whole page just runs from the clone, no override).
+ * Tear the whole table down with `pgdisarm`. */
+static long do_pghook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t mapaddr, uint64_t ninsn,
+                      uint64_t target_off, uint64_t replace, char *p, char *e)
+{
+    resolve_syms();
+    if (!fn_access_process_vm || !fn_find_get_task_by_vpid || !fn_get_task_mm || !fn_mmput ||
+        !fn_apply_existing || !g_addr_pf || !fn_task_pid_nr_ns) {
+        apps(p, e, "error: symbols not resolved (run probe)\n");
+        return -1;
+    }
+    if (ninsn == 0 || ninsn > OFFMAP_MAX || (target_off & 3) || target_off >= 0x1000) {
+        apps(p, e, "error: bad ninsn/target_off\n");
+        return -1;
+    }
+    page &= ~0xFFFUL;
+    clone &= ~0xFFFUL;
+
+    /* reject a duplicate page for the same process (re-arm requires pgdisarm) */
+    for (int i = 0; i < MAX_PG; i++)
+        if (g_pg[i].active && g_pg[i].pid == (int)pid && g_pg[i].page == page) {
+            apps(p, e, "error: page already hooked (pgdisarm first)\n");
+            return -1;
+        }
+    int si = -1;
+    for (int i = 0; i < MAX_PG; i++)
+        if (!g_pg[i].active) {
+            si = i;
+            break;
+        }
+    if (si < 0) {
+        apps(p, e, "error: hook table full\n");
+        return -1;
+    }
+    struct pghook *s = &g_pg[si];
+
+    /* resolve the leaf PTE for the page (must be present/valid) */
+    struct pte_out o;
+    int r = resolve_pte(pid, page, &o);
+    if (r || !(o.val & PTE_VALID)) {
+        apps(p, e, "error: target page not present/valid (run it first)\n");
+        return -1;
+    }
+    /* read this slot's offset_map from the target's user memory */
+    void *task = fn_find_get_task_by_vpid((int)pid);
+    if (is_err_or_null(task)) {
+        apps(p, e, "error: task not found\n");
+        return -1;
+    }
+    int want = (int)(ninsn * 4);
+    if (fn_access_process_vm(task, mapaddr, s->offmap, want, 0) != want) {
+        apps(p, e, "error: read offset_map failed\n");
+        return -1;
+    }
+    /* ensure do_page_fault is hooked (shared, ref-counted with the single-page path) */
+    if (ensure_pf_hooked(p, e) != 0) return -1;
+
+    s->pid = (int)pid;
+    s->page = page;
+    s->clone = clone;
+    s->hook_off = target_off;
+    s->replace = replace;
+    s->nmap = (int)ninsn;
+    s->ptep = (uint64_t *)o.ptep;
+    s->pte_orig = o.val;
+    s->redirects = 0;
+    s->active = 1; /* publish the fully-populated slot before arming UXN */
+    g_npg++;
+
+    /* arm UXN on the page -> EL0 execute now faults into before_pf */
+    *(volatile uint64_t *)s->ptep = o.val | PTE_UXN;
+    flush_tlb_all();
+
+    p = apps(p, e, "ok: pghook slot=");
+    p = appdec(p, e, si);
+    p = apps(p, e, " pid=");
+    p = appdec(p, e, (long)pid);
+    p = apps(p, e, " page=");
+    p = apphex(p, e, page);
+    p = apps(p, e, " clone=");
+    p = apphex(p, e, clone);
+    p = apps(p, e, " backup=");
+    p = apphex(p, e, clone + (uint64_t)s->offmap[target_off / 4] * 4);
+    p = apps(p, e, " hook_off=");
+    p = apphex(p, e, target_off);
+    p = apps(p, e, " replace=");
+    p = apphex(p, e, replace);
+    p = apps(p, e, " npg=");
+    p = appdec(p, e, g_npg);
+    apps(p, e, "\n");
+    return 0;
+}
+
+/* pgdisarm: tear down the entire multi-page table -- restore every UXN'd page
+ * and drop all slots. Unhooks do_page_fault only if the single-page path is also
+ * inactive (maybe_unhook_pf). */
+static long do_pgdisarm(char *p, char *e)
+{
+    long total = 0;
+    int n = 0;
+    /* clear UXN on every armed page first, keeping the slots active so a fault
+     * racing the teardown is still routed; then ONE flush; then drop the slots
+     * (after the flush no page is trapped, so deactivation can't strand a fault) */
+    for (int i = 0; i < MAX_PG; i++) {
+        struct pghook *s = &g_pg[i];
+        if (!s->active) continue;
+        if (s->ptep) *(volatile uint64_t *)s->ptep = s->pte_orig; /* clear UXN */
+        n++;
+    }
+    if (n) flush_tlb_all();
+    for (int i = 0; i < MAX_PG; i++) {
+        struct pghook *s = &g_pg[i];
+        if (!s->active) continue;
+        total += s->redirects;
+        s->active = 0;
+        s->ptep = 0;
+    }
+    g_npg = 0;
+    maybe_unhook_pf();
+    p = apps(p, e, "ok: pgdisarm slots=");
+    p = appdec(p, e, n);
+    p = apps(p, e, " redirects=");
+    p = appdec(p, e, total);
+    apps(p, e, "\n");
+    return 0;
+}
+
 static long do_disarm(char *p, char *e)
 {
     g_armed = 0;
@@ -1152,10 +1359,7 @@ static long do_disarm(char *p, char *e)
         *(volatile uint64_t *)g_ptep = g_pte_orig; /* clear UXN */
         flush_tlb_all();
     }
-    if (g_pf_hooked && g_addr_pf) {
-        hook_unwrap(g_addr_pf, (void *)before_pf, 0);
-        g_pf_hooked = 0;
-    }
+    maybe_unhook_pf(); /* keep do_page_fault hooked if pghook slots are still armed */
     p = apps(p, e, "ok: disarmed, faults=");
     p = appdec(p, e, g_faults);
     p = apps(p, e, " redirects=");
@@ -1208,6 +1412,26 @@ static long do_state(char *p, char *e)
     p = appdec(p, e, g_hwbp_armed);
     p = apps(p, e, " hw_redirects=");
     p = appdec(p, e, g_hw_redirects);
+    p = apps(p, e, " npg=");
+    p = appdec(p, e, g_npg);
+    for (int i = 0; i < MAX_PG; i++) {
+        struct pghook *s = &g_pg[i];
+        if (!s->active) continue;
+        p = apps(p, e, "\n pg[");
+        p = appdec(p, e, i);
+        p = apps(p, e, "] pid=");
+        p = appdec(p, e, s->pid);
+        p = apps(p, e, " page=");
+        p = apphex(p, e, s->page);
+        p = apps(p, e, " clone=");
+        p = apphex(p, e, s->clone);
+        p = apps(p, e, " hook_off=");
+        p = apphex(p, e, s->hook_off);
+        p = apps(p, e, " replace=");
+        p = apphex(p, e, s->replace);
+        p = apps(p, e, " redirects=");
+        p = appdec(p, e, s->redirects);
+    }
     if (g_ptep) {
         p = apps(p, e, "\npte_now=");
         p = apphex(p, e, *(volatile uint64_t *)g_ptep);
@@ -1364,6 +1588,23 @@ static long shpte_run(const char *args, char *buf, int bufcap)
                 rc = -1;
         else
             rc = do_pagehook(pid, page, clone, map, n, toff, rep, p, e);
+    } else if (starts(a, "pgdisarm")) {
+        rc = do_pgdisarm(p, e);
+    } else if (starts(a, "pghook")) {
+        uint64_t pid = 0, page = 0, clone = 0, map = 0, n = 0, toff = 0, rep = 0;
+        const char *s = parse_ull(a + 6, &pid);
+        s = parse_ull(s, &page);
+        s = parse_ull(s, &clone);
+        s = parse_ull(s, &map);
+        s = parse_ull(s, &n);
+        s = parse_ull(s, &toff);
+        parse_ull(s, &rep); /* target_off + replace optional (0 = no override) */
+        if (!pid || !page || !clone || !map || !n)
+            apps(p, e,
+                 "usage: pghook <pid> <page> <clone> <map> <ninsn> [target_off] [replace]\n"),
+                rc = -1;
+        else
+            rc = do_pghook(pid, page, clone, map, n, toff, rep, p, e);
     } else if (starts(a, "redirect")) {
         uint64_t pid = 0, addr = 0, clone = 0;
         const char *s = parse_ull(a + 8, &pid);
@@ -1459,9 +1700,9 @@ static long shpte_run(const char *args, char *buf, int bufcap)
         rc = do_state(p, e);
     } else {
         apps(p, e,
-             "usage: probe | pte | arm | redirect | redirectmap | hookto | "
-             "hidemaps | unhidemaps | ghosttest | ghostredirect | ghostfree | "
-             "bridge | unbridge | disarm | dump\n");
+             "usage: probe | pte | arm | redirect | redirectmap | pagehook | "
+             "pghook | pgdisarm | hookto | hwhookto | hidemaps | unhidemaps | "
+             "ghosttest | ghostredirect | ghostfree | bridge | unbridge | disarm | dump\n");
         rc = -1;
     }
     return rc;
@@ -1487,6 +1728,23 @@ static long shpte_exit(void *__user reserved)
         *(volatile uint64_t *)g_ptep = g_pte_orig;
         flush_tlb_all();
         g_ptep = 0;
+    }
+    /* restore every multi-page UXN'd slot so unload can't leave a trapped page:
+     * clear UXN on all slots, one flush, then deactivate (same race-free order
+     * as do_pgdisarm) */
+    {
+        int restored = 0;
+        for (int i = 0; i < MAX_PG; i++)
+            if (g_pg[i].active && g_pg[i].ptep) {
+                *(volatile uint64_t *)g_pg[i].ptep = g_pg[i].pte_orig;
+                restored++;
+            }
+        if (restored) flush_tlb_all();
+        for (int i = 0; i < MAX_PG; i++) {
+            g_pg[i].active = 0;
+            g_pg[i].ptep = 0;
+        }
+        g_npg = 0;
     }
     if (g_pf_hooked && g_addr_pf) {
         hook_unwrap(g_addr_pf, (void *)before_pf, 0);

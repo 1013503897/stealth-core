@@ -46,6 +46,7 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 kpm/        shpoc.c     P0 syscall-hook smoke test
             shhwbp.c    P1.5/P1.6 HWBP hook: per-thread bp table + state machine
             shpte.c     P2/P4/P5 main module. cmds: pte | arm | redirect | redirectmap |
+                        pagehook (whole-page UXN hook) | pghook/pgdisarm (multi-page table) |
                         hookto/hwhookto (inline_hooker+ghost backup) | ghosttest/ghostredirect/
                         ghostfree | hidemaps | hidetracer | bridge | disarm | dump
             shmin.c     minimal ctl0 isolation test
