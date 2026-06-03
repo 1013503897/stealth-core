@@ -26,8 +26,8 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 | **P3.3** | DBI: conditional + internal branches (`B.cond`/`CBZ`/`TBZ`, clone-relative re-encode) → functions with loops/branches | ✅ verified |
 | **P3.4** | DBI: `LDR`-literal (re-point the load to a clone-local copy of the value) | ✅ verified |
 | **P3.5** | DBI: `BLRAAZ`/`BRAAZ` PAC-call demote (article §5.7); stock NDK doesn't emit it, PAC-ret `paciasp`/`retaa` are PC-independent and pass through verbatim | ⬜ todo |
-| **P4.1** | `/proc/*/maps` hide: filter the clone's entry out of the `seq_file` path (article §5.8) | ⬜ todo |
-| **P4.2** | VMA-less **ghost memory**: inject a PTE for the clone with no VMA (article §5.9) so it's invisible to `maps`/`mincore` | ⬜ todo |
+| **P4.1** | `/proc/*/maps` hide: hook `show_map`, drop the clone's entry from the `seq_file` output (article §5.8) — beats CRC scan **and** maps scan together | ✅ verified |
+| **P4.2** | VMA-less **ghost memory**: inject a PTE for the clone with no VMA (article §5.9) so it's invisible to `maps`/`mincore` even via API probing | ⬜ todo (highest brick risk) |
 
 ## Requirements
 
@@ -64,6 +64,7 @@ tools/      hbtarget.c  self-contained single-thread HWBP test target (pid + &ti
             run_dbi_test.sh         P3.2 harness (DBI-recompiled hook_me runs from the clone)
             run_dbi3_test.sh        P3.3 harness (recompiled work() loop runs correctly)
             run_dbi4_test.sh        P3.4 harness (recompiled lwork() LDR-literal runs correctly)
+            run_hidemaps_test.sh    P4.1 harness (clone vanishes from /proc/<pid>/maps)
 vendor/     KernelPatch  (SDK headers + docs; tag 0.13.1)
 ```
 

@@ -154,8 +154,12 @@ Two independent version pins must match the device, or load/supercall silently f
   (the kernel only routes the entry fault): `tools/dbitarget.c` (P2.2, verbatim clone of a
   PC-relative-free `tick()`), `tools/dbitarget2.c` (P3.2, fixes ADR/ADRP/B/BL), `tools/dbitarget3.c`
   (P3.3, 3-pass engine: also re-encodes internal B/B.cond/CBZ/TBZ clone-relative for loops/branches).
-  **Next (P3.4/P4):** LDR-literal + BLR/BR PAC demote; then VMA-less ghost memory so the clone (today
-  an ordinary RX anon mapping, still visible in `/proc/*/maps`) becomes invisible.
+  `hidemaps`/`unhidemaps` (P4.1) hook `show_map` and drop the clone's VMA from `/proc/*/maps` output
+  (rewind `seq_file->count` + `SEQ_SKIP`; struct offsets taken from the device's kernel BTF). The DBI
+  recompilers live in the targets (`dbitarget.c`..`dbitarget4.c`, covering verbatim → ADR/ADRP/B/BL →
+  internal/conditional branches → LDR-literal). **Remaining: P3.5** (`BLRAAZ`→`BRAAZ` PAC demote;
+  needs a pauth-built target) and **P4.2** (VMA-less ghost memory — inject a PTE with no VMA; highest
+  brick risk, do supervised).
 
 Test targets live in `tools/`: `hbtarget.c` (single thread) and `mttarget.c` (main + 4 workers, for
 P1.6). `tools/run_mt_test.sh` is the device-side end-to-end harness; neither target has a build
