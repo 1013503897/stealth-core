@@ -46,10 +46,17 @@
 #include <stdint.h>
 
 KPM_NAME("shpte");
-KPM_VERSION("0.4.0");
+KPM_VERSION("0.5.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("stealth-poc");
-KPM_DESCRIPTION("P2/P3: UXN net + clone redirect with offset_map routing");
+KPM_DESCRIPTION("P2/P3/P4.1: UXN net + clone redirect + /proc maps hide");
+
+/* struct offsets verified from this device's kernel BTF (6.1 GKI):
+ *   seq_file.count=+24, seq_file.pad_until=+32 ; vm_area_struct.vm_start=+0 */
+#define SEQ_COUNT_OFF 24
+#define SEQ_PAD_OFF 32
+#define VMA_START_OFF 0
+#define SEQ_SKIP 1
 
 enum { PIDTYPE_PID = 0, PIDTYPE_TGID = 1 };
 
@@ -61,7 +68,8 @@ static int (*fn_apply_existing)(void *mm, unsigned long addr, unsigned long size
 static int (*fn_task_pid_nr_ns)(void *task, int type, void *ns) = 0;
 /* int access_process_vm(struct task_struct *tsk, unsigned long addr, void *buf, int len, uint flags) */
 static int (*fn_access_process_vm)(void *tsk, unsigned long addr, void *buf, int len, unsigned int flags) = 0;
-static void *g_addr_pf = 0; /* do_page_fault */
+static void *g_addr_pf = 0;       /* do_page_fault */
+static void *g_addr_show_map = 0; /* show_map (/proc/pid/maps per-VMA) */
 
 /* ---- arm state ---- */
 enum { MODE_SELFHEAL = 0, MODE_REDIRECT = 1, MODE_REDIRECT_MAP = 2 };
@@ -82,6 +90,10 @@ static uint64_t *g_ptep = 0;        /* cached kernel VA of the leaf PTE */
 static uint64_t g_pte_orig = 0;     /* original PTE value (UXN clear) */
 static volatile long g_faults = 0;
 static volatile long g_redirects = 0;
+/* P4.1 maps-hide state */
+static volatile int g_maps_hooked = 0;
+static volatile uint64_t g_hide_page = 0; /* VMA vm_start to drop from maps */
+static volatile long g_maps_hidden = 0;
 
 /* ---- tiny freestanding string/number helpers ---- */
 static char *apps(char *p, char *e, const char *s)
@@ -236,6 +248,32 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
     fargs->ret = 0;
 }
 
+/* ---- P4.1: hide the clone VMA from /proc/pid/maps ----
+ * show_map(struct seq_file *m, void *v): v is the vm_area_struct being printed.
+ * before: snapshot m->count; after: if this VMA is our clone, rewind m->count
+ * (dropping the just-written line) + SEQ_SKIP, so the entry never appears. */
+static void before_showmap(hook_fargs2_t *fargs, void *udata)
+{
+    (void)udata;
+    if (!g_maps_hooked) return;
+    void *m = (void *)fargs->arg0;
+    fargs->local.data0 = *(volatile uint64_t *)((char *)m + SEQ_COUNT_OFF);
+}
+static void after_showmap(hook_fargs2_t *fargs, void *udata)
+{
+    (void)udata;
+    if (!g_maps_hooked || !g_hide_page) return;
+    void *vma = (void *)fargs->arg1;
+    if (!vma) return;
+    uint64_t vm_start = *(volatile uint64_t *)((char *)vma + VMA_START_OFF);
+    if (vm_start != g_hide_page) return;
+    void *m = (void *)fargs->arg0;
+    *(volatile uint64_t *)((char *)m + SEQ_COUNT_OFF) = fargs->local.data0; /* rewind */
+    *(volatile uint64_t *)((char *)m + SEQ_PAD_OFF) = 0;                    /* pad_until=0 */
+    fargs->ret = SEQ_SKIP;
+    g_maps_hidden++;
+}
+
 static void resolve_syms(void)
 {
     if (!fn_find_get_task_by_vpid)
@@ -247,6 +285,45 @@ static void resolve_syms(void)
     if (!fn_task_pid_nr_ns) fn_task_pid_nr_ns = (void *)kallsyms_lookup_name("__task_pid_nr_ns");
     if (!fn_access_process_vm) fn_access_process_vm = (void *)kallsyms_lookup_name("access_process_vm");
     if (!g_addr_pf) g_addr_pf = (void *)kallsyms_lookup_name("do_page_fault");
+    if (!g_addr_show_map) g_addr_show_map = (void *)kallsyms_lookup_name("show_map");
+}
+
+static long do_hidemaps(uint64_t page, char *p, char *e)
+{
+    resolve_syms();
+    if (!g_addr_show_map) {
+        apps(p, e, "error: show_map not resolved\n");
+        return -1;
+    }
+    g_hide_page = page ? (page & ~0xFFFUL) : g_clone_page;
+    if (!g_hide_page) {
+        apps(p, e, "error: no page given and no active clone\n");
+        return -1;
+    }
+    if (!g_maps_hooked) {
+        if (hook_wrap2(g_addr_show_map, (void *)before_showmap, (void *)after_showmap, 0) != HOOK_NO_ERR) {
+            apps(p, e, "error: hook_wrap2(show_map) failed\n");
+            return -1;
+        }
+        g_maps_hooked = 1;
+    }
+    p = apps(p, e, "ok: hiding vma vm_start=");
+    p = apphex(p, e, g_hide_page);
+    apps(p, e, " from /proc/*/maps\n");
+    return 0;
+}
+
+static long do_unhidemaps(char *p, char *e)
+{
+    if (g_maps_hooked && g_addr_show_map) {
+        hook_unwrap(g_addr_show_map, (void *)before_showmap, (void *)after_showmap);
+        g_maps_hooked = 0;
+    }
+    g_hide_page = 0;
+    p = apps(p, e, "ok: maps unhidden, hidden_count=");
+    p = appdec(p, e, g_maps_hidden);
+    apps(p, e, "\n");
+    return 0;
 }
 
 static char *decode_pte(char *p, char *e, uint64_t v)
@@ -443,6 +520,12 @@ static long do_state(char *p, char *e)
     p = appdec(p, e, g_faults);
     p = apps(p, e, " redirects=");
     p = appdec(p, e, g_redirects);
+    p = apps(p, e, " maps_hooked=");
+    p = appdec(p, e, g_maps_hooked);
+    p = apps(p, e, " hide_page=");
+    p = apphex(p, e, g_hide_page);
+    p = apps(p, e, " maps_hidden=");
+    p = appdec(p, e, g_maps_hidden);
     if (g_ptep) {
         p = apps(p, e, "\npte_now=");
         p = apphex(p, e, *(volatile uint64_t *)g_ptep);
@@ -469,6 +552,8 @@ static long do_probe(char *p, char *e)
     p = apphex(p, e, (uint64_t)fn_access_process_vm);
     p = apps(p, e, "\ndo_page_fault=");
     p = apphex(p, e, (uint64_t)g_addr_pf);
+    p = apps(p, e, "\nshow_map=");
+    p = apphex(p, e, (uint64_t)g_addr_show_map);
     apps(p, e, "\n");
     return 0;
 }
@@ -529,13 +614,19 @@ static long shpte_control0(const char *args, char *__user out_msg, int outlen)
             apps(p, e, "usage: arm <pid> <hexaddr>\n"), rc = -1;
         else
             rc = do_arm(pid, addr, p, e);
+    } else if (starts(a, "hidemaps")) {
+        uint64_t page = 0;
+        parse_ull(a + 8, &page);
+        rc = do_hidemaps(page, p, e); /* page optional: defaults to active clone */
+    } else if (starts(a, "unhidemaps")) {
+        rc = do_unhidemaps(p, e);
     } else if (starts(a, "dump")) {
         rc = do_state(p, e);
     } else {
         apps(p, e,
              "usage: probe | pte <pid> <addr> | arm <pid> <addr> | "
              "redirect <pid> <addr> <clone> | redirectmap <pid> <addr> <clone> <map> <n> | "
-             "disarm | dump\n");
+             "hidemaps [page] | unhidemaps | disarm | dump\n");
         rc = -1;
     }
 
@@ -560,7 +651,11 @@ static long shpte_exit(void *__user reserved)
         hook_unwrap(g_addr_pf, (void *)before_pf, 0);
         g_pf_hooked = 0;
     }
-    logki("shpte: exit faults=%ld\n", g_faults);
+    if (g_maps_hooked && g_addr_show_map) {
+        hook_unwrap(g_addr_show_map, (void *)before_showmap, (void *)after_showmap);
+        g_maps_hooked = 0;
+    }
+    logki("shpte: exit faults=%ld maps_hidden=%ld\n", g_faults, g_maps_hidden);
     return 0;
 }
 
