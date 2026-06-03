@@ -69,7 +69,13 @@ tools/      hbtarget.c  self-contained single-thread HWBP test target (pid + &ti
             ghostexec.c             P4.2-B target: hook_me clone executes from a ghost page
             run_ghost_test.sh       P4.2-A harness (inject + read; invisible to maps/mincore)
             run_ghostexec_test.sh   P4.2-B harness (clone runs from VMA-less ghost memory)
+lib/        dbi.c/.h    libdbi: reusable AArch64 position-independent function recompiler
+            dbi_test.c  host/device-runnable unit test (build_dbi_test.ps1)
 vendor/     KernelPatch  (SDK headers + docs; tag 0.13.1)
+
+The DBI recompiler is being consolidated into `lib/libdbi` for reuse by the userspace agent
+(it's what the Vector/LSPlant integration links against). `tools/ghostexec.c` already uses it;
+`tools/dbitarget2..4.c` still carry their own (now-superseded) copies.
 ```
 
 ## Build & run (P1.5 demo)
