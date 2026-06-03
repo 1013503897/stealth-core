@@ -28,6 +28,7 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 | **P3.5** | DBI: `BLRAAZ`/`BRAAZ` PAC-call demote (article §5.7); stock NDK doesn't emit it, PAC-ret `paciasp`/`retaa` are PC-independent and pass through verbatim | ⬜ todo |
 | **P4.1** | `/proc/*/maps` hide: hook `show_map`, drop the clone's entry from the `seq_file` output (article §5.8) — beats CRC scan **and** maps scan together | ✅ verified |
 | **P4.2** | VMA-less **ghost memory**: inject a PTE for the clone with **no VMA** (`vmalloc`+`vmalloc_to_pfn`+`apply_to_page_range`); step A = inject+read (invisible to `maps`/`mincore`), step B = execute the DBI clone from the ghost page (`sync_icache`) — complete no-trace hook, no maps-hide hook needed | ✅ verified |
+| **P5** | Productization groundwork for LSPlant/Vector (and a future Frida-Gum stealth backend): `lib/libdbi` (reusable recompiler) · **HWBP-redirect `inline_hooker`** for real non-page-isolated funcs (`hwhookto`) + UXN variant (`hookto`) with ghost `backup` · no-superkey **syscall bridge** · **TracerPid spoof** (anti-debug) | ✅ verified |
 
 ## Requirements
 
@@ -44,7 +45,9 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 ```
 kpm/        shpoc.c     P0 syscall-hook smoke test
             shhwbp.c    P1.5/P1.6 HWBP hook: per-thread bp table + state machine
-            shpte.c     P2 PTE/UXN: pte read | arm (self-heal) | redirect (clone) | disarm
+            shpte.c     P2/P4/P5 main module. cmds: pte | arm | redirect | redirectmap |
+                        hookto/hwhookto (inline_hooker+ghost backup) | ghosttest/ghostredirect/
+                        ghostfree | hidemaps | hidetracer | bridge | disarm | dump
             shmin.c     minimal ctl0 isolation test
             build.ps1   build a .kpm with NDK clang  (build.ps1 -Src shhwbp.c)
 cli/        shctl.c     KPM control CLI (supercall: load/unload/list/info/control)
@@ -70,6 +73,10 @@ tools/      hbtarget.c  self-contained single-thread HWBP test target (pid + &ti
             hooktool.c              inline_hooker test: funcA -> funcB (replace) + ghost backup
             run_ghost_test.sh       P4.2-A harness (inject + read; invisible to maps/mincore)
             run_ghostexec_test.sh   P4.2-B harness (clone runs from VMA-less ghost memory)
+            hooktool.c / hwhooktool.c   P5 inline_hooker tests (UXN isolated / HWBP non-isolated)
+            bridgetool.c            P5 syscall-bridge test (drive KPM with no superkey)
+            tracertest.c            P5 TracerPid spoof test (ptrace a child, read its status)
+            run_hookto_test.sh / run_hwhook_test.sh / run_bridge_test.sh / run_tracer_test.sh
 lib/        dbi.c/.h    libdbi: reusable AArch64 position-independent function recompiler
             dbi_test.c  host/device-runnable unit test (build_dbi_test.ps1)
 vendor/     KernelPatch  (SDK headers + docs; tag 0.13.1)
@@ -144,11 +151,25 @@ thread is followed independently. (If two devices are attached, add `-s <serial>
 The full traceless-hook pipeline is implemented and device-verified: HWBP multi-thread following
 (P1.6) → UXN net + `do_page_fault` routing (P2) → DBI recompiler (P3) → VMA-less ghost-memory
 execution (P4.2). The original `.text` is never modified (CRC-clean) and the recompiled clone runs
-from memory invisible to both `/proc/*/maps` and `mincore`.
+from memory invisible to both `/proc/*/maps` and `mincore`. P5 adds the productization primitives
+(reusable `libdbi`, HWBP/UXN `inline_hooker` with ghost `backup`, no-superkey syscall bridge,
+TracerPid spoof). Anti-detection coverage: CRC + maps scan + ptrace/TracerPid.
+
+### Productization: LSPlant/Vector (and a future Frida-Gum stealth backend)
+The intended end-product is a modified **Vector** (JingMatrix's Zygisk ART-hook framework; cloned at
+`../Vector`) whose hook backend is our KPM. Findings (see memory `lsplant-vector-integration`):
+- Vector's `inline_hooker(target, hooker) → backup` maps **exactly** onto `hwhookto` (HWBP, since
+  real libart funcs share pages) + ghost backup; `inline_unhooker` → `hwunhook` + `ghostfree`.
+- JingMatrix's LSPlant `InitInfo` has **no `mem_map`** → the article's `alloc_ghost` is unnecessary.
+- **Layer 1** (native libart hooks at LSPlant init): swap Vector's `inline_hooker`/`unhooker` to call
+  our KPM via the syscall bridge — primitive proven by `hwhooktool`. Needs building Vector (gradle+NDK).
+- **Layer 2** (Java methods): fork LSPlant's `DoHook` to trap the compiled `entry_point` via HWBP/UXN
+  instead of swapping the `ArtMethod` pointer (defeats pointer-roaming detection).
+- **Frida-Gum** (optional, larger): re-back Gum's `Interceptor` with `hwhookto` and Stalker's code
+  cache with ghost memory; plus process/port/thread hiding hooks. Same KPM, different frontend.
 
 Remaining / future:
-- **P3.5**: `BLRAAZ`/`BRAAZ` PAC-call demotion (article §5.7) — clear bit 21 to demote the PAC'd
-  indirect call to a branch (keeps target-pointer auth, stops LR clobber) and set LR to the clone's
-  next insn. The stock NDK doesn't emit PAC'd calls, so this needs a pauth-built target to exercise.
+- **P3.5**: `BLRAAZ`/`BRAAZ` PAC-call demotion (article §5.7); stock NDK doesn't emit PAC'd calls.
+- **More hiding hooks**: process (`/proc` readdir), port (`/proc/net/tcp`), thread (`/proc/pid/task`).
 - **Hardening**: multi-page clones (currently one ghost page); pin the ghost VA against allocator
-  reuse; per-process gating for the maps-hide hook; RCU for the slot table (article §5.1).
+  reuse; per-process gating for the maps-hide / tracer hooks; RCU for the slot table (article §5.1).
