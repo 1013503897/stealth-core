@@ -67,6 +67,7 @@ tools/      hbtarget.c  self-contained single-thread HWBP test target (pid + &ti
             run_hidemaps_test.sh    P4.1 harness (clone vanishes from /proc/<pid>/maps)
             ghosttool.c             P4.2-A target: probes a no-VMA VA (read magic vs mincore/maps)
             ghostexec.c             P4.2-B target: hook_me clone executes from a ghost page
+            hooktool.c              inline_hooker test: funcA -> funcB (replace) + ghost backup
             run_ghost_test.sh       P4.2-A harness (inject + read; invisible to maps/mincore)
             run_ghostexec_test.sh   P4.2-B harness (clone runs from VMA-less ghost memory)
 lib/        dbi.c/.h    libdbi: reusable AArch64 position-independent function recompiler

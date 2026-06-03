@@ -156,7 +156,10 @@ Two independent version pins must match the device, or load/supercall silently f
   (P3.3, 3-pass engine: also re-encodes internal B/B.cond/CBZ/TBZ clone-relative for loops/branches).
   `hidemaps`/`unhidemaps` (P4.1) hook `show_map` and drop the clone's VMA from `/proc/*/maps` output
   (rewind `seq_file->count` + `SEQ_SKIP`; struct offsets taken from the device's kernel BTF).
-  `ghosttest`/`ghostredirect`/`ghostfree` (P4.2) implement **VMA-less ghost memory**: `vmalloc` a
+  `hookto <pid> <target> <replace> <clonebytes> <nclone> <template> <ghost_va>` is the **inline_hooker
+  primitive** (for LSPlant): `MODE_REDIRECT_FIXED` routes the target's entry to a `replace` function
+  (LR untouched → replace returns to the original caller), with a DBI ghost clone of the target stashed
+  as the `backup`. `ghosttest`/`ghostredirect`/`ghostfree` (P4.2) implement **VMA-less ghost memory**: `vmalloc` a
   page, get its PFN via `vmalloc_to_pfn` (NOT `virt_to_phys` — its `linear_voffset` isn't exported to
   KPMs), copy attrs from a template exec page, `apply_to_page_range`-inject a PTE at a no-VMA VA, and
   (for `ghostredirect`) `sync_icache` + route the UXN redirect there so the DBI clone executes from
