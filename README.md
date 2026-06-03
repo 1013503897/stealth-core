@@ -30,6 +30,8 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 | **P4.2** | VMA-less **ghost memory**: inject a PTE for the clone with **no VMA** (`vmalloc`+`vmalloc_to_pfn`+`apply_to_page_range`); step A = inject+read (invisible to `maps`/`mincore`), step B = execute the DBI clone from the ghost page (`sync_icache`) — complete no-trace hook, no maps-hide hook needed | ✅ verified |
 | **P5** | Productization groundwork for LSPlant/Vector (and a future Frida-Gum stealth backend): `lib/libdbi` (reusable recompiler) · **HWBP-redirect `inline_hooker`** for real non-page-isolated funcs (`hwhookto`) + UXN variant (`hookto`) with ghost `backup` · no-superkey **syscall bridge** · **TracerPid spoof** (anti-debug) | ✅ verified |
 | **L1a** | LSPlant `inline_hooker` carrier: `pghook` scaled to **many overrides per page** (`MAX_OV`, barrier-safe sentinel table) across **`MAX_PG=24`** pages + `pgunhook` (per-fn `inline_unhooker`); **`lib/kpmhook`** userspace glue maps LSPlant's `InitInfo` callbacks onto the bridge (whole-page DBI clone per page, mmap RX). ~20 simultaneous libart-style hooks, several sharing a page, all from one no-superkey agent | ✅ verified |
+| **L1b** | **Vector wiring** (`../Vector`): `native_api.h` `HookInline`/`UnhookInline` (the funnel for both `lsplant::InitInfo` sites + the `NativeAPIEntries` ABI) try `kpm_inline_hooker`/`unhooker` first, **fall back to Dobby** when the bridge is unarmed; `lib/kpmhook`+`lib/dbi` vendored into `native/src/kpm`; `:zygisk:assembleDebug` → `libzygisk.so` | ✅ built (not yet runtime-verified) |
+| **L1c** | **Page-span census** (`tools/libartcensus.c`, zero-risk on-disk ELF scan): real libart `.text` has **12.2% of functions spanning page boundaries (lower bound), 46.5% of code bytes in spanning runs, max fn ~27 pages** → the single-page whole-page clone is **unusable for real libart**; **multi-page clones are mandatory** (scopes RV-2) | ✅ measured |
 
 ## Requirements
 
@@ -90,6 +92,9 @@ tools/      hbtarget.c  self-contained single-thread HWBP test target (pid + &ti
                                     second page) via lib/kpmhook over the no-superkey bridge
             run_kpmhook_test.sh     L1a harness (arm bridge, run kpmhooktool, observe multi-
                                     override + partial/full unhook + page disarm)
+            libartcensus.c          L1c: zero-risk page-span census of a system lib's .text
+                                    (on-disk ELF scan; quantifies how many functions span page
+                                    boundaries -> whether multi-page clones are needed)
 lib/        dbi.c/.h    libdbi: reusable AArch64 position-independent function recompiler
             dbi_test.c  host/device-runnable unit test (build_dbi_test.ps1)
             kpmhook.c/.h L1a: LSPlant InitInfo inline_hooker/unhooker glue -> KPM multi-page
@@ -179,11 +184,15 @@ The intended end-product is a modified **Vector** (JingMatrix's Zygisk ART-hook 
 - **Layer 1** (native libart hooks at LSPlant init): swap Vector's `inline_hooker`/`unhooker` to call
   our KPM via the syscall bridge. LSPlant installs **~20 simultaneous** libart inline hooks (more than
   6 HWBPs, more than the old `MAX_PG=8`), so the carrier is **multi-page UXN `pghook`** scaled to many
-  overrides per page across 24 pages. **L1a done + device-verified**: `lib/kpmhook` glue maps LSPlant's
-  `InitInfo` callbacks onto `pghook`/`pgunhook` (proven by `kpmhooktool` — 3 overrides on one page + a
-  second page + partial/full unhook). **Remaining:** wire `lib/kpmhook` into Vector's two `InitInfo`
-  sites (`zygisk/.../module.cpp`, `native/src/core/native_api.cpp`) + the `NativeAPIEntries` ABI, and
-  build Vector (gradle+NDK).
+  overrides per page across 24 pages. **L1a done + device-verified** (`kpmhooktool`). **L1b done +
+  built**: `native_api.h` `HookInline`/`UnhookInline` route through `lib/kpmhook` with a Dobby fallback;
+  `:zygisk:assembleDebug` links it. **L1c census** (`tools/libartcensus.c`) shows **46.5% of libart
+  code bytes live in page-spanning functions** → the single-page whole-page clone is unusable for real
+  libart. **Remaining (RV-2): multi-page function clones** in `lib/dbi`+`lib/kpmhook`+`kpm/shpte.c`
+  (clone a function's full multi-page extent; UXN-trap every page it/its neighbors touch; offmap across
+  pages), likely plus multi-slot `hwhookto` for a few hot targets; then a contained in-app verification
+  (one gated process, `system_server` on Dobby). Note: the property process-gate can't be read by an
+  `untrusted_app` (SELinux) — RV-2 needs a working per-process gate.
 - **Layer 2** (Java methods): fork LSPlant's `DoHook` to trap the compiled `entry_point` via HWBP/UXN
   instead of swapping the `ArtMethod` pointer (defeats pointer-roaming detection).
 - **Frida-Gum** (optional, larger): re-back Gum's `Interceptor` with `hwhookto` and Stalker's code

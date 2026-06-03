@@ -12,6 +12,6 @@ $out = Join-Path $here "kpmhooktool"
 
 & $clang "--target=aarch64-linux-android33" "-O2" "-Wall" "-fno-stack-protector" `
     (Join-Path $root "lib\dbi.c") (Join-Path $root "lib\kpmhook.c") (Join-Path $here "kpmhooktool.c") `
-    -o $out
+    "-llog" -o $out
 if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
 Write-Host "[+] built: $out"

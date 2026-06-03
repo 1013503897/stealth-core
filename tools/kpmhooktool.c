@@ -61,6 +61,7 @@ static void round_calls(int i)
 
 int main(void)
 {
+    kpm_hook_force_enable(); /* standalone test: bypass the Vector-only process gate */
     if (kpm_hook_init() != 0) {
         printf("FATAL: bridge not armed (run: shctl KEY control shpte bridge)\n");
         return 1;
