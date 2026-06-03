@@ -155,11 +155,15 @@ Two independent version pins must match the device, or load/supercall silently f
   PC-relative-free `tick()`), `tools/dbitarget2.c` (P3.2, fixes ADR/ADRP/B/BL), `tools/dbitarget3.c`
   (P3.3, 3-pass engine: also re-encodes internal B/B.cond/CBZ/TBZ clone-relative for loops/branches).
   `hidemaps`/`unhidemaps` (P4.1) hook `show_map` and drop the clone's VMA from `/proc/*/maps` output
-  (rewind `seq_file->count` + `SEQ_SKIP`; struct offsets taken from the device's kernel BTF). The DBI
-  recompilers live in the targets (`dbitarget.c`..`dbitarget4.c`, covering verbatim → ADR/ADRP/B/BL →
-  internal/conditional branches → LDR-literal). **Remaining: P3.5** (`BLRAAZ`→`BRAAZ` PAC demote;
-  needs a pauth-built target) and **P4.2** (VMA-less ghost memory — inject a PTE with no VMA; highest
-  brick risk, do supervised).
+  (rewind `seq_file->count` + `SEQ_SKIP`; struct offsets taken from the device's kernel BTF).
+  `ghosttest`/`ghostredirect`/`ghostfree` (P4.2) implement **VMA-less ghost memory**: `vmalloc` a
+  page, get its PFN via `vmalloc_to_pfn` (NOT `virt_to_phys` — its `linear_voffset` isn't exported to
+  KPMs), copy attrs from a template exec page, `apply_to_page_range`-inject a PTE at a no-VMA VA, and
+  (for `ghostredirect`) `sync_icache` + route the UXN redirect there so the DBI clone executes from
+  memory the OS can't see. The DBI recompilers live in the targets (`dbitarget.c`..`dbitarget4.c`,
+  `ghostexec.c`: verbatim → ADR/ADRP/B/BL → internal/conditional branches → LDR-literal). The full
+  pipeline (P1.6→P2→P3→P4.2) is device-verified. **Remaining: P3.5** (`BLRAAZ`→`BRAAZ` PAC demote;
+  needs a pauth-built target).
 
 Test targets live in `tools/`: `hbtarget.c` (single thread) and `mttarget.c` (main + 4 workers, for
 P1.6). `tools/run_mt_test.sh` is the device-side end-to-end harness; neither target has a build

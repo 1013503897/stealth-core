@@ -27,7 +27,7 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 | **P3.4** | DBI: `LDR`-literal (re-point the load to a clone-local copy of the value) | ✅ verified |
 | **P3.5** | DBI: `BLRAAZ`/`BRAAZ` PAC-call demote (article §5.7); stock NDK doesn't emit it, PAC-ret `paciasp`/`retaa` are PC-independent and pass through verbatim | ⬜ todo |
 | **P4.1** | `/proc/*/maps` hide: hook `show_map`, drop the clone's entry from the `seq_file` output (article §5.8) — beats CRC scan **and** maps scan together | ✅ verified |
-| **P4.2** | VMA-less **ghost memory**: inject a PTE for the clone with no VMA (article §5.9) so it's invisible to `maps`/`mincore` even via API probing | ⬜ todo (highest brick risk) |
+| **P4.2** | VMA-less **ghost memory**: inject a PTE for the clone with **no VMA** (`vmalloc`+`vmalloc_to_pfn`+`apply_to_page_range`); step A = inject+read (invisible to `maps`/`mincore`), step B = execute the DBI clone from the ghost page (`sync_icache`) — complete no-trace hook, no maps-hide hook needed | ✅ verified |
 
 ## Requirements
 
@@ -65,6 +65,10 @@ tools/      hbtarget.c  self-contained single-thread HWBP test target (pid + &ti
             run_dbi3_test.sh        P3.3 harness (recompiled work() loop runs correctly)
             run_dbi4_test.sh        P3.4 harness (recompiled lwork() LDR-literal runs correctly)
             run_hidemaps_test.sh    P4.1 harness (clone vanishes from /proc/<pid>/maps)
+            ghosttool.c             P4.2-A target: probes a no-VMA VA (read magic vs mincore/maps)
+            ghostexec.c             P4.2-B target: hook_me clone executes from a ghost page
+            run_ghost_test.sh       P4.2-A harness (inject + read; invisible to maps/mincore)
+            run_ghostexec_test.sh   P4.2-B harness (clone runs from VMA-less ghost memory)
 vendor/     KernelPatch  (SDK headers + docs; tag 0.13.1)
 ```
 
@@ -130,10 +134,14 @@ thread is followed independently. (If two devices are attached, add `-s <serial>
 
 ## Next
 
+The full traceless-hook pipeline is implemented and device-verified: HWBP multi-thread following
+(P1.6) → UXN net + `do_page_fault` routing (P2) → DBI recompiler (P3) → VMA-less ghost-memory
+execution (P4.2). The original `.text` is never modified (CRC-clean) and the recompiled clone runs
+from memory invisible to both `/proc/*/maps` and `mincore`.
+
+Remaining / future:
 - **P3.5**: `BLRAAZ`/`BRAAZ` PAC-call demotion (article §5.7) — clear bit 21 to demote the PAC'd
   indirect call to a branch (keeps target-pointer auth, stops LR clobber) and set LR to the clone's
-  next insn. Stock NDK doesn't emit PAC'd calls, so this needs a pauth-built target to exercise.
-- **P4**: the clone is still **visible in `/proc/*/maps`** (an ordinary RX anon mapping) — the one
-  remaining trace. **P4.1** hides it by filtering the `seq_file`/`show_map` path (§5.8); **P4.2** goes
-  further with VMA-less ghost memory — inject a PTE for the clone with no VMA (§5.9) so it can't be
-  found by `maps` or `mincore`. P4.2 is page-table surgery; expect reboots during bring-up.
+  next insn. The stock NDK doesn't emit PAC'd calls, so this needs a pauth-built target to exercise.
+- **Hardening**: multi-page clones (currently one ghost page); pin the ghost VA against allocator
+  reuse; per-process gating for the maps-hide hook; RCU for the slot table (article §5.1).
