@@ -46,10 +46,10 @@
 #include <stdint.h>
 
 KPM_NAME("shpte");
-KPM_VERSION("0.5.0");
+KPM_VERSION("0.6.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("stealth-poc");
-KPM_DESCRIPTION("P2/P3/P4.1: UXN net + clone redirect + /proc maps hide");
+KPM_DESCRIPTION("P2/P3/P4: UXN redirect + maps hide + VMA-less ghost memory");
 
 /* struct offsets verified from this device's kernel BTF (6.1 GKI):
  *   seq_file.count=+24, seq_file.pad_until=+32 ; vm_area_struct.vm_start=+0 */
@@ -57,6 +57,9 @@ KPM_DESCRIPTION("P2/P3/P4.1: UXN net + clone redirect + /proc maps hide");
 #define SEQ_PAD_OFF 32
 #define VMA_START_OFF 0
 #define SEQ_SKIP 1
+
+#define GHOST_MAGIC 0xDEADBEEFCAFEF00DULL
+#define PFN_MASK 0x0000FFFFFFFFF000ULL /* PTE output-address bits [47:12] */
 
 enum { PIDTYPE_PID = 0, PIDTYPE_TGID = 1 };
 
@@ -70,6 +73,12 @@ static int (*fn_task_pid_nr_ns)(void *task, int type, void *ns) = 0;
 static int (*fn_access_process_vm)(void *tsk, unsigned long addr, void *buf, int len, unsigned int flags) = 0;
 static void *g_addr_pf = 0;       /* do_page_fault */
 static void *g_addr_show_map = 0; /* show_map (/proc/pid/maps per-VMA) */
+/* int apply_to_page_range(mm, addr, size, pte_fn_t fn, void *data) -- allocating */
+static int (*fn_apply)(void *mm, unsigned long addr, unsigned long size, void *fn, void *data) = 0;
+/* vmalloc + vmalloc_to_pfn: avoids KP-unexported virt_to_phys/linear_voffset */
+static void *(*fn_vmalloc)(unsigned long size) = 0;
+static void (*fn_vfree)(void *addr) = 0;
+static unsigned long (*fn_vmalloc_to_pfn)(void *addr) = 0;
 
 /* ---- arm state ---- */
 enum { MODE_SELFHEAL = 0, MODE_REDIRECT = 1, MODE_REDIRECT_MAP = 2 };
@@ -94,6 +103,10 @@ static volatile long g_redirects = 0;
 static volatile int g_maps_hooked = 0;
 static volatile uint64_t g_hide_page = 0; /* VMA vm_start to drop from maps */
 static volatile long g_maps_hidden = 0;
+/* P4.2 ghost-memory state */
+static void *g_ghost_kaddr = 0; /* vmalloc page backing the ghost VA */
+static volatile uint64_t g_ghost_va = 0;
+static volatile int g_ghost_pid = 0;
 
 /* ---- tiny freestanding string/number helpers ---- */
 static char *apps(char *p, char *e, const char *s)
@@ -286,6 +299,131 @@ static void resolve_syms(void)
     if (!fn_access_process_vm) fn_access_process_vm = (void *)kallsyms_lookup_name("access_process_vm");
     if (!g_addr_pf) g_addr_pf = (void *)kallsyms_lookup_name("do_page_fault");
     if (!g_addr_show_map) g_addr_show_map = (void *)kallsyms_lookup_name("show_map");
+    if (!fn_apply) fn_apply = (void *)kallsyms_lookup_name("apply_to_page_range");
+    if (!fn_vmalloc) fn_vmalloc = (void *)kallsyms_lookup_name("vmalloc");
+    if (!fn_vfree) fn_vfree = (void *)kallsyms_lookup_name("vfree");
+    if (!fn_vmalloc_to_pfn) fn_vmalloc_to_pfn = (void *)kallsyms_lookup_name("vmalloc_to_pfn");
+}
+
+/* apply_to_page_range callback: write a hand-crafted PTE value (*data) */
+static int inject_cb(void *ptep, unsigned long addr, void *data)
+{
+    (void)addr;
+    *(volatile uint64_t *)ptep = *(uint64_t *)data;
+    return 0;
+}
+
+/* P4.2: inject a kernel page at a no-VMA user VA. Attributes are copied from an
+ * existing user page (template_va) so memory type/AP/SH/AttrIndx/UXN exactly
+ * match a known-good page -- no hard-coded MAIR index. The page is mapped to the
+ * MMU but has NO VMA, so it is invisible to /proc/maps and mincore. */
+static long do_ghosttest(uint64_t pid, uint64_t ghost_va, uint64_t template_va, char *p, char *e)
+{
+    resolve_syms();
+    if (!fn_vmalloc || !fn_vfree || !fn_vmalloc_to_pfn || !fn_apply || !fn_apply_existing ||
+        !fn_get_task_mm || !fn_mmput || !fn_find_get_task_by_vpid) {
+        apps(p, e, "error: symbols not resolved (run probe)\n");
+        return -1;
+    }
+    if (g_ghost_kaddr) {
+        apps(p, e, "error: ghost already active; ghostfree first\n");
+        return -1;
+    }
+    ghost_va &= ~0xFFFUL;
+
+    void *task = fn_find_get_task_by_vpid((int)pid);
+    if (is_err_or_null(task)) {
+        apps(p, e, "error: task not found\n");
+        return -1;
+    }
+    void *mm = fn_get_task_mm(task);
+    if (is_err_or_null(mm)) {
+        apps(p, e, "error: no mm\n");
+        return -1;
+    }
+
+    /* 1. ghost_va must currently have NO leaf PTE (don't clobber a live mapping) */
+    struct pte_out chk;
+    fn_apply_existing(mm, ghost_va, 0x1000, (void *)pte_cb, &chk);
+    if (chk.n > 0) {
+        fn_mmput(mm);
+        apps(p, e, "error: ghost_va already mapped; pick a free VA\n");
+        return -1;
+    }
+    /* 2. template attributes from an existing mapped user page */
+    struct pte_out tpl;
+    fn_apply_existing(mm, template_va & ~0xFFFUL, 0x1000, (void *)pte_cb, &tpl);
+    if (tpl.n == 0 || !(tpl.val & PTE_VALID)) {
+        fn_mmput(mm);
+        apps(p, e, "error: template_va not mapped\n");
+        return -1;
+    }
+    uint64_t attrs = tpl.val & ~PFN_MASK;
+
+    /* 3. allocate a kernel page (vmalloc -> resolvable PFN), stamp the magic */
+    void *kaddr = fn_vmalloc(0x1000);
+    if (is_err_or_null(kaddr)) {
+        fn_mmput(mm);
+        apps(p, e, "error: vmalloc failed\n");
+        return -1;
+    }
+    *(volatile uint64_t *)kaddr = GHOST_MAGIC;
+    *(volatile uint64_t *)((char *)kaddr + 8) = GHOST_MAGIC;
+    asm volatile("dsb ish" ::: "memory");
+
+    /* 4. PFN of the vmalloc page -> PTE value with template attrs */
+    uint64_t pfn = fn_vmalloc_to_pfn(kaddr);
+    uint64_t pte_val = ((pfn << 12) & PFN_MASK) | attrs;
+
+    /* 5. inject the PTE (allocates page tables for ghost_va), flush TLB */
+    int ir = fn_apply(mm, ghost_va, 0x1000, (void *)inject_cb, &pte_val);
+    flush_tlb_all();
+    fn_mmput(mm);
+    if (ir) {
+        fn_vfree(kaddr);
+        apps(p, e, "error: apply_to_page_range failed\n");
+        return -1;
+    }
+
+    g_ghost_kaddr = kaddr;
+    g_ghost_va = ghost_va;
+    g_ghost_pid = (int)pid;
+
+    p = apps(p, e, "ok: ghost injected va=");
+    p = apphex(p, e, ghost_va);
+    p = apps(p, e, " pa=");
+    p = apphex(p, e, (pfn << 12) & PFN_MASK);
+    p = apps(p, e, " pte=");
+    p = apphex(p, e, pte_val);
+    p = apps(p, e, " magic=");
+    p = apphex(p, e, GHOST_MAGIC);
+    apps(p, e, " (no VMA: invisible to maps/mincore)\n");
+    return 0;
+}
+
+static long do_ghostfree(char *p, char *e)
+{
+    if (!g_ghost_kaddr) {
+        apps(p, e, "error: no ghost active\n");
+        return -1;
+    }
+    /* clear the injected PTE first (so nothing references the page), then free */
+    void *task = fn_find_get_task_by_vpid(g_ghost_pid);
+    if (!is_err_or_null(task)) {
+        void *mm = fn_get_task_mm(task);
+        if (!is_err_or_null(mm)) {
+            uint64_t zero = 0;
+            fn_apply_existing(mm, g_ghost_va, 0x1000, (void *)inject_cb, &zero);
+            flush_tlb_all();
+            fn_mmput(mm);
+        }
+    }
+    fn_vfree(g_ghost_kaddr);
+    g_ghost_kaddr = 0;
+    g_ghost_va = 0;
+    g_ghost_pid = 0;
+    apps(p, e, "ok: ghost freed (PTE cleared + page released)\n");
+    return 0;
 }
 
 static long do_hidemaps(uint64_t page, char *p, char *e)
@@ -526,6 +664,8 @@ static long do_state(char *p, char *e)
     p = apphex(p, e, g_hide_page);
     p = apps(p, e, " maps_hidden=");
     p = appdec(p, e, g_maps_hidden);
+    p = apps(p, e, " ghost_va=");
+    p = apphex(p, e, g_ghost_va);
     if (g_ptep) {
         p = apps(p, e, "\npte_now=");
         p = apphex(p, e, *(volatile uint64_t *)g_ptep);
@@ -554,6 +694,12 @@ static long do_probe(char *p, char *e)
     p = apphex(p, e, (uint64_t)g_addr_pf);
     p = apps(p, e, "\nshow_map=");
     p = apphex(p, e, (uint64_t)g_addr_show_map);
+    p = apps(p, e, "\napply_to_page_range=");
+    p = apphex(p, e, (uint64_t)fn_apply);
+    p = apps(p, e, "\nvmalloc=");
+    p = apphex(p, e, (uint64_t)fn_vmalloc);
+    p = apps(p, e, "\nvmalloc_to_pfn=");
+    p = apphex(p, e, (uint64_t)fn_vmalloc_to_pfn);
     apps(p, e, "\n");
     return 0;
 }
@@ -620,13 +766,25 @@ static long shpte_control0(const char *args, char *__user out_msg, int outlen)
         rc = do_hidemaps(page, p, e); /* page optional: defaults to active clone */
     } else if (starts(a, "unhidemaps")) {
         rc = do_unhidemaps(p, e);
+    } else if (starts(a, "ghosttest")) {
+        uint64_t pid = 0, gva = 0, tva = 0;
+        const char *s = parse_ull(a + 9, &pid);
+        s = parse_ull(s, &gva);
+        parse_ull(s, &tva);
+        if (!pid || !gva || !tva)
+            apps(p, e, "usage: ghosttest <pid> <ghost_va> <template_va>\n"), rc = -1;
+        else
+            rc = do_ghosttest(pid, gva, tva, p, e);
+    } else if (starts(a, "ghostfree")) {
+        rc = do_ghostfree(p, e);
     } else if (starts(a, "dump")) {
         rc = do_state(p, e);
     } else {
         apps(p, e,
              "usage: probe | pte <pid> <addr> | arm <pid> <addr> | "
              "redirect <pid> <addr> <clone> | redirectmap <pid> <addr> <clone> <map> <n> | "
-             "hidemaps [page] | unhidemaps | disarm | dump\n");
+             "hidemaps [page] | unhidemaps | ghosttest <pid> <ghost_va> <template_va> | "
+             "ghostfree | disarm | dump\n");
         rc = -1;
     }
 
@@ -654,6 +812,21 @@ static long shpte_exit(void *__user reserved)
     if (g_maps_hooked && g_addr_show_map) {
         hook_unwrap(g_addr_show_map, (void *)before_showmap, (void *)after_showmap);
         g_maps_hooked = 0;
+    }
+    if (g_ghost_kaddr) {
+        /* clear the injected PTE then free, so we don't leave a dangling map/leak */
+        void *task = fn_find_get_task_by_vpid ? fn_find_get_task_by_vpid(g_ghost_pid) : 0;
+        if (task && !is_err_or_null(task) && fn_get_task_mm) {
+            void *mm = fn_get_task_mm(task);
+            if (!is_err_or_null(mm)) {
+                uint64_t zero = 0;
+                fn_apply_existing(mm, g_ghost_va, 0x1000, (void *)inject_cb, &zero);
+                flush_tlb_all();
+                fn_mmput(mm);
+            }
+        }
+        if (fn_vfree) fn_vfree(g_ghost_kaddr);
+        g_ghost_kaddr = 0;
     }
     logki("shpte: exit faults=%ld maps_hidden=%ld\n", g_faults, g_maps_hidden);
     return 0;
