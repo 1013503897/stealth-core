@@ -155,7 +155,7 @@ static volatile uint64_t g_hook_replace = 0; /* 0 = no override */
  * -- never garbage. nlive counts non-inert slots (when it hits 0 the page disarms). */
 #define MAX_PG 16            /* trapped REGIONS live at once (LSPlant ~20 funcs grouped by region) */
 #define MAX_OV 8             /* hooked function entries per trapped region */
-#define MAX_RGN 16           /* RV-2: max pages in one clean-bounded region (covers all but a few huge libart fns) */
+#define MAX_RGN 64           /* RV-2: max pages in one clean-bounded region (64: reach farther clean boundaries in dense libart) */
 #define OV_NONE (~0ULL)      /* sentinel: inert override slot (a real region offset is < npages*0x1000) */
 /* RV-2: each slot now traps a clean-bounded MULTI-PAGE region [page, page+npages) and
  * routes it to one whole-region clone. The clone covers complete functions (region
