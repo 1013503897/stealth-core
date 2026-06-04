@@ -49,7 +49,7 @@
 KPM_NAME("shpte");
 KPM_VERSION("0.6.0");
 KPM_LICENSE("GPL v2");
-KPM_AUTHOR("stealth-poc");
+KPM_AUTHOR("wxy");
 KPM_DESCRIPTION("P2/P3/P4: UXN redirect + maps hide + VMA-less ghost memory");
 
 /* struct offsets verified from this device's kernel BTF (6.1 GKI):
@@ -203,8 +203,15 @@ static volatile long g_tracer_spoofed = 0;
 static void *g_ghost_kaddr = 0; /* vmalloc page backing the ghost VA */
 static volatile uint64_t g_ghost_va = 0;
 static volatile int g_ghost_pid = 0;
-/* syscall bridge: lets an injected agent drive the KPM without the superkey */
+/* syscall bridge: lets an injected agent drive the KPM without the superkey.
+ * Carrier syscall = sysinfo (arm64 #179), NOT personality: Android's app seccomp
+ * filter ARG-FILTERS personality() (allows the 0xffffffff query, blocks other args
+ * with ERRNO), so a personality-magic bridge is unreachable from real (zygote-forked,
+ * seccomp'd) app processes -- exactly the in-app agent case. sysinfo is allowed for
+ * apps with arbitrary args and is rarely called, so the magic-gated passthrough is
+ * cheap. A real sysinfo(arg0!=magic) passes straight through. */
 #define BRIDGE_MAGIC 0x5348505442524447ULL /* "SHPTBRDG" */
+#define BRIDGE_NR 179                       /* __NR_sysinfo on arm64 (asm-generic) */
 static volatile int g_bridge_hooked = 0;
 /* HWBP-redirect inline_hooker: per-instruction trap, so it doesn't disturb other
  * functions sharing the target's page (real libart funcs aren't page-isolated) */
@@ -1666,9 +1673,9 @@ static long shpte_init(const char *args, const char *event, void *__user reserve
 static long shpte_run(const char *args, char *buf, int bufcap); /* fwd */
 
 /* syscall bridge: an injected agent (no superkey) drives the KPM via
- *   syscall(__NR_personality, BRIDGE_MAGIC, cmd_ptr, cmd_len, out_ptr, out_len)
+ *   syscall(BRIDGE_NR=sysinfo, BRIDGE_MAGIC, cmd_ptr, cmd_len, out_ptr, out_len)
  * It runs in the agent's own process context (sleepable), like a supercall.
- * Real personality() calls (arg0 != magic) pass straight through. */
+ * Real sysinfo() calls (arg0 != magic) pass straight through. */
 static void before_bridge(hook_fargs6_t *fargs, void *udata)
 {
     (void)udata;
@@ -1695,7 +1702,7 @@ static void before_bridge(hook_fargs6_t *fargs, void *udata)
         compat_copy_to_user(uout, buf, len + 1);
     }
     fargs->ret = rc;
-    fargs->skip_origin = 1; /* swallow the personality() call */
+    fargs->skip_origin = 1; /* swallow the carrier syscall */
 }
 
 static long do_bridge(char *p, char *e)
@@ -1704,22 +1711,22 @@ static long do_bridge(char *p, char *e)
         apps(p, e, "ok: bridge already on\n");
         return 0;
     }
-    hook_err_t err = fp_hook_syscalln(__NR_personality, 6, (void *)before_bridge, 0, 0);
+    hook_err_t err = fp_hook_syscalln(BRIDGE_NR, 6, (void *)before_bridge, 0, 0);
     if (err != HOOK_NO_ERR) {
-        p = apps(p, e, "error: hook __NR_personality failed err=");
+        p = apps(p, e, "error: hook sysinfo failed err=");
         p = appdec(p, e, (int)err);
         apps(p, e, "\n");
         return -1;
     }
     g_bridge_hooked = 1;
-    apps(p, e, "ok: syscall bridge on (personality + magic)\n");
+    apps(p, e, "ok: syscall bridge on (sysinfo + magic)\n");
     return 0;
 }
 
 static long do_unbridge(char *p, char *e)
 {
     if (g_bridge_hooked) {
-        fp_unhook_syscalln(__NR_personality, (void *)before_bridge, 0);
+        fp_unhook_syscalln(BRIDGE_NR, (void *)before_bridge, 0);
         g_bridge_hooked = 0;
     }
     apps(p, e, "ok: syscall bridge off\n");
@@ -1957,7 +1964,7 @@ static long shpte_exit(void *__user reserved)
         g_tracer_hooked = 0;
     }
     if (g_bridge_hooked) {
-        fp_unhook_syscalln(__NR_personality, (void *)before_bridge, 0);
+        fp_unhook_syscalln(BRIDGE_NR, (void *)before_bridge, 0);
         g_bridge_hooked = 0;
     }
     g_hwbp_armed = 0;

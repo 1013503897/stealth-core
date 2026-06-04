@@ -9,7 +9,7 @@
 KPM_NAME("shmin");
 KPM_VERSION("0.0.1");
 KPM_LICENSE("GPL v2");
-KPM_AUTHOR("stealth-poc");
+KPM_AUTHOR("wxy");
 KPM_DESCRIPTION("minimal ctl0 isolation test");
 
 static long m_init(const char *args, const char *event, void *__user reserved)

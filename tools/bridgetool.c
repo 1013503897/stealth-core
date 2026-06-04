@@ -9,11 +9,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/sysinfo.h>
 
 #define BRIDGE_MAGIC 0x5348505442524447ULL /* "SHPTBRDG" */
-#ifndef __NR_personality
-#define __NR_personality 92 /* arm64 asm-generic */
-#endif
+#define BRIDGE_NR 179 /* __NR_sysinfo (arm64): seccomp-allowed for apps, unlike personality */
 
 int main(int argc, char **argv)
 {
@@ -21,11 +20,13 @@ int main(int argc, char **argv)
     char out[2048];
     memset(out, 0, sizeof(out));
 
-    long rc = syscall(__NR_personality, BRIDGE_MAGIC, cmd, (long)strlen(cmd) + 1, out, (long)sizeof(out));
+    long rc = syscall(BRIDGE_NR, BRIDGE_MAGIC, cmd, (long)strlen(cmd) + 1, out, (long)sizeof(out));
     printf("== bridge cmd \"%s\" rc=%ld ==\n%s\n", cmd, rc, out[0] ? out : "(empty: bridge off?)\n");
 
-    // real personality(0xffffffff) just queries the current value -> must pass through
-    long cur = syscall(__NR_personality, 0xffffffffUL);
-    printf("real personality query rc=%ld (passthrough OK if >= 0)\n", cur);
+    // a real sysinfo(&info) call (arg0 != magic) must pass straight through
+    struct sysinfo info;
+    long cur = syscall(BRIDGE_NR, &info);
+    printf("real sysinfo passthrough rc=%ld uptime=%lds (passthrough OK if rc==0)\n", cur,
+           cur == 0 ? info.uptime : -1);
     return 0;
 }

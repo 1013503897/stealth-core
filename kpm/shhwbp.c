@@ -64,7 +64,7 @@
 KPM_NAME("shhwbp");
 KPM_VERSION("0.6.0");
 KPM_LICENSE("GPL v2");
-KPM_AUTHOR("stealth-poc");
+KPM_AUTHOR("wxy");
 KPM_DESCRIPTION("P1.6: HWBP per-thread table + follow new threads + GC on exit");
 
 #ifndef offsetof

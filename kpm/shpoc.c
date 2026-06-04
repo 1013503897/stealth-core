@@ -21,7 +21,7 @@
 KPM_NAME("shpoc");
 KPM_VERSION("0.0.1");
 KPM_LICENSE("GPL v2");
-KPM_AUTHOR("stealth-poc");
+KPM_AUTHOR("wxy");
 KPM_DESCRIPTION("P0: syscall-hook smoke test (toolchain + KPM bridge)");
 
 /* updated from hook context; only used for coarse logging, not synchronization */

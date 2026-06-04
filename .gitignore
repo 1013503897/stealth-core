@@ -14,3 +14,7 @@
 # (see README "Requirements"). Not vendored into this repo to avoid an
 # embedded git repo; re-clone github.com/bmax121/KernelPatch at 0.13.1.
 /vendor/
+
+# device-deploy artifacts (contain the APatch superkey -- never commit)
+_kpmboot/
+kpm_bootstrap.zip
