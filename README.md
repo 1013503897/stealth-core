@@ -34,6 +34,7 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 | **L1c** | **Page-span census** (`tools/libartcensus.c`, zero-risk on-disk ELF scan): real libart `.text` has **12.2% of functions spanning page boundaries (lower bound), 46.5% of code bytes in spanning runs, max fn ~27 pages** → the single-page whole-page clone is **unusable for real libart**; **multi-page clones are mandatory** (scopes RV-2) | ✅ measured |
 | **RV-2** | **Clean-bounded multi-page region clones**: a `pghook` slot now traps a contiguous page **region** whose `R_hi` falls in an inter-function gap, cloned in one piece — so a function spanning a page boundary (or a page-neighbor that does) is wholly in the clone and `RET`s normally. Region-relative routing + `fn_vmalloc`'d offmap in the KPM; clean-`R_hi` scan + region clone in `lib/kpmhook`. Verified by `tools/rgntool.c`: a ~1100-insn page-spanning fn runs its FULL body via a 2-page clone (backup returns `n+1100`), its 2nd-page neighbor runs normally; single-page (`npages=1`) regressions stay green | ✅ verified |
 | **L1d** | **LIVE in-app traceless hook of real libart**: the custom Vector routes the **LSPosed manager**'s libart hooks through our KPM — `dump` shows **6-page and 11-page region clones** of real ART code (`redirects=39823`), manager UI fully functional, `.text` untouched. Required: bridge carrier moved `personality`→**`sysinfo`** (Android app seccomp arg-filters `personality`); gate moved cmdline→**UID** (cmdline is still `zygote64` at `LSPlant::Init` time); deploy via `apd module install` (device anti-tamper blocks direct module writes) | ✅ verified |
+| **L1e** | **100% inline-hook coverage**: the manager installs **6** simultaneous libart inline hooks; at `MAX_RGN=16` only **2/6** found a clean region boundary (clean ends — a function RET landing exactly on a page boundary — are sparse in dense libart). Raising **`MAX_RGN` 16→64** brings **all 6** through as region clones (6/39/19/11/25/39 pages; the 4 ex-Dobby ones needed 19/25/39/39), `dump npg=6`, manager fully functional, zero crash, zero Dobby fallback | ✅ verified |
 
 ## Requirements
 
@@ -195,10 +196,12 @@ The intended end-product is a modified **Vector** (JingMatrix's Zygisk ART-hook 
   code bytes live in page-spanning functions** → the single-page whole-page clone is unusable for real
   libart. **RV-2 done + device-verified**: a `pghook` slot now traps a clean-bounded multi-page **region**
   (`R_hi` in an inter-function gap) cloned in one piece, so page-spanning functions/neighbors run wholly
-  from the clone (`tools/rgntool.c`). **Remaining:** a contained *in-app* verification (one gated process,
-  `system_server` on Dobby) — blocked on a working per-process gate (the `persist.*` prop can't be read by
-  an `untrusted_app`) and the SELinux `system_file` block on swapping the deployed module payload; plus
-  multi-slot `hwhookto` for the few functions too large for a clean region.
+  from the clone (`tools/rgntool.c`). **L1d/L1e done + LIVE-verified in-app**: the custom Vector routes the
+  LSPosed manager's libart hooks through the KPM; raising `MAX_RGN` 16→64 brings **all 6** of the manager's
+  inline hooks through as region clones (none on Dobby), manager fully functional, `.text` untouched.
+  **Remaining:** multi-slot `hwhookto` (HWBP, entry-only) as a fallback for functions still too large for a
+  clean region past 64 pages, or hosts needing more than `MAX_PG` regions; and a Vector-passed package-name
+  gate to replace the UID gate.
 - **Layer 2** (Java methods): fork LSPlant's `DoHook` to trap the compiled `entry_point` via HWBP/UXN
   instead of swapping the `ArtMethod` pointer (defeats pointer-roaming detection).
 - **Frida-Gum** (optional, larger): re-back Gum's `Interceptor` with `hwhookto` and Stalker's code
