@@ -265,3 +265,44 @@ Design (in-place-then-async-upgrade):
 Open risks: restoring the ArtMethod while the method may be executing (race); compile may never
 fire for a cold method (timeout -> stays in-place/detectable); jit-cache region churn. This is the
 final goal blocker (surface #3); surfaces 1/2/4/5 are already CLEAN in a real gated app.
+
+## M-C implementation attempt #1 — synchronous force-compile FAILED (2026-06-11)
+
+Wired force_compile as an InitInfo callback called from DoHook BEFORE the suspend. Two
+blockers found on device (gated OFF behind persist.kpmhook.fc; default build unchanged + safe,
+hookdemo runs, probe still S2/S5/S1-4 CLEAN):
+
+1. **JIT thread not up during postAppSpecialize.** Vector's own framework bootstrap hooks
+   (Thread.dispatchUncaughtException, DexFile.openDexFile/openInMemoryDexFiles, LoadedApk.<init>)
+   install in postAppSpecialize, BEFORE the app's main / the JIT compiler thread starts. So an
+   EnqueueOptimizedCompilation there never completes -> the synchronous poll-wait blocks app init
+   -> AMS kills the app (no injection logs at all, pid gone). A compile-and-wait in DoHook is a
+   non-starter for early hooks.
+
+2. **CompileDontBother conflict.** LSPlant's in-place hook sets kAccCompileDontBother (via
+   BackupTo->SetNonCompilable) precisely to STOP ART re-compiling and overwriting the trampoline
+   entry. That directly blocks force-compile. More deeply: LSPlant's ENTIRE machinery
+   (ShouldUseInterpreterEntrypoint, FixupStaticTrampolines, the jit.cxx/instrumentation.cxx hooks)
+   exists to KEEP entry==trampoline against ART optimization. Traceless wants the OPPOSITE: let ART
+   compile the method (entry==JIT code) and trap that. So M-C must DISENGAGE LSPlant's keep-the-hook
+   path for traceless methods -- a real divergence, not a small add.
+
+**Deferred design directions (for attempt #2):**
+- DoHook(nterp, traceless): record (target,hook,trampoline) on a pending list; do NOT set
+  CompileDontBother (so ART can still compile); either skip the in-place hook (method runs
+  un-hooked until upgrade -- breaks framework hooks that fire at startup) or do a minimal entry
+  swap that a later step undoes.
+- A post-init worker (JIT up): EnqueueOptimizedCompilation each pending method, wait for a JIT
+  body (now compiles), then trap it traceless (kpm_inline_hooker) + set the ArtMethod to the
+  pristine compiled state (entry=JIT, normal flags, no backup).
+- Hardest open question: the early framework bootstrap hooks MUST fire during startup, but can't be
+  compiled then. Options: keep them in-place but EXCLUDE them from the goal's S3 scope (they hook
+  obscure framework methods an anti-cheat is unlikely to inspect -- weak), OR upgrade them post-init
+  too (undo in-place + retrap, racy), OR find a way to force-compile them once the JIT is up via
+  LSPlant's existing JIT hook-points firing on the first real compile.
+- Region pressure: each traceless nterp method = its own JIT-region trap slot; MAX_PG=16 shared.
+  Many module hooks could exhaust it even with the GC. May need the HWBP entry-only fallback.
+
+Status: M-C is the sole remaining goal blocker (S3). Infrastructure (force_compile callback,
+ForceCompileMethod, JIT-body acceptance in QcIsTraceable) is committed but gated OFF. Surfaces
+1/2/4/5 CLEAN in a real gated app; S3 needs attempt #2 (deferred upgrade).
