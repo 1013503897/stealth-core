@@ -233,3 +233,35 @@ JIT-compiled moves its entry off the trapped page → hook goes stale; re-trap v
 JIT hook-points); L2c interpreter/nterp (most framework methods — currently fall back, correct but
 not traceless); KPM dead-process region GC (repeated kills leak regions until MAX_PG, reboot clears);
 a per-app gate so REAL target apps (not just com.android.shell) engage the KPM.
+
+## M-C design — traceless hooking of nterp/interpreted methods (2026-06-11)
+
+Real-app methods are mostly NOT individually AOT-compiled: their entry_point is a SHARED
+nterp/bridge stub in boot.oat, so there is no per-method native code to trap -> they fall back to
+the in-place hook (entry swap) -> surface #3 (ArtMethod entry/flags) DETECTED. To make them
+traceless the method must be given its OWN compiled code, then trapped like an AOT method.
+
+Force-compile path (symbols mapped): Jit::EnqueueOptimizedCompilation(jit,method,self) and
+AddCompileTask(self,method,kOptimized,false) (jit.cxx -- LSPlant HOOKS them but exposes no caller);
+nterp detect = entry == art_quick_to_interpreter_bridge (class_linker.cxx); after compile read
+method->GetEntryPoint() (now JIT code in [anon:dalvik-jit-code-cache]).
+
+HARD CONSTRAINT (found): DoHook runs under ScopedSuspendAll (all threads frozen), but JIT
+compilation is ASYNC on a background thread that CANNOT run while suspended -> can't wait for the
+compile inside DoHook (deadlock). So force-compile + trap MUST be deferred out of the suspend.
+
+Design (in-place-then-async-upgrade):
+1. DoHook(nterp, traceless): do the normal IN-PLACE hook so it works immediately, AND record
+   (target, trampoline) on a "pending traceless upgrade" queue.
+2. A Vector worker thread (outside suspend-all): for each pending method -- EnqueueOptimized
+   Compilation(target), poll GetEntryPoint() until it is JIT code (timeout -> leave in-place),
+   then under a fresh short suspend: trap the JIT region via kpm_inline_hooker(jitqc, trampoline),
+   point the backup at the in-clone copy, and RESTORE target's ArtMethod to pristine (undo the
+   entry swap + flags). Net: brief in-place window at startup -> traceless thereafter.
+3. L2b JIT-move follow: ART may re-JIT/GC-move the method (GarbageCollectCache/DoCollection ->
+   MoveObsoleteMethod, hooked by LSPlant) -> re-read GetEntryPoint, re-pghook the new region. The
+   jit region clone is anon RX -> hidden by the existing maps-hide; its trampoline by hidergn.
+
+Open risks: restoring the ArtMethod while the method may be executing (race); compile may never
+fire for a cold method (timeout -> stays in-place/detectable); jit-cache region churn. This is the
+final goal blocker (surface #3); surfaces 1/2/4/5 are already CLEAN in a real gated app.
