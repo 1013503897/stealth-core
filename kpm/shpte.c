@@ -53,10 +53,11 @@ KPM_AUTHOR("wxy");
 KPM_DESCRIPTION("P2/P3/P4: UXN redirect + maps hide + VMA-less ghost memory");
 
 /* struct offsets verified from this device's kernel BTF (6.1 GKI):
- *   seq_file.count=+24, seq_file.pad_until=+32 ; vm_area_struct.vm_start=+0 */
+ *   seq_file.count=+24, seq_file.pad_until=+32 ; vm_area_struct.vm_start=+0, vm_mm=+16 */
 #define SEQ_COUNT_OFF 24
 #define SEQ_PAD_OFF 32
 #define VMA_START_OFF 0
+#define VMA_VM_MM_OFF 16
 #define SEQ_SKIP 1
 
 #define GHOST_MAGIC 0xDEADBEEFCAFEF00DULL
@@ -165,6 +166,8 @@ static volatile uint64_t g_hook_replace = 0; /* 0 = no override */
 struct pghook {
     volatile int active;
     int pid;
+    void *mm;          /* target's mm_struct* -- maps-hide gates the clone on the vma OWNER
+                        * (hides for self-scans AND external readers, never another process) */
     uint64_t page;     /* region base (R_lo) -- first UXN-trapped page */
     volatile int npages; /* pages in the region [page, page+npages*0x1000) */
     uint64_t clone;    /* whole-region clone base (user VA) */
@@ -469,16 +472,60 @@ static void before_showmap(hook_fargs2_t *fargs, void *udata)
 static void after_showmap(hook_fargs2_t *fargs, void *udata)
 {
     (void)udata;
-    if (!g_maps_hooked || !g_hide_page) return;
+    if (!g_maps_hooked) return;
     void *vma = (void *)fargs->arg1;
     if (!vma) return;
     uint64_t vm_start = *(volatile uint64_t *)((char *)vma + VMA_START_OFF);
-    if (vm_start != g_hide_page) return;
+
+    int hit = 0;
+    /* legacy single-page redirect clone (manual `hidemaps`, P4.1 demo) */
+    if (g_hide_page && vm_start == g_hide_page) hit = 1;
+    /* auto-hide: any active pghook region clone. The hide-set IS the g_pg[] table --
+     * a clone is hidden the moment its region is armed and revealed when it disarms,
+     * so hiding is intrinsic to arming and the glue needs no extra supercall. Gate on
+     * the vma's OWNER mm (not the reader): this hides the clone whether the host scans
+     * its own /proc/self/maps OR an external process scans /proc/<host>/maps, while a
+     * DIFFERENT process that merely shares the same library VA (zygote-forked apps all
+     * map libart around here) keeps its line -- no cross-process maps corruption. */
+    if (!hit && g_npg > 0) {
+        void *vmm = *(void *volatile *)((char *)vma + VMA_VM_MM_OFF);
+        for (int i = 0; i < MAX_PG; i++) {
+            struct pghook *s = &g_pg[i];
+            if (!s->active || !s->clone || s->clone != vm_start) continue;
+            if (s->mm && vmm != s->mm) continue; /* vma must belong to the host's mm */
+            hit = 1;
+            break;
+        }
+    }
+    if (!hit) return;
+
     void *m = (void *)fargs->arg0;
     *(volatile uint64_t *)((char *)m + SEQ_COUNT_OFF) = fargs->local.data0; /* rewind */
     *(volatile uint64_t *)((char *)m + SEQ_PAD_OFF) = 0;                    /* pad_until=0 */
     fargs->ret = SEQ_SKIP;
     g_maps_hidden++;
+}
+
+/* show_map hide-hook lifecycle, ref-counted by (g_npg, g_hide_page): install on the
+ * first armed pghook region (or manual hidemaps), remove only when the last region
+ * disarms AND no manual hidemaps is active. Runs in the sleepable supercall/bridge
+ * context (same as do_pghook's ensure_pf_hooked), so inline-patching show_map is safe. */
+static int ensure_maps_hooked(void)
+{
+    if (g_maps_hooked) return 0;
+    if (!g_addr_show_map) g_addr_show_map = (void *)kallsyms_lookup_name("show_map");
+    if (!g_addr_show_map) return -1;
+    if (hook_wrap2(g_addr_show_map, (void *)before_showmap, (void *)after_showmap, 0) != HOOK_NO_ERR)
+        return -1;
+    g_maps_hooked = 1;
+    return 0;
+}
+static void maybe_unhook_maps(void)
+{
+    if (g_maps_hooked && g_npg == 0 && !g_hide_page && g_addr_show_map) {
+        hook_unwrap(g_addr_show_map, (void *)before_showmap, (void *)after_showmap);
+        g_maps_hooked = 0;
+    }
 }
 
 /* ---- TracerPid spoof: rewrite "TracerPid:\t<n>" -> "TracerPid:\t0" in the
@@ -1012,12 +1059,10 @@ static long do_hidemaps(uint64_t page, char *p, char *e)
         apps(p, e, "error: no page given and no active clone\n");
         return -1;
     }
-    if (!g_maps_hooked) {
-        if (hook_wrap2(g_addr_show_map, (void *)before_showmap, (void *)after_showmap, 0) != HOOK_NO_ERR) {
-            apps(p, e, "error: hook_wrap2(show_map) failed\n");
-            return -1;
-        }
-        g_maps_hooked = 1;
+    if (ensure_maps_hooked() != 0) {
+        g_hide_page = 0;
+        apps(p, e, "error: hook_wrap2(show_map) failed\n");
+        return -1;
     }
     p = apps(p, e, "ok: hiding vma vm_start=");
     p = apphex(p, e, g_hide_page);
@@ -1027,13 +1072,13 @@ static long do_hidemaps(uint64_t page, char *p, char *e)
 
 static long do_unhidemaps(char *p, char *e)
 {
-    if (g_maps_hooked && g_addr_show_map) {
-        hook_unwrap(g_addr_show_map, (void *)before_showmap, (void *)after_showmap);
-        g_maps_hooked = 0;
-    }
+    /* drop only the manual single-page hide; keep the hook installed if pghook
+     * regions are still auto-hiding (maybe_unhook_maps refcounts on g_npg) */
     g_hide_page = 0;
+    maybe_unhook_maps();
     p = apps(p, e, "ok: maps unhidden, hidden_count=");
     p = appdec(p, e, g_maps_hidden);
+    if (g_maps_hooked) apps(p, e, " (hook kept: pghook regions still hidden)");
     apps(p, e, "\n");
     return 0;
 }
@@ -1390,6 +1435,16 @@ static long do_pghook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t mapa
     }
 
     s->pid = (int)pid;
+    /* cache the target's mm* for the maps-hide owner gate (equality use only -- never
+     * dereferenced). get_task_mm takes/drops a ref; we keep just the pointer value. */
+    s->mm = 0;
+    {
+        void *tmm = fn_get_task_mm(task);
+        if (!is_err_or_null(tmm)) {
+            s->mm = tmm;
+            fn_mmput(tmm);
+        }
+    }
     s->page = page;
     s->npages = npages;
     s->clone = clone;
@@ -1415,6 +1470,10 @@ static long do_pghook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t mapa
         *(volatile uint64_t *)s->ptep[j] = s->pte_orig[j] | PTE_UXN;
     flush_tlb_all();
 
+    /* auto-hide: hide this clone from /proc/pid/maps the moment the region is armed
+     * (best-effort -- the redirect still works if the maps hook can't install) */
+    int maps_rc = ensure_maps_hooked();
+
     p = apps(p, e, "ok: pghook slot=");
     p = appdec(p, e, si);
     p = apps(p, e, " pid=");
@@ -1431,6 +1490,8 @@ static long do_pghook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t mapa
     p = apphex(p, e, target_off);
     p = apps(p, e, " replace=");
     p = apphex(p, e, replace);
+    p = apps(p, e, " maps_hide=");
+    p = appdec(p, e, maps_rc == 0 ? 1 : 0);
     p = apps(p, e, " npg=");
     p = appdec(p, e, g_npg);
     apps(p, e, "\n");
@@ -1466,6 +1527,7 @@ static long do_pgdisarm(char *p, char *e)
     }
     g_npg = 0;
     maybe_unhook_pf();
+    maybe_unhook_maps(); /* last region gone -> reveal maps again (unless manual hidemaps) */
     p = apps(p, e, "ok: pgdisarm slots=");
     p = appdec(p, e, n);
     p = apps(p, e, " redirects=");
@@ -1521,6 +1583,7 @@ static long do_pgunhook(uint64_t pid, uint64_t page, uint64_t off, char *p, char
         s->offmap = 0;
         if (g_npg > 0) g_npg--;
         maybe_unhook_pf();
+        maybe_unhook_maps(); /* last region gone -> reveal maps again (unless manual hidemaps) */
         p = apps(p, e, "ok: pgunhook slot=");
         p = appdec(p, e, i);
         p = apps(p, e, " disarmed region=");
