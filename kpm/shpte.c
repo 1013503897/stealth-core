@@ -204,6 +204,17 @@ static volatile long g_maps_hidden = 0;
  * signature) -- armed together with show_map; separate counter for telemetry */
 static volatile int g_smaps_hooked = 0;
 static volatile long g_smaps_hidden = 0;
+/* general region hide-set (mm-gated): in addition to the auto-hidden pghook clones, the glue
+ * registers arbitrary anomalous regions here -- chiefly the LSPlant trampoline pool (an rwxp
+ * anon region GenerateTrampolineFor mmaps for EVERY hook, which an anti-tamper maps-scan flags).
+ * Keyed by (owner mm, page) like the clone hide; cleared per-mm when the process is GC'd. */
+#define MAX_HIDE 64
+struct hidereg {
+    void *mm;
+    uint64_t page;
+};
+static struct hidereg g_hide[MAX_HIDE];
+static volatile int g_nhide = 0;
 /* TracerPid spoof state (anti-debug / anti-ptrace-detection) */
 static volatile int g_tracer_hooked = 0;
 static volatile long g_tracer_spoofed = 0;
@@ -501,6 +512,15 @@ static int maps_hide_vma(hook_fargs2_t *fargs)
             break;
         }
     }
+    /* general hide-set (e.g. the LSPlant trampoline pool), mm-gated like the clones */
+    if (!hit && g_nhide > 0) {
+        void *vmm = *(void *volatile *)((char *)vma + VMA_VM_MM_OFF);
+        for (int i = 0; i < MAX_HIDE; i++) {
+            if (g_hide[i].page != vm_start || g_hide[i].mm != vmm) continue;
+            hit = 1;
+            break;
+        }
+    }
     if (!hit) return 0;
 
     void *m = (void *)fargs->arg0;
@@ -546,7 +566,7 @@ static int ensure_maps_hooked(void)
 }
 static void maybe_unhook_maps(void)
 {
-    if (g_npg != 0 || g_hide_page) return; /* still needed */
+    if (g_npg != 0 || g_hide_page || g_nhide != 0) return; /* still needed */
     if (g_smaps_hooked && g_addr_show_smap) {
         hook_unwrap(g_addr_show_smap, (void *)before_showmap, (void *)after_showsmap);
         g_smaps_hooked = 0;
@@ -1113,6 +1133,56 @@ static long do_unhidemaps(char *p, char *e)
     return 0;
 }
 
+/* hidergn <pid> <addr>: add the page containing `addr` (in pid's mm) to the general hide-set,
+ * so an in-process maps/smaps scan never sees it. Used by the glue to hide the LSPlant
+ * trampoline pool (rwxp anon). mm-gated like the clone hide; auto-cleared when the process is
+ * GC'd (gc_dead_slots_locked). */
+static long do_hidergn(uint64_t pid, uint64_t addr, char *p, char *e)
+{
+    resolve_syms();
+    if (!fn_find_get_task_by_vpid || !fn_get_task_mm || !fn_mmput) {
+        apps(p, e, "error: symbols not resolved\n");
+        return -1;
+    }
+    void *task = fn_find_get_task_by_vpid((int)pid);
+    if (is_err_or_null(task)) {
+        apps(p, e, "error: task not found\n");
+        return -1;
+    }
+    void *mm = fn_get_task_mm(task);
+    if (is_err_or_null(mm)) {
+        apps(p, e, "error: no mm\n");
+        return -1;
+    }
+    fn_mmput(mm); /* pointer used for equality only, never dereferenced */
+    uint64_t page = addr & ~0xFFFUL;
+    for (int i = 0; i < MAX_HIDE; i++)
+        if (g_hide[i].mm == mm && g_hide[i].page == page) {
+            apps(p, e, "ok: hidergn already present\n");
+            return 0;
+        }
+    int slot = -1;
+    for (int i = 0; i < MAX_HIDE; i++)
+        if (g_hide[i].mm == 0) {
+            slot = i;
+            break;
+        }
+    if (slot < 0) {
+        apps(p, e, "error: hide-set full\n");
+        return -1;
+    }
+    g_hide[slot].mm = mm;
+    g_hide[slot].page = page;
+    g_nhide++;
+    ensure_maps_hooked(); /* best-effort: arm show_map/show_smap so the hide takes effect */
+    p = apps(p, e, "ok: hidergn page=");
+    p = apphex(p, e, page);
+    p = apps(p, e, " nhide=");
+    p = appdec(p, e, g_nhide);
+    apps(p, e, "\n");
+    return 0;
+}
+
 static long do_hidetracer(char *p, char *e)
 {
     resolve_syms();
@@ -1351,6 +1421,7 @@ static int gc_dead_slots_locked(void)
         if (!s->active) continue;
         void *task = fn_find_get_task_by_vpid ? fn_find_get_task_by_vpid(s->pid) : 0;
         if (!is_err_or_null(task)) continue; /* alive (ref leaked -- rare, acceptable) */
+        void *dead_mm = s->mm;
         s->active = 0;                        /* publish inert before freeing (before_pf skips) */
         s->npages = 0;
         if (s->offmap && fn_vfree) fn_vfree(s->offmap);
@@ -1358,6 +1429,15 @@ static int gc_dead_slots_locked(void)
         s->mm = 0;
         if (g_npg > 0) g_npg--;
         freed++;
+        /* drop this dead process's general hide-set entries (its mm is being freed; a stale
+         * mm pointer could false-match a reused mm and hide a line in a new process) */
+        if (dead_mm)
+            for (int j = 0; j < MAX_HIDE; j++)
+                if (g_hide[j].mm == dead_mm) {
+                    g_hide[j].mm = 0;
+                    g_hide[j].page = 0;
+                    if (g_nhide > 0) g_nhide--;
+                }
     }
     if (freed) {
         maybe_unhook_pf();
@@ -1966,6 +2046,14 @@ static long shpte_run(const char *args, char *buf, int bufcap)
             apps(p, e, "usage: arm <pid> <hexaddr>\n"), rc = -1;
         else
             rc = do_arm(pid, addr, p, e);
+    } else if (starts(a, "hidergn")) {
+        uint64_t pid = 0, addr = 0;
+        const char *s = parse_ull(a + 7, &pid);
+        parse_ull(s, &addr);
+        if (!pid || !addr)
+            apps(p, e, "usage: hidergn <pid> <hexaddr>\n"), rc = -1;
+        else
+            rc = do_hidergn(pid, addr, p, e);
     } else if (starts(a, "hidemaps")) {
         uint64_t page = 0;
         parse_ull(a + 8, &page);
