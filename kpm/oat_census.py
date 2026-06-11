@@ -69,3 +69,48 @@ pac_calls = cnt['PAC-BLRAA*'] + cnt['PAC-BRAA*']
 print(f"PAC indirect call/jump (BLRAA*/BRAA*, the P3.5 verbatim-passthrough risk): "
       f"{pac_calls:,} ({100*pac_calls/total:.3f}%)")
 print(f"PAC-RET (paciasp/retaa, PC-independent, fine): {cnt['PAC-RETAA*']:,}")
+
+# --- region-boundary feasibility (mirrors kpmhook.c make_rgn_locked / clean_boundary) ---
+# A page boundary b is "clean" if the word at b-4 is RET / NOP / 0 / unconditional-B, so no
+# function straddles it. A region clone needs a clean boundary within MAX_RGN=64 pages of the
+# target's page. Measure how reachable that is across the oat exec segment.
+MAX_RGN = 64
+PAGE = 0x1000
+def is_clean_word(w):
+    if w == 0xD65F03C0: return True           # RET
+    if w == 0xD503201F or w == 0: return True  # NOP / zero padding
+    if (w & 0xFC000000) == 0x14000000: return True  # unconditional B (tail)
+    return False
+
+seg_off, seg_vaddr, seg_filesz = segs[0][0], segs[0][1], segs[0][2]
+seg = data[seg_off:seg_off + seg_filesz]
+# page boundaries are at vaddr multiples of 0x1000; seg_vaddr is page-aligned
+npages_seg = seg_filesz // PAGE
+clean = [False] * (npages_seg + 1)
+for p in range(1, npages_seg + 1):          # boundary at start of page p (= end of page p-1)
+    bptr = p * PAGE
+    if bptr - 4 + 4 <= len(seg):
+        w = struct.unpack_from("<I", seg, bptr - 4)[0]
+        clean[p] = is_clean_word(w)
+nclean = sum(clean)
+print(f"\n--- region-boundary feasibility (MAX_RGN={MAX_RGN} pages) ---")
+print(f"exec pages: {npages_seg:,}   clean page boundaries: {nclean:,} ({100*nclean/npages_seg:.1f}% of boundaries)")
+# for each start page, distance (pages) to the next clean boundary, capped at MAX_RGN
+reachable = 0; dist_hist = collections.Counter()
+for sp in range(npages_seg):
+    d = 0
+    for k in range(1, MAX_RGN + 1):
+        if sp + k > npages_seg: break
+        if clean[sp + k]: d = k; break
+    if d:
+        reachable += 1
+        dist_hist[d] += 1
+print(f"start-pages that find a clean region end within {MAX_RGN} pages: "
+      f"{reachable:,}/{npages_seg:,} ({100*reachable/npages_seg:.2f}%)")
+import statistics
+dists = [d for d, c in dist_hist.items() for _ in range(c)]
+if dists:
+    print(f"region size to clean end (pages): min={min(dists)} median={int(statistics.median(dists))} "
+          f"mean={statistics.mean(dists):.1f} max={max(dists)}")
+    over = npages_seg - reachable
+    print(f"start-pages with NO clean end within {MAX_RGN} (would fall back to Dobby): {over:,} ({100*over/npages_seg:.2f}%)")

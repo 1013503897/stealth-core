@@ -168,9 +168,30 @@ supporting ARMv8.3 PAC — so the one known DBI gap is NOT triggered. Every PC-r
 present is already rewritten; everything else is PC-independent and safe verbatim. **No
 instruction type in this oat would be mis-handled.**
 
-CAVEAT: this is static TYPE coverage, not execution proof. Two validations remain:
-(step 2, offline, cheap) run `dbi_recompile_range` on real oat regions at their runtime VA and
-confirm it succeeds (rewrite logic + clean-boundary availability within MAX_RGN=64 — oat may be
-denser than libart) — the DBI is host-runnable (`lib/build_dbi_test.ps1`); (step 3, integration)
-execute a cloned oat region inside an ART process and confirm correct behavior (the only true
-proof; needs the DoHook integration + a Java hook in the gated process).
+CAVEAT: this is static TYPE coverage, not execution proof.
+
+### DBI-on-oat validation step 1.5 — region-boundary feasibility (same `oat_census.py`)
+
+The clone needs a clean page boundary (RET/B/NOP before it, per `kpmhook.c clean_boundary`) within
+`MAX_RGN=64` pages of the target's page, else the region can't be formed (→ fallback). Measured on
+the boot.oat exec segment (2,661 pages):
+
+- clean page boundaries: **98 / 2,660 = 3.7%** — oat is DENSE (functions rarely end on a page
+  boundary; even sparser than libart, consistent with the L1c finding).
+- start-pages that DO find a clean region end within 64 pages: **2,403 / 2,661 = 90.30%**.
+- region size to that clean end: min 1, **median 17**, mean 21.5, max 64 pages (so clones are
+  large — a 64-page region = 256 KiB clone + 256 KiB offmap; with MAX_PG=16 that's bounded but
+  not trivial; clones are hidden by M2/M2.1).
+- start-pages with NO clean end within 64 pages: **258 / 2,661 = 9.70%** → those methods can't be
+  region-cloned and would fall back to the in-place (detectable) hook.
+
+**Combined offline verdict: DBI-on-oat is feasible for ~90% of AOT methods** (instruction types
+100% handled; clean region findable for 90.3%). The ~10% uncloneable tail needs a fallback — the
+HWBP `hwhookto` entry-only redirect (README "multi-slot hwhookto"), or accept in-place for those.
+
+### Remaining: step 3 — execution (the only true proof)
+
+Execute a cloned oat region inside an ART process and confirm correct behavior (call-original via
+the clone + neighbor methods run correctly). Needs the DoHook integration + a Java hook in the
+gated process. The cheap offline steps (1, 1.5) found no blocker, so the integration is worth
+building; validate DBI-on-oat execution as its FIRST integration test before trusting the rest.
