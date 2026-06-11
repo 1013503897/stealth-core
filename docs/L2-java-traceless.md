@@ -99,3 +99,59 @@ Result: M's ArtMethod is byte-identical to an unhooked method; M's oat bytes are
 First concrete step next session: pick a definitely-AOT framework method in the manager host,
 read its `GetEntryPoint()`, confirm it lands in boot.oat and which clean-bounded region — then
 wire the `kpm_java_hook` glue for L2a.
+
+## Implementation findings (from reading DoHook + the glue, 2026-06-11)
+
+Read of `lsplant.cc:528 DoHook`, the KPM glue `stealth-poc/lib/kpmhook.c`, and
+`hook_helper.hpp:171`. Three findings that change the implementation:
+
+1. **The glue already does L2a — no glue change.** `kpm_inline_hooker(target, hooker)`
+   (kpmhook.c:323) finds/builds the clean-bounded region containing `target`, DBI-clones it,
+   sends `pghook` with override `(target-base) → hooker`, and returns the **in-clone faithful
+   copy** of target. For L2a: `kpm_inline_hooker(M.GetEntryPoint(), trampoline)`. Done.
+
+2. **CALL-ORIGINAL RECURSION TRAP (critical).** LSPlant's `backup` ArtMethod normally gets
+   target's *original* entry via `BackupTo` (art_method.cxx:169), so calling backup runs M's
+   real code. In the traceless path that's WRONG: M's oat entry is now KPM-trapped (the UXN
+   trap fires for ANY execution reaching that address, whatever ArtMethod points there), so
+   calling backup → faults → reroutes to the trampoline → **infinite recursion**. Fix: point
+   backup at the **in-clone copy** returned by `kpm_inline_hooker` (the clone is NOT trapped),
+   i.e. `backup->CopyFrom(target); backup->SetEntryPoint(clone_backup); backup->SetNonCompilable();`.
+   Target itself stays 100% pristine (no BackupTo, no SetNonCompilable, no SetEntryPoint on it).
+
+3. **Cannot reuse `info_.inline_hooker` for L2a.** That callback (used by HookHandler,
+   hook_helper.hpp:171) routes through Vector's `HookInline`, which **falls back to DobbyHook**
+   when the KPM path returns null. For a Java method that fallback would *patch the shared,
+   CoW boot.oat page* — both detectable (CRC) AND corrupting (the page is shared across procs
+   via the page cache; an inline patch there is catastrophic). So DoHook needs a **KPM-ONLY**
+   hooker (no Dobby fallback) whose failure falls back to LSPlant's normal *in-place* hook, not
+   to Dobby. That means a new `InitInfo` field (e.g. `kpm_only_hooker`) stored globally at Init
+   and called by DoHook — a multi-file change (lsplant.hpp InitInfo + Vector Init wiring + DoHook).
+
+**Guarded DoHook shape** (compile-time `LSPLANT_KPM_TRACELESS_L2`, default OFF so the verified
+L1 path is untouched; KPM failure falls back to the existing in-place hook):
+```
+auto *entrypoint = GenerateTrampolineFor(hook);            // unchanged
+#ifdef LSPLANT_KPM_TRACELESS_L2
+if (kpm_hook_init()==0) {
+    void *qc = target->GetEntryPoint();                    // READ, no write
+    if (void *clone_backup = kpm_only_hooker(qc, entrypoint)) {
+        backup->CopyFrom(target);
+        backup->SetEntryPoint(clone_backup);               // call-original via clone (no re-fault)
+        backup->SetNonCompilable();
+        if (!backup->IsStatic()) backup->SetPrivate();
+        return true;                                       // target ArtMethod untouched
+    }
+}
+#endif
+target->BackupTo(backup); target->SetNonCompilable(); target->SetEntryPoint(entrypoint); // default
+```
+
+**Unvalidated risk — DBI on oat code.** `dbi_recompile_range` (lib/dbi) was verified on
+libart.so `.text` + a synthetic span fn, NOT on dex2oat output. The clone is used for (a)
+neighbor methods sharing M's region and (b) call-original — both need a faithful oat recompile.
+dex2oat code may use addressing/runtime-register patterns the DBI doesn't preserve. **This is
+only testable INSIDE an ART process** (boot.oat is not mapped into a standalone native test
+binary), so L2 has no isolated PoC — it must be validated via the Vector/LSPlant integration
+with a real Java hook in the gated process. Validate DBI-on-oat (clone of a real oat region
+executes correctly) as the FIRST integration test, before trusting call-original/neighbors.
