@@ -189,9 +189,26 @@ the boot.oat exec segment (2,661 pages):
 100% handled; clean region findable for 90.3%). The ~10% uncloneable tail needs a fallback — the
 HWBP `hwhookto` entry-only redirect (README "multi-slot hwhookto"), or accept in-place for those.
 
-### Remaining: step 3 — execution (the only true proof)
+### Step 3 — execution VALIDATED on device (2026-06-11) ✅
 
-Execute a cloned oat region inside an ART process and confirm correct behavior (call-original via
-the clone + neighbor methods run correctly). Needs the DoHook integration + a Java hook in the
-gated process. The cheap offline steps (1, 1.5) found no blocker, so the integration is worth
-building; validate DBI-on-oat execution as its FIRST integration test before trusting the rest.
+The DoHook integration is built (LSPlant InitInfo `traceless_inline_hooker` + the DoHook fork +
+Vector wiring, runtime-gated by `persist.kpmhook.l2=1`; Vector commit 95d18ccb on mine/master,
+the lsplant submodule change 9dc3d68 is LOCAL-only — its sole remote is the public upstream).
+The manager process hooks no Java methods, so a gated native self-test (`persist.kpmhook.l2test=1`,
+`module.cpp RunL2SelfTest`) traps `java.lang.Math.max`'s compiled oat region via `kpm_inline_hooker`
+and exercises the mechanism on real dex2oat code. **All four checks PASS** on the Pixel 6 manager
+host (maxQc=0x710d4220, in boot.oat):
+
+- **trap+redirect**: `max(5,9)` returns 0x7777 (the stub) — the kernel UXN trap on the oat page
+  reroutes the method's entry. ✓
+- **clone executes**: the in-clone copy of max (invoked via min's entry) returns 9 — **the DBI
+  faithfully recompiled and executed real oat code**. The linchpin risk is empirically retired. ✓
+- **ArtMethod pristine**: `entry_point` 0x710d4220 unchanged before/after — no pointer-roaming/flag
+  mutation. ✓
+- **post-unhook**: `max(5,9)`=9 again — clean teardown. ✓
+
+No crash (manager survived). L1 path unaffected (npg=6 with L2 off). **L2a is proven end-to-end.**
+Remaining for productionizing: exercise the full `lsplant::Hook` DoHook path against a real Xposed
+Java hook in a gated app (the self-test exercises `kpm_inline_hooker` directly); L2b JIT-move
+follow; L2c interpreter path; KPM dead-process region GC (repeated force-stops leak regions until
+MAX_PG, cleared by reboot); and a private remote for the lsplant submodule (currently local-only).
