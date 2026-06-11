@@ -1335,6 +1335,37 @@ static long do_pagehook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t ma
     return rc;
 }
 
+/* GC region slots whose owning process has exited (find_get_task_by_vpid -> NULL). Runs in
+ * the serialized, sleepable supercall context (do_pghook / `pggc`), so it can vfree and never
+ * races do_pghook. Safe vs before_pf: a dead slot's offmap is only ever dereferenced after the
+ * `s->pid == current tgid` check, which a dead pid can't pass, and the dead process isn't
+ * faulting -- so freeing it can't UAF a live reader. (Without this, processes that exit leak
+ * their region slots until MAX_PG fills and new hooks fall back to DETECTABLE Dobby/in-place.)
+ * Note: leaks one task ref per LIVE gated process scanned (put_task_struct is inline/unexposed);
+ * negligible since this only runs when the table is full / on demand. */
+static int gc_dead_slots_locked(void)
+{
+    int freed = 0;
+    for (int i = 0; i < MAX_PG; i++) {
+        struct pghook *s = &g_pg[i];
+        if (!s->active) continue;
+        void *task = fn_find_get_task_by_vpid ? fn_find_get_task_by_vpid(s->pid) : 0;
+        if (!is_err_or_null(task)) continue; /* alive (ref leaked -- rare, acceptable) */
+        s->active = 0;                        /* publish inert before freeing (before_pf skips) */
+        s->npages = 0;
+        if (s->offmap && fn_vfree) fn_vfree(s->offmap);
+        s->offmap = 0;
+        s->mm = 0;
+        if (g_npg > 0) g_npg--;
+        freed++;
+    }
+    if (freed) {
+        maybe_unhook_pf();
+        maybe_unhook_maps();
+    }
+    return freed;
+}
+
 /* pghook: add ONE page to the multi-page hook table. Routing is identical to
  * pagehook (whole-page clone via per-slot offset_map + optional single-fn entry
  * override), but several pages can be armed simultaneously -- this is what an
@@ -1412,7 +1443,14 @@ static long do_pghook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t mapa
             break;
         }
     if (si < 0) {
-        apps(p, e, "error: hook table full\n");
+        /* table full -- reap slots whose process exited, then retry (else this hook would fall
+         * back to DETECTABLE Dobby/in-place, breaking tracelessness) */
+        if (gc_dead_slots_locked() > 0)
+            for (int i = 0; i < MAX_PG; i++)
+                if (!g_pg[i].active) { si = i; break; }
+    }
+    if (si < 0) {
+        apps(p, e, "error: hook table full (no dead slots to reap)\n");
         return -1;
     }
     struct pghook *s = &g_pg[si];
@@ -1878,6 +1916,13 @@ static long shpte_run(const char *args, char *buf, int bufcap)
                 rc = -1;
         else
             rc = do_pagehook(pid, page, clone, map, n, toff, rep, p, e);
+    } else if (starts(a, "pggc")) {
+        int n = gc_dead_slots_locked();
+        p = apps(p, e, "ok: pggc reaped ");
+        p = appdec(p, e, n);
+        p = apps(p, e, " dead slots, npg=");
+        p = appdec(p, e, g_npg);
+        apps(p, e, "\n");
     } else if (starts(a, "pgdisarm")) {
         rc = do_pgdisarm(p, e);
     } else if (starts(a, "pgunhook")) {
