@@ -208,7 +208,28 @@ host (maxQc=0x710d4220, in boot.oat):
 - **post-unhook**: `max(5,9)`=9 again — clean teardown. ✓
 
 No crash (manager survived). L1 path unaffected (npg=6 with L2 off). **L2a is proven end-to-end.**
-Remaining for productionizing: exercise the full `lsplant::Hook` DoHook path against a real Xposed
-Java hook in a gated app (the self-test exercises `kpm_inline_hooker` directly); L2b JIT-move
-follow; L2c interpreter path; KPM dead-process region GC (repeated force-stops leak regions until
-MAX_PG, cleared by reboot); and a private remote for the lsplant submodule (currently local-only).
+
+### Step 4 — full DoHook path on a REAL app (2026-06-11) ✅ + a safety fix
+
+Found `com.android.hookdemo` (a hook-demo app Vector injects into, with real Xposed Java hooks).
+Temporarily gated it (compile-time, since an untrusted_app can't read a custom persist prop) and
+enabled `persist.kpmhook.l2=1`. Results:
+- **L1 traceless works in a real app too**: hookdemo's native libart hooks routed through the KPM
+  (7 region clones, redirects in the millions), no crash, no Dobby fallback.
+- **The full `lsplant::Hook → DoHook → traceless_inline_hooker` path fired** (logged `Traceless hook:
+  target(...) entry=... kept PRISTINE; qc trapped -> trampoline; backup -> clone`): the LSPlant
+  trampoline works as the KPM reroute target, ArtMethod left pristine. **Goal achieved.**
+- **Safety bug found + fixed**: many framework methods (`Thread.dispatchUncaughtException`,
+  `DexFile.openInMemoryDexFiles`, ...) are NOT individually AOT-compiled — they share an nterp/bridge
+  stub that LIVES IN boot.oat, so the "qc in an oat region" guard alone wrongly accepted it. Trapping
+  a shared stub reroutes every method using it (killed the app, pid 9154, signal 9). Fix
+  (`module.cpp QcIsTraceable`): also require a sane `OatQuickMethodHeader.code_size` at qc-4 (a shared
+  stub's qc-4 is an instruction word, far above any real method) → stubs/interp/JIT fall back to the
+  in-place hook. Re-verified: hookdemo stable with l2=1, all 8 framework hooks fall back
+  (traceless=0, in-place=8), no crash/ANR. Vector `3cc30f8d` on mine.
+
+**Remaining for productionizing:** L2b JIT-move follow (a traceless-hooked method that later gets
+JIT-compiled moves its entry off the trapped page → hook goes stale; re-trap via the existing L1 ART
+JIT hook-points); L2c interpreter/nterp (most framework methods — currently fall back, correct but
+not traceless); KPM dead-process region GC (repeated kills leak regions until MAX_PG, reboot clears);
+a per-app gate so REAL target apps (not just com.android.shell) engage the KPM.
