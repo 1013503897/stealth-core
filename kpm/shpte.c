@@ -112,6 +112,7 @@ static int (*fn_task_pid_nr_ns)(void *task, int type, void *ns) = 0;
 static int (*fn_access_process_vm)(void *tsk, unsigned long addr, void *buf, int len, unsigned int flags) = 0;
 static void *g_addr_pf = 0;        /* do_page_fault */
 static void *g_addr_show_map = 0;  /* show_map (/proc/pid/maps per-VMA) */
+static void *g_addr_show_smap = 0; /* show_smap (/proc/pid/smaps per-VMA, same sig as show_map) */
 static void *g_addr_status = 0;    /* proc_pid_status (/proc/pid/status) */
 /* int apply_to_page_range(mm, addr, size, pte_fn_t fn, void *data) -- allocating */
 static int (*fn_apply)(void *mm, unsigned long addr, unsigned long size, void *fn, void *data) = 0;
@@ -199,6 +200,10 @@ static volatile long g_redirects = 0;
 static volatile int g_maps_hooked = 0;
 static volatile uint64_t g_hide_page = 0; /* VMA vm_start to drop from maps */
 static volatile long g_maps_hidden = 0;
+/* smaps shares the maps-hide callbacks (show_smap has the same (seq_file*, vma*)
+ * signature) -- armed together with show_map; separate counter for telemetry */
+static volatile int g_smaps_hooked = 0;
+static volatile long g_smaps_hidden = 0;
 /* TracerPid spoof state (anti-debug / anti-ptrace-detection) */
 static volatile int g_tracer_hooked = 0;
 static volatile long g_tracer_spoofed = 0;
@@ -458,35 +463,34 @@ static void maybe_unhook_pf(void)
     }
 }
 
-/* ---- P4.1: hide the clone VMA from /proc/pid/maps ----
- * show_map(struct seq_file *m, void *v): v is the vm_area_struct being printed.
+/* ---- P4.1: hide the clone VMA from /proc/pid/{maps,smaps} ----
+ * show_map / show_smap (struct seq_file *m, void *v): v is the vm_area_struct being
+ * printed (smaps writes the same header line + per-VMA stats in one show() call).
  * before: snapshot m->count; after: if this VMA is our clone, rewind m->count
- * (dropping the just-written line) + SEQ_SKIP, so the entry never appears. */
+ * (dropping the whole just-written entry) + SEQ_SKIP, so it never appears. */
 static void before_showmap(hook_fargs2_t *fargs, void *udata)
 {
     (void)udata;
-    if (!g_maps_hooked) return;
+    if (!g_maps_hooked && !g_smaps_hooked) return;
     void *m = (void *)fargs->arg0;
     fargs->local.data0 = *(volatile uint64_t *)((char *)m + SEQ_COUNT_OFF);
 }
-static void after_showmap(hook_fargs2_t *fargs, void *udata)
+/* shared core: returns 1 (and rewinds the seq entry) if `vma` is one of our clones.
+ * Gate on the vma's OWNER mm (not the reader): hides the clone whether the host scans
+ * its own /proc/self/{maps,smaps} OR an external process scans /proc/<host>/..., while a
+ * DIFFERENT process that merely shares the same library VA (zygote-forked apps all map
+ * libart around here) keeps its line -- no cross-process maps corruption. */
+static int maps_hide_vma(hook_fargs2_t *fargs)
 {
-    (void)udata;
-    if (!g_maps_hooked) return;
     void *vma = (void *)fargs->arg1;
-    if (!vma) return;
+    if (!vma) return 0;
     uint64_t vm_start = *(volatile uint64_t *)((char *)vma + VMA_START_OFF);
 
     int hit = 0;
     /* legacy single-page redirect clone (manual `hidemaps`, P4.1 demo) */
     if (g_hide_page && vm_start == g_hide_page) hit = 1;
     /* auto-hide: any active pghook region clone. The hide-set IS the g_pg[] table --
-     * a clone is hidden the moment its region is armed and revealed when it disarms,
-     * so hiding is intrinsic to arming and the glue needs no extra supercall. Gate on
-     * the vma's OWNER mm (not the reader): this hides the clone whether the host scans
-     * its own /proc/self/maps OR an external process scans /proc/<host>/maps, while a
-     * DIFFERENT process that merely shares the same library VA (zygote-forked apps all
-     * map libart around here) keeps its line -- no cross-process maps corruption. */
+     * a clone is hidden the moment its region is armed and revealed when it disarms. */
     if (!hit && g_npg > 0) {
         void *vmm = *(void *volatile *)((char *)vma + VMA_VM_MM_OFF);
         for (int i = 0; i < MAX_PG; i++) {
@@ -497,19 +501,32 @@ static void after_showmap(hook_fargs2_t *fargs, void *udata)
             break;
         }
     }
-    if (!hit) return;
+    if (!hit) return 0;
 
     void *m = (void *)fargs->arg0;
     *(volatile uint64_t *)((char *)m + SEQ_COUNT_OFF) = fargs->local.data0; /* rewind */
     *(volatile uint64_t *)((char *)m + SEQ_PAD_OFF) = 0;                    /* pad_until=0 */
     fargs->ret = SEQ_SKIP;
-    g_maps_hidden++;
+    return 1;
+}
+static void after_showmap(hook_fargs2_t *fargs, void *udata)
+{
+    (void)udata;
+    if (!g_maps_hooked) return;
+    if (maps_hide_vma(fargs)) g_maps_hidden++;
+}
+static void after_showsmap(hook_fargs2_t *fargs, void *udata)
+{
+    (void)udata;
+    if (!g_smaps_hooked) return;
+    if (maps_hide_vma(fargs)) g_smaps_hidden++;
 }
 
-/* show_map hide-hook lifecycle, ref-counted by (g_npg, g_hide_page): install on the
- * first armed pghook region (or manual hidemaps), remove only when the last region
- * disarms AND no manual hidemaps is active. Runs in the sleepable supercall/bridge
- * context (same as do_pghook's ensure_pf_hooked), so inline-patching show_map is safe. */
+/* {show_map, show_smap} hide-hook lifecycle, ref-counted by (g_npg, g_hide_page):
+ * install on the first armed pghook region (or manual hidemaps), remove only when the
+ * last region disarms AND no manual hidemaps is active. Runs in the sleepable
+ * supercall/bridge context (same as do_pghook's ensure_pf_hooked), so inline-patching
+ * is safe. smaps is best-effort: if show_smap won't resolve/hook, maps is still hidden. */
 static int ensure_maps_hooked(void)
 {
     if (g_maps_hooked) return 0;
@@ -518,11 +535,23 @@ static int ensure_maps_hooked(void)
     if (hook_wrap2(g_addr_show_map, (void *)before_showmap, (void *)after_showmap, 0) != HOOK_NO_ERR)
         return -1;
     g_maps_hooked = 1;
+    /* also hide from /proc/pid/smaps (same VMA, same callbacks) -- best effort */
+    if (!g_smaps_hooked) {
+        if (!g_addr_show_smap) g_addr_show_smap = (void *)kallsyms_lookup_name("show_smap");
+        if (g_addr_show_smap &&
+            hook_wrap2(g_addr_show_smap, (void *)before_showmap, (void *)after_showsmap, 0) == HOOK_NO_ERR)
+            g_smaps_hooked = 1;
+    }
     return 0;
 }
 static void maybe_unhook_maps(void)
 {
-    if (g_maps_hooked && g_npg == 0 && !g_hide_page && g_addr_show_map) {
+    if (g_npg != 0 || g_hide_page) return; /* still needed */
+    if (g_smaps_hooked && g_addr_show_smap) {
+        hook_unwrap(g_addr_show_smap, (void *)before_showmap, (void *)after_showsmap);
+        g_smaps_hooked = 0;
+    }
+    if (g_maps_hooked && g_addr_show_map) {
         hook_unwrap(g_addr_show_map, (void *)before_showmap, (void *)after_showmap);
         g_maps_hooked = 0;
     }
@@ -580,6 +609,7 @@ static void resolve_syms(void)
     if (!fn_access_process_vm) fn_access_process_vm = (void *)kallsyms_lookup_name("access_process_vm");
     if (!g_addr_pf) g_addr_pf = (void *)kallsyms_lookup_name("do_page_fault");
     if (!g_addr_show_map) g_addr_show_map = (void *)kallsyms_lookup_name("show_map");
+    if (!g_addr_show_smap) g_addr_show_smap = (void *)kallsyms_lookup_name("show_smap");
     if (!g_addr_status) g_addr_status = (void *)kallsyms_lookup_name("proc_pid_status");
     if (!fn_apply) fn_apply = (void *)kallsyms_lookup_name("apply_to_page_range");
     if (!fn_vmalloc) fn_vmalloc = (void *)kallsyms_lookup_name("vmalloc");
@@ -1651,6 +1681,10 @@ static long do_state(char *p, char *e)
     p = apphex(p, e, g_hide_page);
     p = apps(p, e, " maps_hidden=");
     p = appdec(p, e, g_maps_hidden);
+    p = apps(p, e, " smaps_hooked=");
+    p = appdec(p, e, g_smaps_hooked);
+    p = apps(p, e, " smaps_hidden=");
+    p = appdec(p, e, g_smaps_hidden);
     p = apps(p, e, " tracer_spoof=");
     p = appdec(p, e, g_tracer_hooked);
     p = apps(p, e, " ghost_va=");
@@ -2017,6 +2051,10 @@ static long shpte_exit(void *__user reserved)
     if (g_pf_hooked && g_addr_pf) {
         hook_unwrap(g_addr_pf, (void *)before_pf, 0);
         g_pf_hooked = 0;
+    }
+    if (g_smaps_hooked && g_addr_show_smap) {
+        hook_unwrap(g_addr_show_smap, (void *)before_showmap, (void *)after_showsmap);
+        g_smaps_hooked = 0;
     }
     if (g_maps_hooked && g_addr_show_map) {
         hook_unwrap(g_addr_show_map, (void *)before_showmap, (void *)after_showmap);
