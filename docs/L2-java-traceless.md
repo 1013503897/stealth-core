@@ -150,8 +150,27 @@ target->BackupTo(backup); target->SetNonCompilable(); target->SetEntryPoint(entr
 **Unvalidated risk — DBI on oat code.** `dbi_recompile_range` (lib/dbi) was verified on
 libart.so `.text` + a synthetic span fn, NOT on dex2oat output. The clone is used for (a)
 neighbor methods sharing M's region and (b) call-original — both need a faithful oat recompile.
-dex2oat code may use addressing/runtime-register patterns the DBI doesn't preserve. **This is
-only testable INSIDE an ART process** (boot.oat is not mapped into a standalone native test
-binary), so L2 has no isolated PoC — it must be validated via the Vector/LSPlant integration
-with a real Java hook in the gated process. Validate DBI-on-oat (clone of a real oat region
-executes correctly) as the FIRST integration test, before trusting call-original/neighbors.
+dex2oat code may use addressing/runtime-register patterns the DBI doesn't preserve.
+
+### DBI-on-oat validation step 1 — instruction-type census (2026-06-11, `kpm/oat_census.py`)
+
+Pulled the device's `boot.oat` (14.6 MB ELF) and censused its PF_X segment (10.6 MB,
+**2,725,478** arm64 instructions). Result strongly POSITIVE for DBI feasibility:
+
+| bucket | share | DBI |
+|---|---|---|
+| PC-relative the DBI **rewrites** (ADRP 6.15, CBZ/CBNZ 3.33, B 2.80, B.cond 2.42, BL 0.87, TBZ 0.22, LDR-lit 0.03, ADR 0.00) | **15.83%** | handled |
+| PC-independent verbatim (BLR 7.26, BR, RET 1.09, loads/stores/ALU 75.82) | ~84% | verbatim-OK |
+| **PAC indirect call/jump `BLRAA*`/`BRAA*`** (the P3.5 verbatim-passthrough gap) | **0.000%** | n/a — NONE present |
+
+Key: this image emits **no PAC** at all (no BLRAA*/BRAA*, no paciasp/retaa) despite the Pixel 6
+supporting ARMv8.3 PAC — so the one known DBI gap is NOT triggered. Every PC-relative type
+present is already rewritten; everything else is PC-independent and safe verbatim. **No
+instruction type in this oat would be mis-handled.**
+
+CAVEAT: this is static TYPE coverage, not execution proof. Two validations remain:
+(step 2, offline, cheap) run `dbi_recompile_range` on real oat regions at their runtime VA and
+confirm it succeeds (rewrite logic + clean-boundary availability within MAX_RGN=64 — oat may be
+denser than libart) — the DBI is host-runnable (`lib/build_dbi_test.ps1`); (step 3, integration)
+execute a cloned oat region inside an ART process and confirm correct behavior (the only true
+proof; needs the DoHook integration + a Java hook in the gated process).
