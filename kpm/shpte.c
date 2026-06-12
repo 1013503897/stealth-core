@@ -57,6 +57,7 @@ KPM_DESCRIPTION("P2/P3/P4: UXN redirect + maps hide + VMA-less ghost memory");
 #define SEQ_COUNT_OFF 24
 #define SEQ_PAD_OFF 32
 #define VMA_START_OFF 0
+#define VMA_END_OFF 8
 #define VMA_VM_MM_OFF 16
 #define SEQ_SKIP 1
 
@@ -501,12 +502,19 @@ static int maps_hide_vma(hook_fargs2_t *fargs)
     /* legacy single-page redirect clone (manual `hidemaps`, P4.1 demo) */
     if (g_hide_page && vm_start == g_hide_page) hit = 1;
     /* auto-hide: any active pghook region clone. The hide-set IS the g_pg[] table --
-     * a clone is hidden the moment its region is armed and revealed when it disarms. */
+     * a clone is hidden the moment its region is armed and revealed when it disarms.
+     * Match by RANGE (clone within [vm_start,vm_end)), NOT vm_start==clone: the kernel
+     * MERGES an anon r-xp clone with an adjacent anon r-xp VMA, so the merged VMA's start
+     * can sit a page below the registered clone addr -- an exact-start match would leak the
+     * whole merged VMA (the residual S2 anon-r-xp the in-app probe flags). The containing VMA
+     * is all-ours anon r-xp (nothing legit is anon r-xp under W^X), so hiding it whole is safe. */
     if (!hit && g_npg > 0) {
         void *vmm = *(void *volatile *)((char *)vma + VMA_VM_MM_OFF);
+        uint64_t vm_end = *(volatile uint64_t *)((char *)vma + VMA_END_OFF);
         for (int i = 0; i < MAX_PG; i++) {
             struct pghook *s = &g_pg[i];
-            if (!s->active || !s->clone || s->clone != vm_start) continue;
+            if (!s->active || !s->clone) continue;
+            if ((uint64_t)s->clone < vm_start || (uint64_t)s->clone >= vm_end) continue;
             if (s->mm && vmm != s->mm) continue; /* vma must belong to the host's mm */
             hit = 1;
             break;
