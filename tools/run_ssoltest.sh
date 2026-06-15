@@ -9,6 +9,7 @@ GO=/data/local/tmp/ssol_go
 OUT=/data/local/tmp/ssoltarget.out
 XOL_ADD=0x5550000000
 XOL_MIX=0x5560000000
+XOL_IND=0x5570000000
 
 rm -f "$GO" "$OUT"
 "$TGT" "$GO" > "$OUT" 2>&1 &
@@ -18,12 +19,15 @@ for i in $(seq 1 50); do grep -q '^xol_va=' "$OUT" && break; sleep 0.1; done
 PID=$(sed -n 's/^pid=//p' "$OUT")
 ADD=$(sed -n 's/^ssol_add=//p' "$OUT")
 MIX=$(sed -n 's/^ssol_mix=//p' "$OUT")
-echo "[driver] pid=$PID ssol_add=$ADD ssol_mix=$MIX"
+IND=$(sed -n 's/^ssol_indirect=//p' "$OUT")
+echo "[driver] pid=$PID ssol_add=$ADD ssol_mix=$MIX ssol_indirect=$IND"
 
 echo "[driver] arming ssoltest on ssol_add ..."
 timeout 10 "$SHCTL" "$KEY" control shpte "ssoltest $PID $ADD 1 $XOL_ADD"
 echo "[driver] arming ssoltest on ssol_mix ..."
 timeout 10 "$SHCTL" "$KEY" control shpte "ssoltest $PID $MIX 1 $XOL_MIX"
+echo "[driver] arming ssoltest on ssol_indirect ..."
+timeout 10 "$SHCTL" "$KEY" control shpte "ssoltest $PID $IND 1 $XOL_IND"
 
 echo "[driver] signalling target ..."
 touch "$GO"

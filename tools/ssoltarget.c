@@ -35,7 +35,28 @@ __attribute__((aligned(4096), noinline)) long ssol_mix(int n)
     return sum;
 }
 
-/* push whatever the linker places next off ssol_mix's page */
+/* page-isolated leaf callees (own pages, NOT trapped -> run native) */
+__attribute__((aligned(4096), noinline)) int leaf_a(int x) { return x + 7; }
+__attribute__((aligned(4096), noinline)) int leaf_b(int x) { return x * 3; }
+
+/* indirect-call heavy: BLR via volatile fn pointers -- the clone's "problem 2"
+ * pattern (calls OUT of the trapped page). Under SSOL the BLR is simulated
+ * (pc=original target, x30=original orig+4), the callee runs native and RETs back
+ * INTO the trapped page (faults -> SSOL continues). LR is an ORIGINAL address
+ * throughout -> no clone return addresses on the stack (what broke the clone). */
+__attribute__((aligned(4096), noinline)) int ssol_indirect(int n)
+{
+    int (*volatile fa)(int) = leaf_a;
+    int (*volatile fb)(int) = leaf_b;
+    int acc = n;
+    for (int i = 0; i < 3; i++) {
+        acc = fa(acc);
+        acc = fb(acc);
+    }
+    return acc;
+}
+
+/* push whatever the linker places next off the last function's page */
 __attribute__((aligned(4096))) volatile char _pad[4096] = {0};
 
 static int file_exists(const char *p)
@@ -52,6 +73,7 @@ int main(int argc, char **argv)
     printf("pid=%d\n", getpid());
     printf("ssol_add=%p\n", (void *)&ssol_add);
     printf("ssol_mix=%p\n", (void *)&ssol_mix);
+    printf("ssol_indirect=%p\n", (void *)&ssol_indirect);
     printf("xol_va=0x5550000000\n");
     printf("go_file=%s\n", go);
     fflush(stdout);
@@ -65,11 +87,13 @@ int main(int argc, char **argv)
 
     int r1 = ssol_add(3, 4);
     long r2 = ssol_mix(100);
+    int r3 = ssol_indirect(1);
     long e2 = (long)(100 * 101 / 2) + (long)0x1234567890ABCDEFLL;
 
     printf("ssol_add(3,4)=%d expect=7 %s\n", r1, r1 == 7 ? "PASS" : "FAIL");
     printf("ssol_mix(100)=%ld expect=%ld %s\n", r2, e2, r2 == e2 ? "PASS" : "FAIL");
+    printf("ssol_indirect(1)=%d expect=300 %s\n", r3, r3 == 300 ? "PASS" : "FAIL");
     printf("DONE\n");
     fflush(stdout);
-    return (r1 == 7 && r2 == e2) ? 0 : 1;
+    return (r1 == 7 && r2 == e2 && r3 == 300) ? 0 : 1;
 }
