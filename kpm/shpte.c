@@ -380,9 +380,30 @@ static int resolve_pte(uint64_t pid, uint64_t base, struct pte_out *o)
 
 enum ssol_action { SSOL_SIMULATED = 0, SSOL_XOL = 1 };
 
-/* P1a: plain reads (function not yet wired). P1b: PAN-safe user reads. */
-static uint32_t ssol_rd32(uintptr_t a) { return *(volatile uint32_t *)a; }
-static uint64_t ssol_rd64(uintptr_t a) { return *(volatile uint64_t *)a; }
+/* LDR-literal pool reads come from the trapped region's kernel-side instruction
+ * snapshot (set by before_pf right before each ssol_simulate call) -- so the fault
+ * path never does a PAN-unsafe user deref. Out-of-region literals return 0 (P1 keeps
+ * literals in-region; P2 adds a PAN-safe user read for cross-region pools). NOTE:
+ * these globals are single-fault-at-a-time correct; concurrent faults on different
+ * CPUs would race them -- fine for the P1 single-thread self-test, made per-fault
+ * safe in P2. */
+static const uint32_t *volatile g_rd_insns = 0;
+static volatile uint64_t g_rd_base = 0;
+static volatile int g_rd_n = 0;
+static uint32_t ssol_rd32(uintptr_t a)
+{
+    if (g_rd_insns && a >= g_rd_base && a + 4 <= g_rd_base + (uint64_t)g_rd_n * 4)
+        return g_rd_insns[(a - g_rd_base) / 4];
+    return 0;
+}
+static uint64_t ssol_rd64(uintptr_t a)
+{
+    if (g_rd_insns && a >= g_rd_base && a + 8 <= g_rd_base + (uint64_t)g_rd_n * 4) {
+        uint64_t i = (a - g_rd_base) / 4;
+        return (uint64_t)g_rd_insns[i] | ((uint64_t)g_rd_insns[i + 1] << 32);
+    }
+    return 0;
+}
 
 static int64_t ssol_sext(int64_t v, int bits) { int s = 64 - bits; return (v << s) >> s; }
 
@@ -558,6 +579,31 @@ static volatile long g_step_fires = 0; /* total step exceptions we consumed */
 static volatile long g_selfstep_armed = 0;
 static volatile long g_selfstep_fired = 0;
 
+/* SSOL region table (separate from g_pg[] clone regions -> zero risk to the
+ * verified clone path). A region UXN-traps [page, page+npages) and routes every
+ * fault through simulate (PC-relative) or XOL+single-step (PC-independent). P1
+ * uses one region for the self-test. */
+#define MAX_SSOL_RGN 4
+struct ssol_rgn {
+    volatile int active;
+    int pid;            /* tgid gate */
+    void *mm;           /* equality-only (future maps-hide), never dereferenced */
+    uint64_t page;      /* region base */
+    int npages;
+    uint64_t entry;     /* hooked fn entry VA (0 = pure pass-through, P1 self-test) */
+    uint64_t replace;   /* entry override target (trampoline) */
+    uint32_t *insns;    /* vmalloc'd snapshot, npages*1024 words (insn + literal pool) */
+    uint64_t xol_kaddr; /* kernel alias of the scratch page (write copied insns here) */
+    uint64_t xol_va;    /* user VA of the scratch page (EL0 single-steps here) */
+    uint64_t *ptep[MAX_RGN];
+    uint64_t pte_orig[MAX_RGN];
+    volatile long n_sim, n_xol;
+};
+static struct ssol_rgn g_ssol[MAX_SSOL_RGN];
+static volatile int g_nssol = 0;
+
+static void sync_icache(void *addr, unsigned long size); /* defined below; used by the XOL copy */
+
 static struct ssol_ctx *ctx_by_tid(int tid)
 {
     for (int i = 0; i < MAX_SSOL_CTX; i++)
@@ -616,7 +662,7 @@ static void ssol_remove_step_hook(void)
 static void before_pf(hook_fargs3_t *fargs, void *udata)
 {
     (void)udata;
-    if (!g_armed && g_npg == 0) return;
+    if (!g_armed && g_npg == 0 && g_nssol == 0) return;
     uint64_t far = fargs->arg0;
     uint64_t fpage = far & ~0xfffUL;
     struct pt_regs *regs = (struct pt_regs *)fargs->arg2;
@@ -693,6 +739,72 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
             s->redirects++;
             fargs->skip_origin = 1;
             fargs->ret = 0;
+            return;
+        }
+    }
+
+    /* ---- SSOL regions (P1b-2): advance the ORIGINAL instruction stream via
+     * simulate (PC-relative) or XOL+single-step (PC-independent). No clone, no
+     * relocation -> ART-intact, no code/data interleaving issue. UXN stays armed
+     * throughout, so each original instruction faults in turn. ---- */
+    if (g_nssol > 0) {
+        for (int i = 0; i < MAX_SSOL_RGN; i++) {
+            struct ssol_rgn *s = &g_ssol[i];
+            if (!s->active) continue;
+            if (fpage < s->page || fpage >= s->page + (uint64_t)s->npages * 0x1000UL) continue;
+            if (fn_task_pid_nr_ns &&
+                fn_task_pid_nr_ns((void *)get_current(), PIDTYPE_TGID, 0) != s->pid)
+                continue; /* same VA in another process -> not our trap */
+            uint64_t roff = far - s->page;
+            uint32_t insn = s->insns[roff >> 2];
+
+            /* hooked-fn entry override (P1 self-test: entry==0 -> never matches) */
+            if (s->entry && far == s->entry && s->replace) {
+                regs->pc = s->replace;
+                fargs->skip_origin = 1;
+                fargs->ret = 0;
+                return;
+            }
+
+            /* PC-relative -> simulate in place (literal pool read from the snapshot) */
+            g_rd_base = s->page;
+            g_rd_insns = s->insns;
+            g_rd_n = s->npages * 1024;
+            if (ssol_simulate(regs, insn) == SSOL_SIMULATED) {
+                s->n_sim++;
+                fargs->skip_origin = 1;
+                fargs->ret = 0;
+                return; /* UXN stays set -> the next original insn faults again */
+            }
+
+            /* PC-independent -> XOL: copy the one insn to this thread's scratch slot,
+             * set pc there, arm a single step (uprobes flow). ssol_step_fn restores
+             * pc = far+4 after the one insn runs at EL0. */
+            if (s->xol_kaddr && g_step_registered && fn_user_enable_single_step) {
+                int tid = fn_task_pid_nr_ns ? fn_task_pid_nr_ns((void *)get_current(), PIDTYPE_PID, 0) : 0;
+                struct ssol_ctx *c = ctx_by_tid(tid);
+                if (!c) c = ctx_free();
+                if (c) {
+                    int slot = (int)(c - g_ctx);
+                    uint64_t koff = (uint64_t)slot * 8;
+                    *(volatile uint32_t *)(s->xol_kaddr + koff) = insn;
+                    *(volatile uint32_t *)(s->xol_kaddr + koff + 4) = 0xD4200000u; /* BRK #0 guard */
+                    sync_icache((void *)(s->xol_kaddr + koff), 8);
+                    c->tid = tid;
+                    c->kind = SSOL_K_XOL;
+                    c->resume_pc = far + 4;
+                    c->xol_va = s->xol_va + koff;
+                    c->active = 1;
+                    regs->pc = s->xol_va + koff;
+                    fn_user_enable_single_step((void *)get_current());
+                    s->n_xol++;
+                    fargs->skip_origin = 1;
+                    fargs->ret = 0;
+                    return;
+                }
+            }
+            /* couldn't XOL (no ctx / no scratch): let the real fault surface (visible
+             * failure) rather than silently spin on the UXN'd page. */
             return;
         }
     }
@@ -2115,6 +2227,219 @@ static long do_state(char *p, char *e)
     return 0;
 }
 
+/* inject a VMA-less executable scratch page at user VA `xol_va` in `mm`, exec attrs
+ * copied from `template_va` (the region's .text). Keeps the kernel alias in *kaddr_out
+ * so before_pf can write the copied insn PAN-free. Mirrors ghost_inject. */
+static int ssol_inject_xol(void *mm, uint64_t xol_va, uint64_t template_va, uint64_t *kaddr_out)
+{
+    xol_va &= ~0xFFFUL;
+    struct pte_out chk;
+    chk.n = 0;
+    chk.val = 0;
+    fn_apply_existing(mm, xol_va, 0x1000, (void *)pte_cb, &chk);
+    if (chk.n > 0 && (chk.val & PTE_VALID)) return -3; /* xol_va must be unmapped */
+    struct pte_out tpl;
+    tpl.n = 0;
+    tpl.val = 0;
+    fn_apply_existing(mm, template_va & ~0xFFFUL, 0x1000, (void *)pte_cb, &tpl);
+    if (tpl.n == 0 || !(tpl.val & PTE_VALID)) return -4;
+    uint64_t attrs = tpl.val & ~PFN_MASK; /* exec attrs from the .text page */
+    void *kaddr = fn_vmalloc(0x1000);
+    if (is_err_or_null(kaddr)) return -5;
+    for (int i = 0; i < 0x1000; i++) ((volatile char *)kaddr)[i] = 0;
+    sync_icache(kaddr, 0x1000);
+    uint64_t pfn = fn_vmalloc_to_pfn(kaddr);
+    uint64_t pte_val = ((pfn << 12) & PFN_MASK) | attrs;
+    if (fn_apply(mm, xol_va, 0x1000, (void *)inject_cb, &pte_val)) {
+        fn_vfree(kaddr);
+        return -7;
+    }
+    flush_tlb_all();
+    *kaddr_out = (uint64_t)kaddr;
+    return 0;
+}
+
+/* ssoltest <pid> <func_va> <npages> <xol_va>: UXN-trap [func_page, +npages) as an
+ * SSOL region (pure pass-through, no entry override). The self-test process then
+ * calls the trapped function -- every instruction runs via simulate/XOL -- and
+ * checks the result. Tear down with `ssoldisarm`. */
+static long do_ssoltest(uint64_t pid, uint64_t func, uint64_t npages, uint64_t xol_va, char *p, char *e)
+{
+    resolve_syms();
+    if (!fn_access_process_vm || !fn_find_get_task_by_vpid || !fn_get_task_mm || !fn_mmput ||
+        !fn_apply_existing || !fn_apply || !fn_vmalloc || !fn_vfree || !fn_vmalloc_to_pfn || !g_addr_pf ||
+        !fn_task_pid_nr_ns || !fn_register_user_step_hook || !fn_user_enable_single_step) {
+        apps(p, e, "error: symbols not resolved (run probe)\n");
+        return -1;
+    }
+    if (npages == 0 || npages > (uint64_t)MAX_RGN) {
+        apps(p, e, "error: bad npages (1..MAX_RGN)\n");
+        return -1;
+    }
+    uint64_t page = func & ~0xFFFUL;
+    int si = -1;
+    for (int i = 0; i < MAX_SSOL_RGN; i++)
+        if (!g_ssol[i].active) {
+            si = i;
+            break;
+        }
+    if (si < 0) {
+        apps(p, e, "error: ssol region table full\n");
+        return -1;
+    }
+    struct ssol_rgn *s = &g_ssol[si];
+
+    void *task = fn_find_get_task_by_vpid((int)pid);
+    if (is_err_or_null(task)) {
+        apps(p, e, "error: task not found\n");
+        return -1;
+    }
+    void *mm = fn_get_task_mm(task);
+    if (is_err_or_null(mm)) {
+        apps(p, e, "error: get_task_mm failed\n");
+        return -1;
+    }
+    /* resolve + cache the leaf PTE of every region page (all must be present) */
+    uint64_t *ptep[MAX_RGN];
+    uint64_t pte_orig[MAX_RGN];
+    int ok = 1;
+    for (int j = 0; j < (int)npages; j++) {
+        struct pte_out o;
+        if (resolve_pte(pid, page + (uint64_t)j * 0x1000, &o) || !(o.val & PTE_VALID)) {
+            ok = 0;
+            break;
+        }
+        ptep[j] = (uint64_t *)o.ptep;
+        pte_orig[j] = o.val;
+    }
+    if (!ok) {
+        fn_mmput(mm);
+        apps(p, e, "error: a region page not present (run it first)\n");
+        return -1;
+    }
+    /* snapshot the region instructions into a kernel buffer (insn + literal pool) */
+    int want = (int)(npages * 0x1000);
+    uint32_t *insns = fn_vmalloc((unsigned long)want);
+    if (!insns) {
+        fn_mmput(mm);
+        apps(p, e, "error: snapshot vmalloc failed\n");
+        return -1;
+    }
+    if ((int)fn_access_process_vm(task, page, insns, want, 0) != want) {
+        fn_vfree(insns);
+        fn_mmput(mm);
+        apps(p, e, "error: snapshot read failed\n");
+        return -1;
+    }
+    /* inject the XOL scratch page (exec attrs from the region's .text) */
+    uint64_t xol_kaddr = 0;
+    int ir = ssol_inject_xol(mm, xol_va, page, &xol_kaddr);
+    fn_mmput(mm);
+    if (ir) {
+        fn_vfree(insns);
+        p = apps(p, e, "error: xol inject failed ir=");
+        p = appdec(p, e, ir);
+        apps(p, e, "\n");
+        return -1;
+    }
+    if (ensure_pf_hooked(p, e) != 0) {
+        fn_vfree(insns);
+        return -1;
+    }
+    if (ssol_ensure_step_hook()) {
+        fn_vfree(insns);
+        apps(p, e, "error: step hook register failed\n");
+        return -1;
+    }
+
+    s->pid = (int)pid;
+    s->mm = 0;
+    {
+        void *tmm = fn_get_task_mm(task);
+        if (!is_err_or_null(tmm)) {
+            s->mm = tmm;
+            fn_mmput(tmm);
+        }
+    }
+    s->page = page;
+    s->npages = (int)npages;
+    s->entry = 0;
+    s->replace = 0;
+    s->insns = insns;
+    s->xol_kaddr = xol_kaddr;
+    s->xol_va = xol_va & ~0xFFFUL;
+    for (int j = 0; j < (int)npages; j++) {
+        s->ptep[j] = ptep[j];
+        s->pte_orig[j] = pte_orig[j];
+    }
+    s->n_sim = 0;
+    s->n_xol = 0;
+    s->active = 1; /* publish before arming UXN */
+    g_nssol++;
+
+    for (int j = 0; j < (int)npages; j++)
+        *(volatile uint64_t *)s->ptep[j] = s->pte_orig[j] | PTE_UXN;
+    flush_tlb_all();
+
+    p = apps(p, e, "ok: ssoltest slot=");
+    p = appdec(p, e, si);
+    p = apps(p, e, " pid=");
+    p = appdec(p, e, (long)pid);
+    p = apps(p, e, " page=");
+    p = apphex(p, e, page);
+    p = apps(p, e, " npages=");
+    p = appdec(p, e, (long)npages);
+    p = apps(p, e, " xol_va=");
+    p = apphex(p, e, s->xol_va);
+    p = apps(p, e, " xol_kaddr=");
+    p = apphex(p, e, xol_kaddr);
+    p = apps(p, e, " nssol=");
+    p = appdec(p, e, g_nssol);
+    apps(p, e, "\n");
+    return 0;
+}
+
+/* ssoldisarm: restore UXN on every SSOL region, free snapshots + scratch pages. */
+static long do_ssoldisarm(char *p, char *e)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_SSOL_RGN; i++) {
+        struct ssol_rgn *s = &g_ssol[i];
+        if (!s->active) continue;
+        for (int j = 0; j < s->npages; j++)
+            if (s->ptep[j]) *(volatile uint64_t *)s->ptep[j] = s->pte_orig[j];
+        n++;
+    }
+    if (n) flush_tlb_all();
+    for (int i = 0; i < MAX_SSOL_RGN; i++) {
+        struct ssol_rgn *s = &g_ssol[i];
+        if (!s->active) continue;
+        s->active = 0;
+        if (s->insns && fn_vfree) fn_vfree(s->insns);
+        s->insns = 0;
+        if (s->xol_kaddr) {
+            void *task = fn_find_get_task_by_vpid ? fn_find_get_task_by_vpid(s->pid) : 0;
+            if (task && !is_err_or_null(task) && fn_get_task_mm) {
+                void *mm = fn_get_task_mm(task);
+                if (!is_err_or_null(mm)) {
+                    uint64_t zero = 0;
+                    fn_apply_existing(mm, s->xol_va, 0x1000, (void *)inject_cb, &zero);
+                    flush_tlb_all();
+                    fn_mmput(mm);
+                }
+            }
+            if (fn_vfree) fn_vfree((void *)s->xol_kaddr);
+            s->xol_kaddr = 0;
+        }
+    }
+    g_nssol = 0;
+    for (int i = 0; i < MAX_SSOL_CTX; i++) g_ctx[i].active = 0;
+    p = apps(p, e, "ok: ssoldisarm regions=");
+    p = appdec(p, e, n);
+    apps(p, e, "\n");
+    return 0;
+}
+
 /* P1b-1 self-test of the single-step primitive: arm ONE step on the CALLER (the
  * shctl/manager thread) via the exact uprobes flow. On return to EL0 the caller
  * single-steps one harmless instruction -> ssol_step_fn -> g_selfstep_fired++.
@@ -2175,6 +2500,24 @@ static long do_ssolstat(char *p, char *e)
     p = appdec(p, e, g_step_fires);
     p = apps(p, e, " ctx_active=");
     p = appdec(p, e, nctx);
+    p = apps(p, e, " nssol=");
+    p = appdec(p, e, g_nssol);
+    for (int i = 0; i < MAX_SSOL_RGN; i++) {
+        struct ssol_rgn *s = &g_ssol[i];
+        if (!s->active) continue;
+        p = apps(p, e, "\n ssol[");
+        p = appdec(p, e, i);
+        p = apps(p, e, "] pid=");
+        p = appdec(p, e, s->pid);
+        p = apps(p, e, " page=");
+        p = apphex(p, e, s->page);
+        p = apps(p, e, " npages=");
+        p = appdec(p, e, s->npages);
+        p = apps(p, e, " n_sim=");
+        p = appdec(p, e, s->n_sim);
+        p = apps(p, e, " n_xol=");
+        p = appdec(p, e, s->n_xol);
+    }
     apps(p, e, "\n");
     return 0;
 }
@@ -2302,6 +2645,18 @@ static long shpte_run(const char *args, char *buf, int bufcap)
         rc = do_selfstep(p, e);
     } else if (starts(a, "ssolstat")) {
         rc = do_ssolstat(p, e);
+    } else if (starts(a, "ssoltest")) {
+        uint64_t pid = 0, func = 0, n = 0, xol = 0;
+        const char *s = parse_ull(a + 8, &pid);
+        s = parse_ull(s, &func);
+        s = parse_ull(s, &n);
+        parse_ull(s, &xol);
+        if (!pid || !func || !n || !xol)
+            apps(p, e, "usage: ssoltest <pid> <func_va> <npages> <xol_va>\n"), rc = -1;
+        else
+            rc = do_ssoltest(pid, func, n, xol, p, e);
+    } else if (starts(a, "ssoldisarm")) {
+        rc = do_ssoldisarm(p, e);
     } else if (starts(a, "pte")) {
         uint64_t pid = 0, addr = 0;
         const char *s = parse_ull(a + 3, &pid);
@@ -2498,6 +2853,27 @@ static long shpte_exit(void *__user reserved)
 {
     /* always restore + unhook so unload can't leave a UXN'd page or live hook */
     g_armed = 0;
+    /* restore every SSOL-trapped page + free its snapshot/scratch before unload */
+    {
+        int restored = 0;
+        for (int i = 0; i < MAX_SSOL_RGN; i++) {
+            struct ssol_rgn *s = &g_ssol[i];
+            if (!s->active) continue;
+            for (int j = 0; j < s->npages; j++)
+                if (s->ptep[j]) *(volatile uint64_t *)s->ptep[j] = s->pte_orig[j];
+            restored++;
+        }
+        if (restored) flush_tlb_all();
+        for (int i = 0; i < MAX_SSOL_RGN; i++) {
+            struct ssol_rgn *s = &g_ssol[i];
+            s->active = 0;
+            if (s->insns && fn_vfree) fn_vfree(s->insns);
+            s->insns = 0;
+            if (s->xol_kaddr && fn_vfree) fn_vfree((void *)s->xol_kaddr);
+            s->xol_kaddr = 0;
+        }
+        g_nssol = 0;
+    }
     ssol_remove_step_hook(); /* drop the user step-hook + clear SSOL ctxs */
     if (g_ptep) {
         *(volatile uint64_t *)g_ptep = g_pte_orig;
