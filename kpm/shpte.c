@@ -648,12 +648,21 @@ static int ssol_ensure_step_hook(void)
     g_step_registered = 1;
     return 0;
 }
+/* Teardown is just clearing ctxs. We DELIBERATELY do NOT call
+ * unregister_user_step_hook here: it does synchronize_rcu(), and KernelPatch runs
+ * BOTH the module exit (unload_module) AND every control command (module_control0)
+ * INSIDE rcu_read_lock() -- so synchronize_rcu() would wait for the very read-side
+ * section it is running in => guaranteed self-deadlock (observed: a live
+ * `shctl unload shpte` HUNG the kernel, needing a physical reboot). There is no
+ * KP-reachable context outside that rcu_read_lock from which to sync, and unload
+ * frees the module memory immediately after exit() returns, so the hook genuinely
+ * cannot be cleanly removed under this KP. Consequence + rule: the step hook stays
+ * registered for the module's lifetime (cheap -- it only fires on EL0 software
+ * steps, and returns DBG_HOOK_ERROR for non-SSOL steppers). The bootstrap NEVER
+ * unloads (load;probe;bridge at boot), so production is unaffected. For DEV: NEVER
+ * live-unload shpte -- REBOOT to reload (a reboot doesn't run exit()/sync). */
 static void ssol_remove_step_hook(void)
 {
-    if (g_step_registered && fn_unregister_user_step_hook) {
-        fn_unregister_user_step_hook(&g_step_hook);
-        g_step_registered = 0;
-    }
     for (int i = 0; i < MAX_SSOL_CTX; i++) g_ctx[i].active = 0;
 }
 
