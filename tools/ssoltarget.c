@@ -67,10 +67,15 @@ __attribute__((aligned(4096), noinline)) int hook_me(int a, int b)
     return a + b; /* leaf: x30 flows through, so call-original RETs back into tramp */
 }
 volatile int g_tramp_ran = 0;
+/* the "trampoline": runs, then calls the ORIGINAL via backup = bk_va (an unmapped VA).
+ * Jumping to bk_va faults -> the KPM arms a one-shot bypass + redirects to hook_me's
+ * body (run via SSOL, hook skipped); x30 flows through so the body RETs back here. */
+#define BK_VA 0x5590000000ULL
 __attribute__((aligned(4096), noinline)) int tramp(int a, int b)
 {
     g_tramp_ran = 1;
-    return hook_me(a, b) + 1000; /* bl hook_me -> LR in tramp -> call-original (bypass) */
+    int (*volatile orig)(int, int) = (int (*)(int, int))BK_VA; /* backup = bk_va */
+    return orig(a, b) + 1000;
 }
 
 /* page-aligned TEXT separator so `tramp` OWNS its page (main/neighbors land on the

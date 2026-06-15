@@ -592,7 +592,8 @@ struct ssol_rgn {
     int npages;
     uint64_t entry;       /* hooked fn entry VA (0 = pure pass-through, P1 self-test) */
     uint64_t replace;     /* entry override target = trampoline base (0 = none) */
-    uint64_t replace_end; /* trampoline end VA -- LR in [replace,replace_end) => call-original */
+    uint64_t bk_va;       /* call-original `backup` VA (UNMAPPED): a fault here arms a
+                           * one-shot bypass + redirects pc to entry -> body via SSOL */
     uint32_t *insns;      /* vmalloc'd snapshot, npages*1024 words (insn + literal pool) */
     uint64_t xol_kaddr;   /* kernel alias of the scratch page (write copied insns here) */
     uint64_t xol_va;      /* user VA of the scratch page (EL0 single-steps here) */
@@ -615,6 +616,24 @@ static struct ssol_ctx *ctx_free(void)
 {
     for (int i = 0; i < MAX_SSOL_CTX; i++)
         if (!g_ctx[i].active) return &g_ctx[i];
+    return 0;
+}
+
+/* one-shot call-original bypass, keyed by tid: armed when a region's bk_va is hit,
+ * consumed at that region's entry (the very next fault on the same thread). */
+static volatile int g_byp_tid[MAX_SSOL_CTX]; /* tid, 0 = empty slot */
+static volatile int g_byp_rgn[MAX_SSOL_CTX]; /* region index armed for that tid */
+static void byp_arm(int tid, int rgn)
+{
+    for (int i = 0; i < MAX_SSOL_CTX; i++)
+        if (g_byp_tid[i] == tid) { g_byp_rgn[i] = rgn; return; } /* re-arm existing */
+    for (int i = 0; i < MAX_SSOL_CTX; i++)
+        if (g_byp_tid[i] == 0) { g_byp_rgn[i] = rgn; g_byp_tid[i] = tid; return; }
+}
+static int byp_take(int tid, int rgn) /* 1 + consume if armed for (tid,rgn) */
+{
+    for (int i = 0; i < MAX_SSOL_CTX; i++)
+        if (g_byp_tid[i] == tid && g_byp_rgn[i] == rgn) { g_byp_tid[i] = 0; return 1; }
     return 0;
 }
 
@@ -753,38 +772,54 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
         }
     }
 
-    /* ---- SSOL regions (P1b-2): advance the ORIGINAL instruction stream via
-     * simulate (PC-relative) or XOL+single-step (PC-independent). No clone, no
-     * relocation -> ART-intact, no code/data interleaving issue. UXN stays armed
-     * throughout, so each original instruction faults in turn. ---- */
+    /* ---- SSOL regions: advance the ORIGINAL instruction stream via simulate
+     * (PC-relative) or XOL+single-step (PC-independent). No clone, no relocation ->
+     * ART-intact, no code/data interleaving. UXN stays armed, so each original
+     * instruction faults in turn. ---- */
     if (g_nssol > 0) {
+        int tid = fn_task_pid_nr_ns ? fn_task_pid_nr_ns((void *)get_current(), PIDTYPE_PID, 0) : 0;
+        int tgid = fn_task_pid_nr_ns ? fn_task_pid_nr_ns((void *)get_current(), PIDTYPE_TGID, 0) : 0;
+
+        /* call-original dispatch: a hook's bk_va is the UNMAPPED VA handed to the hook
+         * frontend as `backup`. When the original is invoked (ART jumps to bk_va) the
+         * instruction fetch faults here -> arm a one-shot bypass for this thread and
+         * redirect pc to the real entry. The entry then faults, sees the bypass, and
+         * runs the body via SSOL (hook skipped); x30 is untouched so the body RETs to
+         * the real caller. Robust for the ART-invoke path, where LR cannot distinguish
+         * a real call from a call-original (both arrive via ART invoke stubs). */
+        for (int i = 0; i < MAX_SSOL_RGN; i++) {
+            struct ssol_rgn *s = &g_ssol[i];
+            if (!s->active || !s->bk_va || far != s->bk_va) continue;
+            if (s->pid && tgid != s->pid) continue;
+            byp_arm(tid, i);
+            regs->pc = s->entry;
+            s->n_orig++;
+            fargs->skip_origin = 1;
+            fargs->ret = 0;
+            return;
+        }
+
         for (int i = 0; i < MAX_SSOL_RGN; i++) {
             struct ssol_rgn *s = &g_ssol[i];
             if (!s->active) continue;
             if (fpage < s->page || fpage >= s->page + (uint64_t)s->npages * 0x1000UL) continue;
-            if (fn_task_pid_nr_ns &&
-                fn_task_pid_nr_ns((void *)get_current(), PIDTYPE_TGID, 0) != s->pid)
-                continue; /* same VA in another process -> not our trap */
+            if (s->pid && tgid != s->pid) continue; /* same VA in another process -> not ours */
             uint64_t roff = far - s->page;
             uint32_t insn = s->insns[roff >> 2];
 
-            /* hooked-fn entry: redirect to the trampoline UNLESS this is the
-             * trampoline itself calling the original (LR points into it). The LR
-             * (x30) is in pt_regs -> PAN-free, per-thread, no flag/alias needed.
-             *   far==entry & LR not in trampoline -> real caller: hook fires.
-             *   far==entry & LR in  trampoline    -> call-original: run body via
-             *                                        SSOL (fall through).
-             * Handles 0/1/N call-original, recursion, and multiple threads. */
-            if (s->entry && far == s->entry && s->replace) {
-                uint64_t lr = STRIP_PAC(regs->regs[30]);
-                if (lr < s->replace || lr >= s->replace_end) {
+            /* hooked-fn entry: redirect to the trampoline, UNLESS a one-shot
+             * call-original bypass is armed for this thread+region (set when this
+             * region's bk_va was hit) -> run the body via SSOL instead. */
+            if (s->entry && far == s->entry) {
+                if (byp_take(tid, i)) {
+                    /* call-original: fall through to SSOL the entry instruction */
+                } else if (s->replace) {
                     regs->pc = s->replace; /* hook fires */
                     s->n_hook++;
                     fargs->skip_origin = 1;
                     fargs->ret = 0;
                     return;
                 }
-                s->n_orig++; /* call-original: fall through to SSOL the entry insn */
             }
 
             /* PC-relative -> simulate in place (literal pool read from the snapshot) */
@@ -802,7 +837,6 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
              * set pc there, arm a single step (uprobes flow). ssol_step_fn restores
              * pc = far+4 after the one insn runs at EL0. */
             if (s->xol_kaddr && g_step_registered && fn_user_enable_single_step) {
-                int tid = fn_task_pid_nr_ns ? fn_task_pid_nr_ns((void *)get_current(), PIDTYPE_PID, 0) : 0;
                 struct ssol_ctx *c = ctx_by_tid(tid);
                 if (!c) c = ctx_free();
                 if (c) {
@@ -2280,12 +2314,13 @@ static int ssol_inject_xol(void *mm, uint64_t xol_va, uint64_t template_va, uint
     return 0;
 }
 
-/* Core SSOL region arm. entry/replace/replace_end=0 -> pure pass-through (ssoltest);
- * nonzero -> entry override (ssolhook): far==entry & LR outside the trampoline routes
- * to `replace`, else the body runs via SSOL (call-original). UXN-traps [func_page,
- * +npages). Tear down with `ssoldisarm`. */
+/* Core SSOL region arm. entry/replace/bk_va=0 -> pure pass-through (ssoltest);
+ * nonzero -> entry override (ssolhook): a real call to `entry` routes to `replace`
+ * (the trampoline); the hook frontend runs the original by jumping to `bk_va` (an
+ * unmapped VA = `backup`), which arms a one-shot bypass + runs the body via SSOL.
+ * UXN-traps [func_page, +npages). Tear down with `ssoldisarm`. */
 static long do_ssolarm(uint64_t pid, uint64_t func, uint64_t npages, uint64_t xol_va, uint64_t entry,
-                       uint64_t replace, uint64_t replace_end, char *p, char *e)
+                       uint64_t replace, uint64_t bk_va, char *p, char *e)
 {
     resolve_syms();
     if (!fn_access_process_vm || !fn_find_get_task_by_vpid || !fn_get_task_mm || !fn_mmput ||
@@ -2387,7 +2422,7 @@ static long do_ssolarm(uint64_t pid, uint64_t func, uint64_t npages, uint64_t xo
     s->npages = (int)npages;
     s->entry = entry;
     s->replace = replace;
-    s->replace_end = replace_end;
+    s->bk_va = bk_va;
     s->insns = insns;
     s->xol_kaddr = xol_kaddr;
     s->xol_va = xol_va & ~0xFFFUL;
@@ -2687,18 +2722,18 @@ static long shpte_run(const char *args, char *buf, int bufcap)
         else
             rc = do_ssolarm(pid, func, n, xol, 0, 0, 0, p, e);
     } else if (starts(a, "ssolhook")) {
-        uint64_t pid = 0, func = 0, n = 0, xol = 0, rep = 0, rsz = 0;
+        uint64_t pid = 0, func = 0, n = 0, xol = 0, rep = 0, bk = 0;
         const char *s = parse_ull(a + 8, &pid);
         s = parse_ull(s, &func);
         s = parse_ull(s, &n);
         s = parse_ull(s, &xol);
         s = parse_ull(s, &rep);
-        parse_ull(s, &rsz);
-        if (!pid || !func || !n || !xol || !rep || !rsz)
-            apps(p, e, "usage: ssolhook <pid> <func_va> <npages> <xol_va> <replace_va> <replace_size>\n"),
+        parse_ull(s, &bk);
+        if (!pid || !func || !n || !xol || !rep || !bk)
+            apps(p, e, "usage: ssolhook <pid> <func_va> <npages> <xol_va> <replace_va> <backup_va>\n"),
                 rc = -1;
         else
-            rc = do_ssolarm(pid, func, n, xol, func, rep, rep + rsz, p, e);
+            rc = do_ssolarm(pid, func, n, xol, func, rep, bk, p, e);
     } else if (starts(a, "ssoldisarm")) {
         rc = do_ssoldisarm(p, e);
     } else if (starts(a, "pte")) {
