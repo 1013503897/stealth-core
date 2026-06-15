@@ -361,6 +361,158 @@ static int resolve_pte(uint64_t pid, uint64_t base, struct pte_out *o)
     return 0;
 }
 
+/* ===================== SSOL simulator (ported from lib/ssol.c) =====================
+ * Computes the architectural effect of one PC-relative instruction directly into
+ * pt_regs (NO execution), for the SSOL before_pf dispatch (P1b). The bulk is PORTED
+ * VERBATIM from the P0 lib/ssol.c (device-verified off-device), with two on-device
+ * adaptations: (1) LDR-literal pool reads go through ssol_rd32/64 (P1a: plain reads
+ * to compile clean; P1b makes them PAN-safe -- a direct user deref from the EL1
+ * fault handler faults under PAN); (2) BR/BLR/RET register targets are STRIP_PAC'd.
+ * All helpers are ssol_-prefixed to avoid any symbol clash in this large module. */
+#ifndef STRIP_PAC
+#define STRIP_PAC(x) ((uint64_t)(x) & 0x0000ffffffffffffULL)
+#endif
+
+enum ssol_action { SSOL_SIMULATED = 0, SSOL_XOL = 1 };
+
+/* P1a: plain reads (function not yet wired). P1b: PAN-safe user reads. */
+static uint32_t ssol_rd32(uintptr_t a) { return *(volatile uint32_t *)a; }
+static uint64_t ssol_rd64(uintptr_t a) { return *(volatile uint64_t *)a; }
+
+static int64_t ssol_sext(int64_t v, int bits) { int s = 64 - bits; return (v << s) >> s; }
+
+static int ssol_is_adr(uint32_t i) { return (i & 0x9F000000u) == 0x10000000u; }
+static int ssol_is_adrp(uint32_t i) { return (i & 0x9F000000u) == 0x90000000u; }
+static int ssol_is_b(uint32_t i) { return (i & 0xFC000000u) == 0x14000000u; }
+static int ssol_is_bl(uint32_t i) { return (i & 0xFC000000u) == 0x94000000u; }
+static int ssol_is_bcond(uint32_t i) { return (i & 0xFF000010u) == 0x54000000u; }
+static int ssol_is_cbz(uint32_t i) { return (i & 0x7E000000u) == 0x34000000u; }   /* CBZ/CBNZ */
+static int ssol_is_tbz(uint32_t i) { return (i & 0x7E000000u) == 0x36000000u; }   /* TBZ/TBNZ */
+static int ssol_is_ldrlit(uint32_t i) { return (i & 0x3B000000u) == 0x18000000u && ((i >> 30) & 3) != 3; }
+static int ssol_is_br(uint32_t i) { return (i & 0xFFFFFC1Fu) == 0xD61F0000u; }  /* BR  Xn */
+static int ssol_is_blr(uint32_t i) { return (i & 0xFFFFFC1Fu) == 0xD63F0000u; } /* BLR Xn */
+static int ssol_is_ret(uint32_t i) { return (i & 0xFFFFFC1Fu) == 0xD65F0000u; } /* RET {Xn=30} */
+
+static uint64_t ssol_btarget(uint32_t insn, uint64_t pc)
+{
+    if (ssol_is_b(insn) || ssol_is_bl(insn)) return pc + ((uint64_t)ssol_sext(insn & 0x03ffffff, 26) << 2);
+    if (ssol_is_bcond(insn) || ssol_is_cbz(insn)) return pc + ((uint64_t)ssol_sext((insn >> 5) & 0x7ffff, 19) << 2);
+    if (ssol_is_tbz(insn)) return pc + ((uint64_t)ssol_sext((insn >> 5) & 0x3fff, 14) << 2);
+    return 0;
+}
+
+/* ARM ConditionHolds. NZCV = pstate bits 31/30/29/28. */
+static int ssol_eval_cond(uint32_t cond, uint64_t pstate)
+{
+    int N = (pstate >> 31) & 1, Z = (pstate >> 30) & 1, C = (pstate >> 29) & 1, V = (pstate >> 28) & 1;
+    int res;
+    switch ((cond >> 1) & 7) {
+    case 0: res = (Z == 1); break;             /* EQ / NE */
+    case 1: res = (C == 1); break;             /* CS / CC */
+    case 2: res = (N == 1); break;             /* MI / PL */
+    case 3: res = (V == 1); break;             /* VS / VC */
+    case 4: res = (C == 1 && Z == 0); break;   /* HI / LS */
+    case 5: res = (N == V); break;             /* GE / LT */
+    case 6: res = (N == V && Z == 0); break;   /* GT / LE */
+    default: res = 1; break;                   /* AL / NV */
+    }
+    if ((cond & 1) && cond != 0xf) res = !res;
+    return res;
+}
+
+/* field value 31 => XZR/WZR (reads 0), NEVER SP, in every encoding SSOL handles. */
+static uint64_t ssol_reg_read(const struct pt_regs *regs, int idx, int is64)
+{
+    uint64_t v = (idx == 31) ? 0 : regs->regs[idx];
+    return is64 ? v : (v & 0xffffffffu);
+}
+static void ssol_reg_write(struct pt_regs *regs, int idx, uint64_t val, int is64)
+{
+    if (idx == 31) return; /* XZR: discard -- NEVER write regs[31] (= SP). */
+    regs->regs[idx] = is64 ? val : (val & 0xffffffffu);
+}
+
+static enum ssol_action ssol_simulate(struct pt_regs *regs, uint32_t insn)
+{
+    uint64_t pc = regs->pc;
+
+    if (ssol_is_b(insn)) {
+        regs->pc = ssol_btarget(insn, pc);
+        return SSOL_SIMULATED;
+    }
+    if (ssol_is_bl(insn)) {
+        regs->regs[30] = pc + 4;
+        regs->pc = ssol_btarget(insn, pc);
+        return SSOL_SIMULATED;
+    }
+    if (ssol_is_bcond(insn)) {
+        regs->pc = ssol_eval_cond(insn & 0xf, regs->pstate) ? ssol_btarget(insn, pc) : pc + 4;
+        return SSOL_SIMULATED;
+    }
+    if (ssol_is_cbz(insn)) {
+        int sf = (insn >> 31) & 1;
+        int rt = insn & 0x1f;
+        int is_cbnz = (insn >> 24) & 1;
+        int zero = (ssol_reg_read(regs, rt, sf) == 0);
+        int taken = zero ^ is_cbnz;
+        regs->pc = taken ? ssol_btarget(insn, pc) : pc + 4;
+        return SSOL_SIMULATED;
+    }
+    if (ssol_is_tbz(insn)) {
+        int rt = insn & 0x1f;
+        int bitpos = (int)((((insn >> 31) & 1) << 5) | ((insn >> 19) & 0x1f));
+        int is_tbnz = (insn >> 24) & 1;
+        int bit = (int)((ssol_reg_read(regs, rt, 1) >> bitpos) & 1);
+        int taken = is_tbnz ? bit : !bit;
+        regs->pc = taken ? ssol_btarget(insn, pc) : pc + 4;
+        return SSOL_SIMULATED;
+    }
+    if (ssol_is_adr(insn)) {
+        int rd = insn & 0x1f;
+        int64_t imm = ssol_sext((int64_t)(((insn >> 5) & 0x7ffff) << 2 | ((insn >> 29) & 3)), 21);
+        ssol_reg_write(regs, rd, pc + (uint64_t)imm, 1);
+        regs->pc = pc + 4;
+        return SSOL_SIMULATED;
+    }
+    if (ssol_is_adrp(insn)) {
+        int rd = insn & 0x1f;
+        int64_t imm = ssol_sext((int64_t)(((insn >> 5) & 0x7ffff) << 2 | ((insn >> 29) & 3)), 21);
+        ssol_reg_write(regs, rd, (pc & ~0xfffULL) + ((uint64_t)imm << 12), 1);
+        regs->pc = pc + 4;
+        return SSOL_SIMULATED;
+    }
+    if (ssol_is_ldrlit(insn)) {
+        if ((insn >> 26) & 1) return SSOL_XOL; /* V=1: SIMD/FP literal -> XOL */
+        int rt = insn & 0x1f;
+        int opc = (insn >> 30) & 3; /* 0 = 32-bit, 1 = 64-bit, 2 = LDRSW */
+        int64_t off = ssol_sext((int64_t)((insn >> 5) & 0x7ffff), 19) << 2;
+        uintptr_t addr = (uintptr_t)(pc + (uint64_t)off);
+        uint64_t val;
+        if (opc == 1) val = ssol_rd64(addr);
+        else if (opc == 2) val = (uint64_t)(int64_t)(int32_t)ssol_rd32(addr); /* LDRSW: sign-extend */
+        else val = (uint64_t)ssol_rd32(addr);                                  /* 32-bit: zero-extend */
+        ssol_reg_write(regs, rt, val, opc != 0);
+        regs->pc = pc + 4;
+        return SSOL_SIMULATED;
+    }
+    /* register (indirect) branches: target is a register holding an ORIGINAL address
+     * (STRIP_PAC for this device's pointer-auth). LR stays original -> ART-intact. */
+    if (ssol_is_br(insn)) {
+        regs->pc = STRIP_PAC(ssol_reg_read(regs, (insn >> 5) & 0x1f, 1));
+        return SSOL_SIMULATED;
+    }
+    if (ssol_is_blr(insn)) {
+        regs->regs[30] = pc + 4;
+        regs->pc = STRIP_PAC(ssol_reg_read(regs, (insn >> 5) & 0x1f, 1));
+        return SSOL_SIMULATED;
+    }
+    if (ssol_is_ret(insn)) {
+        regs->pc = STRIP_PAC(ssol_reg_read(regs, (insn >> 5) & 0x1f, 1));
+        return SSOL_SIMULATED;
+    }
+    return SSOL_XOL; /* PC-independent (ALU/MOV/LDR-STR reg/NOP/atomics/PAC branches) */
+}
+
 /* ---- do_page_fault before-callback: self-heal the UXN execute fault ----
  * do_page_fault(unsigned long far, unsigned long esr, struct pt_regs *regs) */
 static void before_pf(hook_fargs3_t *fargs, void *udata)
