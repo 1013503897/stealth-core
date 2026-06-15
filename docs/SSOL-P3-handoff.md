@@ -111,22 +111,34 @@ ptep[],pte_orig[], n_sim,n_xol,n_hook,n_orig
 保证目标进程里未映射(高地址通常空)。自测里 hook_me/hook_me2 用 `0x5590000000`/`0x5591000000`。
 另已加 `ssolunhook <pid> <region_base> <entry>`(仿 pgunhook:逐 ov 退役,最后一个 ov 整区 disarm)供 `kpm_inline_unhooker`。
 
-**5.3 Vector：重写 `kpm_inline_hooker`(`Vector/native/src/kpm/kpmhook.c`)**:
-- 不再 `make_rgn`/建 DBI 克隆/发 `pghook`;改为算出 `qc` 所在页范围 → 发 `ssolhook <pid> <qc> <npages>
-  <xol_va> <replace=hooker> <bk_va>`。
-- `xol_va`:每进程一个 scratch 页基址(高未映射 VA);`bk_va`:每 hook 唯一(见 5.2)。
-- **返回 `bk_va` 作为 backup**(LSPlant 会把它设成 backup-ArtMethod 的 entry)。
-- `kpm_inline_unhooker`:发新的「移除某 ov」命令(需在 KPM 加,或先整页 disarm)。
-- LSPlant 的 trampoline/backup-ArtMethod 那侧**大概率不用改**(backup 只是个 ART 会跳过去的 VA)。
-- `QcIsTraceable`(module.cpp):SSOL 不像克隆那样要求 body 不跨页/无数据交织 —— 可放宽,但先保持原判定跑通再说。
+**5.3 Vector 接线 ✅ DONE + 真机验证 (Vector `c0d8a5b6`, 推送 mine/master)** —— 但有 2 个稳定性遗留。
+**关键修正(handoff 原先漏了):`kpm_inline_hooker` 是双用途的** —— `HookInline`(`native_api.h`)用它 hook ~11 个
+**热的 libart 函数**(DoCollection/MaybeEnqueueCompilation…),`traceless_inline_hooker`(`module.cpp`)用它 hook
+**冷的 Java 方法 qc**。SSOL 陷的是整页 → 页上每条指令执行都缺页+单步 → 冷 qc 没问题(只经 hook 跑),但**热的
+多线程 libart .text 会缺页风暴 → 立刻 SIGTRAP**(我一开始全 SSOL 时实测到)。所以**拆开**:
+- `kpm_inline_hooker`/`kpm_inline_unhooker` 保持 **克隆/pghook**(libart 函数,未动,稳定)。
+- 新增 `kpm_ssol_hooker`/`kpm_ssol_unhooker`(独立 `g_srgns[]` 表,发 `ssolhook`/`ssolunhook`)给 Java qc。
+- `module.cpp` 的 `traceless_inline_hooker` → `kpm_ssol_hooker`。
+- **声明要同时加到 `native/include/core/native_api.h`(module.cpp 实际只 include 这个,不 include kpmhook.h)和
+  `kpmhook.h`**(漏了 native_api.h 会编译报 undeclared)。
+- `xol_va = 0x5540000000 + rgn*0x1000`(每区域),`bk_va = 0x5500000000 + (rgn*16+slot)*0x1000`(每 hook 唯一,返回作 backup)。
+- 构建:JBR21 + `rm -rf zygisk/build/Debug` + `gradlew :zygisk:zipDebug`(kpm-probe 的 `--build` 从 bash 跑不稳,
+  改 PowerShell 编 zip 再 `run.sh` 不带 `--build` 部署——proven)。
+- **结果(com.android.hookdemo fc=1 l2=1 probe=1):`[convert] traceless-converted 8/8`,
+  `[probe] VERDICT S2=CLEAN S5=CLEAN S1/4=CLEAN S3=CLEAN` —— 5 面全 CLEAN,probe 瞬间 app 存活。** 多 ov 真机验证:
+  `ssolstat nssol=3`,各区 **2 + 3 + 1** 个 ov(多个 qc 共享一陷页);libart 走克隆 `npg=9`;maps_hidden=31(含 xol scratch → S2 干净)。
 
-**5.4 构建 + 真机**:Vector 编 zip(JBR21 gradle,见记忆 `build-requires-jbr21`;改 native/src/kpm 要
-`rm -rf zygisk/build/Debug` 强制重编,否则 globbed 源不重编)→ apd 装 → reboot。优先用 **`/kpm-probe` skill**
-(一条龙 build→push→reboot→gate→launch→poll→VERDICT)。先在 **hookdemo**(简单 app,GREEN 基线)验
-hook 工作 + 5 面;再上 **katana**(克隆的失败案例)验复杂 app。
+**⚠️ 5.3 还差 2 个(下个 session 先做):**
+1. **间接 SIGILL** —— hookdemo 在全 CLEAN 的 probe 之后 ~48s SIGILL(一次;另一次 60s 重跑没复现)。克隆版在 hookdemo 是稳的,
+   所以是 SSOL 引入的回归。**最可能 = ART 的 JIT GC 重编/释放了被陷的 JIT 页 → SSOL 的静态快照 `insns[]` 失效 → simulate 读到陈旧指令 → SIGILL。**
+   这就是 **M-B「JIT-move follow」**:要在 `GarbageCollectCache`/`DoCollection`(lsplant 已 hook 来抓 Jit*)时 re-snapshot/re-trap(或 disarm)。
+   需抓 tombstone/crash-PC 确认(这次没留 tombstone,用 logcat DEBUG 抓)。
+2. **SSOL 无死进程 GC** —— `g_ssol` 跨启动泄漏槽位(见过 `nssol=9` 带死 pid 4318/11240;tgid-gated 所以对别进程惰性,但会填满 MAX_SSOL_RGN=16)。
+   照 pghook 的 `pggc` 加一个 SSOL 版(KPM 侧 reap owner 已退出的 g_ssol 槽)。
 
-**5.5 收尾**:S2 —— 把 xol scratch 页 + 任何 anon-exec 的 SSOL 残留从 /proc/self/{maps,smaps} 隐藏
-(复用 KPM 现有 maps-hide `hidergn`/`g_hide`)。probe 期望 **S1/S2/S3/S4/S5 全 CLEAN on katana** = 终极目标在复杂 app 达成。
+**5.4 katana**(克隆崩溃的复杂 app —— SSOL 跑原始代码理论上不崩;但**先修上面 #1**,否则 katana 不停 JIT-GC 会很快 SIGILL)。
+**5.5 S2**:hookdemo 上 xol scratch 已被现有 maps-hide 盖住(S2 已 CLEAN);katana 上再验。
+设备:Pixel 6 已刷此 build,gated hookdemo fc/l2/probe=1,`nssol` 有泄漏的陈旧区域(重启清)。
 
 ---
 
@@ -134,8 +146,13 @@ hook 工作 + 5 面;再上 **katana**(克隆的失败案例)验复杂 app。
 
 P0 `8c0f7a0`(lib/ssol.c 离线核+单测)→ P1a `af0bf7d`(移植进 KPM)→ P1b-1 `221c9d9`(单步原语)→
 P1b-2/c `2202a97`(完整 XOL 回路)→ `076e9eb`(teardown 自死锁修复)→ `4ea6042`(间接调用去风险)→
-`e2bdd0b`(入口覆盖+LR,后被取代)→ `da0048f`(**bk_va call-original,当前 HEAD**)。
+`e2bdd0b`(入口覆盖+LR,后被取代)→ `da0048f`(bk_va call-original)→ `3219f1b`(本 handoff)→
+**`46a34bf`(P3 5.1 多目标 SSOL 区域 + ssolunhook)→ `686414d`(handoff 标 5.1 done)= stealth-poc 当前 HEAD**。
 全程真机验证。lib/ssol.* 与 tools/ssoltarget.* 也在内。
+
+**Vector 侧(repo `1013503897/Vector` = remote `mine`,master;origin 是 JingMatrix 公库**勿推**):**
+`c0d8a5b6`(P3 5.3 SSOL Java-hook 接线,clone/SSOL 拆分)。改动 4 文件:`native/src/kpm/kpmhook.{c,h}`、
+`native/include/core/native_api.h`、`zygisk/src/main/cpp/module.cpp`。默认 build 安全(SSOL 仅 `persist.kpmhook.l2=1` 才启用)。
 
 ---
 
