@@ -10,6 +10,7 @@ OUT=/data/local/tmp/ssoltarget.out
 XOL_ADD=0x5550000000
 XOL_MIX=0x5560000000
 XOL_IND=0x5570000000
+XOL_HOOK=0x5580000000
 
 rm -f "$GO" "$OUT"
 "$TGT" "$GO" > "$OUT" 2>&1 &
@@ -20,7 +21,9 @@ PID=$(sed -n 's/^pid=//p' "$OUT")
 ADD=$(sed -n 's/^ssol_add=//p' "$OUT")
 MIX=$(sed -n 's/^ssol_mix=//p' "$OUT")
 IND=$(sed -n 's/^ssol_indirect=//p' "$OUT")
-echo "[driver] pid=$PID ssol_add=$ADD ssol_mix=$MIX ssol_indirect=$IND"
+HM=$(sed -n 's/^hook_me=//p' "$OUT")
+TR=$(sed -n 's/^tramp=//p' "$OUT")
+echo "[driver] pid=$PID add=$ADD mix=$MIX ind=$IND hook_me=$HM tramp=$TR"
 
 echo "[driver] arming ssoltest on ssol_add ..."
 timeout 10 "$SHCTL" "$KEY" control shpte "ssoltest $PID $ADD 1 $XOL_ADD"
@@ -28,6 +31,8 @@ echo "[driver] arming ssoltest on ssol_mix ..."
 timeout 10 "$SHCTL" "$KEY" control shpte "ssoltest $PID $MIX 1 $XOL_MIX"
 echo "[driver] arming ssoltest on ssol_indirect ..."
 timeout 10 "$SHCTL" "$KEY" control shpte "ssoltest $PID $IND 1 $XOL_IND"
+echo "[driver] arming ssolhook on hook_me (replace=tramp) ..."
+timeout 10 "$SHCTL" "$KEY" control shpte "ssolhook $PID $HM 1 $XOL_HOOK $TR 0x1000"
 
 echo "[driver] signalling target ..."
 touch "$GO"

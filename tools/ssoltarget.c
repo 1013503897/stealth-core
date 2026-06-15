@@ -56,8 +56,27 @@ __attribute__((aligned(4096), noinline)) int ssol_indirect(int n)
     return acc;
 }
 
-/* push whatever the linker places next off the last function's page */
-__attribute__((aligned(4096))) volatile char _pad[4096] = {0};
+/* ---- P3 hook self-test: entry-override + call-original via LR discrimination ----
+ * hook_me = the "hooked method" (page-isolated, SSOL-trapped with entry override).
+ * tramp   = the "trampoline/replacement" (page-isolated, NOT trapped): it runs, then
+ * calls the ORIGINAL hook_me -- which the KPM bypasses because the call's LR points
+ * INTO tramp -- and adds 1000. A direct hook_me(3,4) is redirected by the KPM to
+ * tramp (LR in main, not tramp), so it must return 7+1000=1007 with tramp having run. */
+__attribute__((aligned(4096), noinline)) int hook_me(int a, int b)
+{
+    return a + b; /* leaf: x30 flows through, so call-original RETs back into tramp */
+}
+volatile int g_tramp_ran = 0;
+__attribute__((aligned(4096), noinline)) int tramp(int a, int b)
+{
+    g_tramp_ran = 1;
+    return hook_me(a, b) + 1000; /* bl hook_me -> LR in tramp -> call-original (bypass) */
+}
+
+/* page-aligned TEXT separator so `tramp` OWNS its page (main/neighbors land on the
+ * NEXT page) -- otherwise main packs into tramp's page and its LR would wrongly fall
+ * inside [replace, replace+0x1000). An aligned data array does NOT separate .text. */
+__attribute__((aligned(4096), noinline, used)) static int _pgsep(void) { return 0; }
 
 static int file_exists(const char *p)
 {
@@ -74,6 +93,8 @@ int main(int argc, char **argv)
     printf("ssol_add=%p\n", (void *)&ssol_add);
     printf("ssol_mix=%p\n", (void *)&ssol_mix);
     printf("ssol_indirect=%p\n", (void *)&ssol_indirect);
+    printf("hook_me=%p\n", (void *)&hook_me);
+    printf("tramp=%p\n", (void *)&tramp);
     printf("xol_va=0x5550000000\n");
     printf("go_file=%s\n", go);
     fflush(stdout);
@@ -90,10 +111,16 @@ int main(int argc, char **argv)
     int r3 = ssol_indirect(1);
     long e2 = (long)(100 * 101 / 2) + (long)0x1234567890ABCDEFLL;
 
+    g_tramp_ran = 0;
+    int (*volatile hm)(int, int) = hook_me; /* volatile fn-ptr -> real call (no fold) */
+    int r4 = hm(3, 4);                       /* hooked: redirected to tramp, which call-originals */
+
     printf("ssol_add(3,4)=%d expect=7 %s\n", r1, r1 == 7 ? "PASS" : "FAIL");
     printf("ssol_mix(100)=%ld expect=%ld %s\n", r2, e2, r2 == e2 ? "PASS" : "FAIL");
     printf("ssol_indirect(1)=%d expect=300 %s\n", r3, r3 == 300 ? "PASS" : "FAIL");
+    printf("hook_me(3,4)=%d expect=1007 tramp_ran=%d %s\n", r4, g_tramp_ran,
+           (r4 == 1007 && g_tramp_ran) ? "PASS" : "FAIL");
     printf("DONE\n");
     fflush(stdout);
-    return (r1 == 7 && r2 == e2 && r3 == 300) ? 0 : 1;
+    return (r1 == 7 && r2 == e2 && r3 == 300 && r4 == 1007 && g_tramp_ran) ? 0 : 1;
 }

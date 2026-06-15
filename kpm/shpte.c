@@ -583,21 +583,22 @@ static volatile long g_selfstep_fired = 0;
  * verified clone path). A region UXN-traps [page, page+npages) and routes every
  * fault through simulate (PC-relative) or XOL+single-step (PC-independent). P1
  * uses one region for the self-test. */
-#define MAX_SSOL_RGN 4
+#define MAX_SSOL_RGN 8
 struct ssol_rgn {
     volatile int active;
     int pid;            /* tgid gate */
     void *mm;           /* equality-only (future maps-hide), never dereferenced */
     uint64_t page;      /* region base */
     int npages;
-    uint64_t entry;     /* hooked fn entry VA (0 = pure pass-through, P1 self-test) */
-    uint64_t replace;   /* entry override target (trampoline) */
-    uint32_t *insns;    /* vmalloc'd snapshot, npages*1024 words (insn + literal pool) */
-    uint64_t xol_kaddr; /* kernel alias of the scratch page (write copied insns here) */
-    uint64_t xol_va;    /* user VA of the scratch page (EL0 single-steps here) */
+    uint64_t entry;       /* hooked fn entry VA (0 = pure pass-through, P1 self-test) */
+    uint64_t replace;     /* entry override target = trampoline base (0 = none) */
+    uint64_t replace_end; /* trampoline end VA -- LR in [replace,replace_end) => call-original */
+    uint32_t *insns;      /* vmalloc'd snapshot, npages*1024 words (insn + literal pool) */
+    uint64_t xol_kaddr;   /* kernel alias of the scratch page (write copied insns here) */
+    uint64_t xol_va;      /* user VA of the scratch page (EL0 single-steps here) */
     uint64_t *ptep[MAX_RGN];
     uint64_t pte_orig[MAX_RGN];
-    volatile long n_sim, n_xol;
+    volatile long n_sim, n_xol, n_hook, n_orig;
 };
 static struct ssol_rgn g_ssol[MAX_SSOL_RGN];
 static volatile int g_nssol = 0;
@@ -767,12 +768,23 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
             uint64_t roff = far - s->page;
             uint32_t insn = s->insns[roff >> 2];
 
-            /* hooked-fn entry override (P1 self-test: entry==0 -> never matches) */
+            /* hooked-fn entry: redirect to the trampoline UNLESS this is the
+             * trampoline itself calling the original (LR points into it). The LR
+             * (x30) is in pt_regs -> PAN-free, per-thread, no flag/alias needed.
+             *   far==entry & LR not in trampoline -> real caller: hook fires.
+             *   far==entry & LR in  trampoline    -> call-original: run body via
+             *                                        SSOL (fall through).
+             * Handles 0/1/N call-original, recursion, and multiple threads. */
             if (s->entry && far == s->entry && s->replace) {
-                regs->pc = s->replace;
-                fargs->skip_origin = 1;
-                fargs->ret = 0;
-                return;
+                uint64_t lr = STRIP_PAC(regs->regs[30]);
+                if (lr < s->replace || lr >= s->replace_end) {
+                    regs->pc = s->replace; /* hook fires */
+                    s->n_hook++;
+                    fargs->skip_origin = 1;
+                    fargs->ret = 0;
+                    return;
+                }
+                s->n_orig++; /* call-original: fall through to SSOL the entry insn */
             }
 
             /* PC-relative -> simulate in place (literal pool read from the snapshot) */
@@ -2268,11 +2280,12 @@ static int ssol_inject_xol(void *mm, uint64_t xol_va, uint64_t template_va, uint
     return 0;
 }
 
-/* ssoltest <pid> <func_va> <npages> <xol_va>: UXN-trap [func_page, +npages) as an
- * SSOL region (pure pass-through, no entry override). The self-test process then
- * calls the trapped function -- every instruction runs via simulate/XOL -- and
- * checks the result. Tear down with `ssoldisarm`. */
-static long do_ssoltest(uint64_t pid, uint64_t func, uint64_t npages, uint64_t xol_va, char *p, char *e)
+/* Core SSOL region arm. entry/replace/replace_end=0 -> pure pass-through (ssoltest);
+ * nonzero -> entry override (ssolhook): far==entry & LR outside the trampoline routes
+ * to `replace`, else the body runs via SSOL (call-original). UXN-traps [func_page,
+ * +npages). Tear down with `ssoldisarm`. */
+static long do_ssolarm(uint64_t pid, uint64_t func, uint64_t npages, uint64_t xol_va, uint64_t entry,
+                       uint64_t replace, uint64_t replace_end, char *p, char *e)
 {
     resolve_syms();
     if (!fn_access_process_vm || !fn_find_get_task_by_vpid || !fn_get_task_mm || !fn_mmput ||
@@ -2372,8 +2385,9 @@ static long do_ssoltest(uint64_t pid, uint64_t func, uint64_t npages, uint64_t x
     }
     s->page = page;
     s->npages = (int)npages;
-    s->entry = 0;
-    s->replace = 0;
+    s->entry = entry;
+    s->replace = replace;
+    s->replace_end = replace_end;
     s->insns = insns;
     s->xol_kaddr = xol_kaddr;
     s->xol_va = xol_va & ~0xFFFUL;
@@ -2383,6 +2397,8 @@ static long do_ssoltest(uint64_t pid, uint64_t func, uint64_t npages, uint64_t x
     }
     s->n_sim = 0;
     s->n_xol = 0;
+    s->n_hook = 0;
+    s->n_orig = 0;
     s->active = 1; /* publish before arming UXN */
     g_nssol++;
 
@@ -2390,7 +2406,7 @@ static long do_ssoltest(uint64_t pid, uint64_t func, uint64_t npages, uint64_t x
         *(volatile uint64_t *)s->ptep[j] = s->pte_orig[j] | PTE_UXN;
     flush_tlb_all();
 
-    p = apps(p, e, "ok: ssoltest slot=");
+    p = apps(p, e, "ok: ssolarm slot=");
     p = appdec(p, e, si);
     p = apps(p, e, " pid=");
     p = appdec(p, e, (long)pid);
@@ -2398,10 +2414,12 @@ static long do_ssoltest(uint64_t pid, uint64_t func, uint64_t npages, uint64_t x
     p = apphex(p, e, page);
     p = apps(p, e, " npages=");
     p = appdec(p, e, (long)npages);
+    p = apps(p, e, " entry=");
+    p = apphex(p, e, entry);
+    p = apps(p, e, " replace=");
+    p = apphex(p, e, replace);
     p = apps(p, e, " xol_va=");
     p = apphex(p, e, s->xol_va);
-    p = apps(p, e, " xol_kaddr=");
-    p = apphex(p, e, xol_kaddr);
     p = apps(p, e, " nssol=");
     p = appdec(p, e, g_nssol);
     apps(p, e, "\n");
@@ -2526,6 +2544,10 @@ static long do_ssolstat(char *p, char *e)
         p = appdec(p, e, s->n_sim);
         p = apps(p, e, " n_xol=");
         p = appdec(p, e, s->n_xol);
+        p = apps(p, e, " n_hook=");
+        p = appdec(p, e, s->n_hook);
+        p = apps(p, e, " n_orig=");
+        p = appdec(p, e, s->n_orig);
     }
     apps(p, e, "\n");
     return 0;
@@ -2663,7 +2685,20 @@ static long shpte_run(const char *args, char *buf, int bufcap)
         if (!pid || !func || !n || !xol)
             apps(p, e, "usage: ssoltest <pid> <func_va> <npages> <xol_va>\n"), rc = -1;
         else
-            rc = do_ssoltest(pid, func, n, xol, p, e);
+            rc = do_ssolarm(pid, func, n, xol, 0, 0, 0, p, e);
+    } else if (starts(a, "ssolhook")) {
+        uint64_t pid = 0, func = 0, n = 0, xol = 0, rep = 0, rsz = 0;
+        const char *s = parse_ull(a + 8, &pid);
+        s = parse_ull(s, &func);
+        s = parse_ull(s, &n);
+        s = parse_ull(s, &xol);
+        s = parse_ull(s, &rep);
+        parse_ull(s, &rsz);
+        if (!pid || !func || !n || !xol || !rep || !rsz)
+            apps(p, e, "usage: ssolhook <pid> <func_va> <npages> <xol_va> <replace_va> <replace_size>\n"),
+                rc = -1;
+        else
+            rc = do_ssolarm(pid, func, n, xol, func, rep, rep + rsz, p, e);
     } else if (starts(a, "ssoldisarm")) {
         rc = do_ssoldisarm(p, e);
     } else if (starts(a, "pte")) {
