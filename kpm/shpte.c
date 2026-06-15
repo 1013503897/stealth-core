@@ -583,17 +583,25 @@ static volatile long g_selfstep_fired = 0;
  * verified clone path). A region UXN-traps [page, page+npages) and routes every
  * fault through simulate (PC-relative) or XOL+single-step (PC-independent). P1
  * uses one region for the self-test. */
-#define MAX_SSOL_RGN 8
+#define MAX_SSOL_RGN 16  /* trapped SSOL regions live at once (matches MAX_PG) */
+#define MAX_SSOL_OV 16   /* hooked method entries per SSOL region (LSPlant groups many qc per page) */
 struct ssol_rgn {
     volatile int active;
     int pid;            /* tgid gate */
     void *mm;           /* equality-only (future maps-hide), never dereferenced */
     uint64_t page;      /* region base */
     int npages;
-    uint64_t entry;       /* hooked fn entry VA (0 = pure pass-through, P1 self-test) */
-    uint64_t replace;     /* entry override target = trampoline base (0 = none) */
-    uint64_t bk_va;       /* call-original `backup` VA (UNMAPPED): a fault here arms a
-                           * one-shot bypass + redirects pc to entry -> body via SSOL */
+    /* Multi-target override table (mirrors pghook's ov_off[]/ov_replace[]): one SSOL
+     * region [page,page+npages) can host MAX_SSOL_OV hooked entries -- LSPlant hooks
+     * ~20 qc, many sharing a code page. Published key-last / retired key-first via
+     * ssol_set_ov, so a racing before_pf never sees a half-built entry. nov == 0 is a
+     * pure pass-through region (ssoltest: no entry override, every insn just runs). */
+    volatile int nov;
+    volatile uint64_t ov_off[MAX_SSOL_OV];     /* region-relative entry byte offset; OV_NONE = inert */
+    volatile uint64_t ov_replace[MAX_SSOL_OV]; /* entry override target = trampoline for ov_off[k] */
+    volatile uint64_t ov_bk[MAX_SSOL_OV];      /* call-original `backup` VA (UNMAPPED) for ov_off[k]:
+                                                * a fault here arms a one-shot bypass + redirects pc to
+                                                * that entry -> body via SSOL */
     uint32_t *insns;      /* vmalloc'd snapshot, npages*1024 words (insn + literal pool) */
     uint64_t xol_kaddr;   /* kernel alias of the scratch page (write copied insns here) */
     uint64_t xol_va;      /* user VA of the scratch page (EL0 single-steps here) */
@@ -603,6 +611,16 @@ struct ssol_rgn {
 };
 static struct ssol_rgn g_ssol[MAX_SSOL_RGN];
 static volatile int g_nssol = 0;
+
+/* publish a new SSOL override key-last (replace + bk_va visible before the off key),
+ * so a racing before_pf never matches an offset before its replacement/backup land. */
+static inline void ssol_set_ov(struct ssol_rgn *s, int k, uint64_t off, uint64_t replace, uint64_t bk)
+{
+    s->ov_replace[k] = replace;
+    s->ov_bk[k] = bk;
+    asm volatile("dmb ishst" ::: "memory"); /* replace+bk visible before the key */
+    s->ov_off[k] = off;
+}
 
 static void sync_icache(void *addr, unsigned long size); /* defined below; used by the XOL copy */
 
@@ -619,21 +637,23 @@ static struct ssol_ctx *ctx_free(void)
     return 0;
 }
 
-/* one-shot call-original bypass, keyed by tid: armed when a region's bk_va is hit,
- * consumed at that region's entry (the very next fault on the same thread). */
-static volatile int g_byp_tid[MAX_SSOL_CTX]; /* tid, 0 = empty slot */
-static volatile int g_byp_rgn[MAX_SSOL_CTX]; /* region index armed for that tid */
-static void byp_arm(int tid, int rgn)
+/* one-shot call-original bypass, keyed by (tid, entry VA): armed when a hook's bk_va
+ * is hit, consumed at that hook's entry (the very next fault on the same thread). The
+ * entry VA (not a region index) is the key, so a region hosting several hooked entries
+ * bypasses exactly the one whose original is being called. */
+static volatile int g_byp_tid[MAX_SSOL_CTX];        /* tid, 0 = empty slot */
+static volatile uint64_t g_byp_entry[MAX_SSOL_CTX]; /* entry VA armed to bypass once for that tid */
+static void byp_arm(int tid, uint64_t entry)
 {
     for (int i = 0; i < MAX_SSOL_CTX; i++)
-        if (g_byp_tid[i] == tid) { g_byp_rgn[i] = rgn; return; } /* re-arm existing */
+        if (g_byp_tid[i] == tid) { g_byp_entry[i] = entry; return; } /* re-arm existing */
     for (int i = 0; i < MAX_SSOL_CTX; i++)
-        if (g_byp_tid[i] == 0) { g_byp_rgn[i] = rgn; g_byp_tid[i] = tid; return; }
+        if (g_byp_tid[i] == 0) { g_byp_entry[i] = entry; g_byp_tid[i] = tid; return; }
 }
-static int byp_take(int tid, int rgn) /* 1 + consume if armed for (tid,rgn) */
+static int byp_take(int tid, uint64_t entry) /* 1 + consume if armed for (tid,entry) */
 {
     for (int i = 0; i < MAX_SSOL_CTX; i++)
-        if (g_byp_tid[i] == tid && g_byp_rgn[i] == rgn) { g_byp_tid[i] = 0; return 1; }
+        if (g_byp_tid[i] == tid && g_byp_entry[i] == entry) { g_byp_tid[i] = 0; return 1; }
     return 0;
 }
 
@@ -782,21 +802,26 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
 
         /* call-original dispatch: a hook's bk_va is the UNMAPPED VA handed to the hook
          * frontend as `backup`. When the original is invoked (ART jumps to bk_va) the
-         * instruction fetch faults here -> arm a one-shot bypass for this thread and
-         * redirect pc to the real entry. The entry then faults, sees the bypass, and
-         * runs the body via SSOL (hook skipped); x30 is untouched so the body RETs to
-         * the real caller. Robust for the ART-invoke path, where LR cannot distinguish
-         * a real call from a call-original (both arrive via ART invoke stubs). */
+         * instruction fetch faults here -> arm a one-shot bypass for this thread+entry
+         * and redirect pc to that hooked entry. The entry then faults, sees the bypass,
+         * and runs the body via SSOL (hook skipped); x30 is untouched so the body RETs
+         * to the real caller. Robust for the ART-invoke path, where LR cannot
+         * distinguish a real call from a call-original (both arrive via ART invoke
+         * stubs). Scan every region's whole override table. */
         for (int i = 0; i < MAX_SSOL_RGN; i++) {
             struct ssol_rgn *s = &g_ssol[i];
-            if (!s->active || !s->bk_va || far != s->bk_va) continue;
+            if (!s->active) continue;
             if (s->pid && tgid != s->pid) continue;
-            byp_arm(tid, i);
-            regs->pc = s->entry;
-            s->n_orig++;
-            fargs->skip_origin = 1;
-            fargs->ret = 0;
-            return;
+            for (int k = 0; k < MAX_SSOL_OV; k++) {
+                if (s->ov_off[k] == OV_NONE || !s->ov_bk[k] || far != s->ov_bk[k]) continue;
+                uint64_t entry = s->page + s->ov_off[k];
+                byp_arm(tid, entry);
+                regs->pc = entry;
+                s->n_orig++;
+                fargs->skip_origin = 1;
+                fargs->ret = 0;
+                return;
+            }
         }
 
         for (int i = 0; i < MAX_SSOL_RGN; i++) {
@@ -807,19 +832,19 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
             uint64_t roff = far - s->page;
             uint32_t insn = s->insns[roff >> 2];
 
-            /* hooked-fn entry: redirect to the trampoline, UNLESS a one-shot
-             * call-original bypass is armed for this thread+region (set when this
-             * region's bk_va was hit) -> run the body via SSOL instead. */
-            if (s->entry && far == s->entry) {
-                if (byp_take(tid, i)) {
-                    /* call-original: fall through to SSOL the entry instruction */
-                } else if (s->replace) {
-                    regs->pc = s->replace; /* hook fires */
-                    s->n_hook++;
-                    fargs->skip_origin = 1;
-                    fargs->ret = 0;
-                    return;
-                }
+            /* hooked-fn entry: if this fault is at one of the region's hooked entries,
+             * redirect to its trampoline -- UNLESS a one-shot call-original bypass is
+             * armed for this thread+entry (set when that entry's bk_va was hit), in
+             * which case run the body via SSOL instead. Inert slots hold OV_NONE, which
+             * never equals a real region offset (roff < npages*0x1000). */
+            for (int k = 0; k < MAX_SSOL_OV; k++) {
+                if (s->ov_off[k] != roff) continue;
+                if (byp_take(tid, far)) break; /* call-original: fall through to SSOL */
+                regs->pc = s->ov_replace[k];   /* hook fires */
+                s->n_hook++;
+                fargs->skip_origin = 1;
+                fargs->ret = 0;
+                return;
             }
 
             /* PC-relative -> simulate in place (literal pool read from the snapshot) */
@@ -2319,7 +2344,7 @@ static int ssol_inject_xol(void *mm, uint64_t xol_va, uint64_t template_va, uint
  * (the trampoline); the hook frontend runs the original by jumping to `bk_va` (an
  * unmapped VA = `backup`), which arms a one-shot bypass + runs the body via SSOL.
  * UXN-traps [func_page, +npages). Tear down with `ssoldisarm`. */
-static long do_ssolarm(uint64_t pid, uint64_t func, uint64_t npages, uint64_t xol_va, uint64_t entry,
+static long do_ssolarm(uint64_t pid, uint64_t base, uint64_t npages, uint64_t xol_va, uint64_t entry,
                        uint64_t replace, uint64_t bk_va, char *p, char *e)
 {
     resolve_syms();
@@ -2333,7 +2358,60 @@ static long do_ssolarm(uint64_t pid, uint64_t func, uint64_t npages, uint64_t xo
         apps(p, e, "error: bad npages (1..MAX_RGN)\n");
         return -1;
     }
-    uint64_t page = func & ~0xFFFUL;
+    uint64_t page = base & ~0xFFFUL;
+    uint64_t region_end = page + npages * 0x1000UL;
+    /* an entry override (ssolhook) must land inside [page, region_end) and be aligned;
+     * entry == 0 is a pure pass-through region (ssoltest, every insn just runs). */
+    if (entry && (entry < page || entry >= region_end || (entry & 3))) {
+        apps(p, e, "error: entry outside region / misaligned\n");
+        return -1;
+    }
+
+    /* LSPlant hooks one qc at a time; several can share a region (same page range). If
+     * this region is already armed for the process, just APPEND the {entry_off ->
+     * replace, bk_va} override to its table -- no re-arm/re-snapshot, the whole-region
+     * UXN trap + snapshot + xol scratch are already in place. Mirrors do_pghook. */
+    for (int i = 0; i < MAX_SSOL_RGN; i++) {
+        struct ssol_rgn *s = &g_ssol[i];
+        if (!s->active || s->pid != (int)pid || s->page != page) continue;
+        if (s->npages != (int)npages) {
+            apps(p, e, "error: region armed with a different npages (ssoldisarm first)\n");
+            return -1;
+        }
+        if (entry) {
+            uint64_t off = entry - page;
+            int k = -1, freek = -1;
+            for (int j = 0; j < MAX_SSOL_OV; j++) {
+                if (s->ov_off[j] == off) { k = j; break; }       /* re-hook same entry */
+                if (freek < 0 && s->ov_off[j] == OV_NONE) freek = j;
+            }
+            if (k < 0) k = freek; /* claim an inert slot */
+            if (k < 0) {
+                apps(p, e, "error: ssol override table full\n");
+                return -1;
+            }
+            int fresh = (s->ov_off[k] != off);
+            ssol_set_ov(s, k, off, replace, bk_va); /* key-last publish (see ssol_set_ov) */
+            if (fresh) s->nov++;
+        }
+        p = apps(p, e, "ok: ssolarm slot=");
+        p = appdec(p, e, i);
+        p = apps(p, e, " (appended) pid=");
+        p = appdec(p, e, (long)pid);
+        p = apps(p, e, " page=");
+        p = apphex(p, e, page);
+        p = apps(p, e, " entry=");
+        p = apphex(p, e, entry);
+        p = apps(p, e, " replace=");
+        p = apphex(p, e, replace);
+        p = apps(p, e, " bk_va=");
+        p = apphex(p, e, bk_va);
+        p = apps(p, e, " nov=");
+        p = appdec(p, e, s->nov);
+        apps(p, e, "\n");
+        return 0;
+    }
+
     int si = -1;
     for (int i = 0; i < MAX_SSOL_RGN; i++)
         if (!g_ssol[i].active) {
@@ -2420,9 +2498,15 @@ static long do_ssolarm(uint64_t pid, uint64_t func, uint64_t npages, uint64_t xo
     }
     s->page = page;
     s->npages = (int)npages;
-    s->entry = entry;
-    s->replace = replace;
-    s->bk_va = bk_va;
+    for (int k = 0; k < MAX_SSOL_OV; k++) s->ov_off[k] = OV_NONE; /* all slots inert */
+    s->nov = 0;
+    if (entry) {
+        /* not yet active/UXN-armed -> no fault can race; set ov[0] directly */
+        s->ov_off[0] = entry - page;
+        s->ov_replace[0] = replace;
+        s->ov_bk[0] = bk_va;
+        s->nov = 1;
+    }
     s->insns = insns;
     s->xol_kaddr = xol_kaddr;
     s->xol_va = xol_va & ~0xFFFUL;
@@ -2502,6 +2586,78 @@ static long do_ssoldisarm(char *p, char *e)
     return 0;
 }
 
+/* ssolunhook <pid> <region_base> <entry>: remove ONE override from an SSOL region
+ * (mirrors LSPlant inline_unhooker / do_pgunhook). The entry reverts to running its
+ * body straight via SSOL (no trampoline redirect). When the region's last override is
+ * removed, fully disarm it: restore every UXN'd PTE, free the snapshot + xol scratch.
+ * Runs in the sleepable bridge/supercall context. */
+static long do_ssolunhook(uint64_t pid, uint64_t base, uint64_t entry, char *p, char *e)
+{
+    uint64_t page = base & ~0xFFFUL;
+    for (int i = 0; i < MAX_SSOL_RGN; i++) {
+        struct ssol_rgn *s = &g_ssol[i];
+        if (!s->active || s->pid != (int)pid || s->page != page) continue;
+        uint64_t off = entry - page;
+        int k = -1;
+        for (int j = 0; j < MAX_SSOL_OV; j++)
+            if (s->ov_off[j] == off) { k = j; break; }
+        if (k < 0) {
+            apps(p, e, "error: entry not hooked in this region\n");
+            return -1;
+        }
+        /* retire key-first: one store of OV_NONE makes the slot inert for the racing
+         * before_pf scan (the entry then runs its body straight via SSOL); the stale
+         * ov_replace/ov_bk are left as-is, never matched again. */
+        s->ov_off[k] = OV_NONE;
+        s->nov--;
+        if (s->nov > 0) {
+            p = apps(p, e, "ok: ssolunhook slot=");
+            p = appdec(p, e, i);
+            p = apps(p, e, " entry=");
+            p = apphex(p, e, entry);
+            p = apps(p, e, " nov=");
+            p = appdec(p, e, s->nov);
+            p = apps(p, e, " (region still armed)\n");
+            return 0;
+        }
+        /* last override gone -> disarm the whole region (restore every UXN'd PTE, then
+         * free the snapshot + xol scratch). Same race-free order as do_ssoldisarm. */
+        for (int j = 0; j < s->npages; j++)
+            if (s->ptep[j]) *(volatile uint64_t *)s->ptep[j] = s->pte_orig[j];
+        flush_tlb_all();
+        s->active = 0;
+        if (s->insns && fn_vfree) fn_vfree(s->insns);
+        s->insns = 0;
+        if (s->xol_kaddr) {
+            void *task = fn_find_get_task_by_vpid ? fn_find_get_task_by_vpid(s->pid) : 0;
+            if (task && !is_err_or_null(task) && fn_get_task_mm) {
+                void *mm = fn_get_task_mm(task);
+                if (!is_err_or_null(mm)) {
+                    uint64_t zero = 0;
+                    fn_apply_existing(mm, s->xol_va, 0x1000, (void *)inject_cb, &zero);
+                    flush_tlb_all();
+                    fn_mmput(mm);
+                }
+            }
+            if (fn_vfree) fn_vfree((void *)s->xol_kaddr);
+            s->xol_kaddr = 0;
+        }
+        if (g_nssol > 0) g_nssol--;
+        /* leave do_page_fault + the step hook installed: other SSOL/pghook regions may
+         * still be live, and the step hook is module-lifetime by design (teardown rule). */
+        p = apps(p, e, "ok: ssolunhook slot=");
+        p = appdec(p, e, i);
+        p = apps(p, e, " disarmed region=");
+        p = apphex(p, e, page);
+        p = apps(p, e, " nssol=");
+        p = appdec(p, e, g_nssol);
+        apps(p, e, "\n");
+        return 0;
+    }
+    apps(p, e, "error: region not armed for this pid\n");
+    return -1;
+}
+
 /* P1b-1 self-test of the single-step primitive: arm ONE step on the CALLER (the
  * shctl/manager thread) via the exact uprobes flow. On return to EL0 the caller
  * single-steps one harmless instruction -> ssol_step_fn -> g_selfstep_fired++.
@@ -2575,6 +2731,8 @@ static long do_ssolstat(char *p, char *e)
         p = apphex(p, e, s->page);
         p = apps(p, e, " npages=");
         p = appdec(p, e, s->npages);
+        p = apps(p, e, " nov=");
+        p = appdec(p, e, s->nov);
         p = apps(p, e, " n_sim=");
         p = appdec(p, e, s->n_sim);
         p = apps(p, e, " n_xol=");
@@ -2583,6 +2741,15 @@ static long do_ssolstat(char *p, char *e)
         p = appdec(p, e, s->n_hook);
         p = apps(p, e, " n_orig=");
         p = appdec(p, e, s->n_orig);
+        for (int k = 0; k < MAX_SSOL_OV; k++) {
+            if (s->ov_off[k] == OV_NONE) continue;
+            p = apps(p, e, "\n   ov off=");
+            p = apphex(p, e, s->ov_off[k]);
+            p = apps(p, e, " replace=");
+            p = apphex(p, e, s->ov_replace[k]);
+            p = apps(p, e, " bk=");
+            p = apphex(p, e, s->ov_bk[k]);
+        }
     }
     apps(p, e, "\n");
     return 0;
@@ -2721,19 +2888,31 @@ static long shpte_run(const char *args, char *buf, int bufcap)
             apps(p, e, "usage: ssoltest <pid> <func_va> <npages> <xol_va>\n"), rc = -1;
         else
             rc = do_ssolarm(pid, func, n, xol, 0, 0, 0, p, e);
+    } else if (starts(a, "ssolunhook")) {
+        uint64_t pid = 0, base = 0, entry = 0;
+        const char *s = parse_ull(a + 10, &pid);
+        s = parse_ull(s, &base);
+        parse_ull(s, &entry);
+        if (!pid || !base || !entry)
+            apps(p, e, "usage: ssolunhook <pid> <region_base> <entry_va>\n"), rc = -1;
+        else
+            rc = do_ssolunhook(pid, base, entry, p, e);
     } else if (starts(a, "ssolhook")) {
-        uint64_t pid = 0, func = 0, n = 0, xol = 0, rep = 0, bk = 0;
+        uint64_t pid = 0, base = 0, n = 0, xol = 0, entry = 0, rep = 0, bk = 0;
         const char *s = parse_ull(a + 8, &pid);
-        s = parse_ull(s, &func);
+        s = parse_ull(s, &base);
         s = parse_ull(s, &n);
         s = parse_ull(s, &xol);
+        s = parse_ull(s, &entry);
         s = parse_ull(s, &rep);
         parse_ull(s, &bk);
-        if (!pid || !func || !n || !xol || !rep || !bk)
-            apps(p, e, "usage: ssolhook <pid> <func_va> <npages> <xol_va> <replace_va> <backup_va>\n"),
+        if (!pid || !base || !n || !xol || !entry || !rep || !bk)
+            apps(p, e,
+                 "usage: ssolhook <pid> <region_base> <npages> <xol_va> <entry_va> <replace_va> "
+                 "<backup_va>\n"),
                 rc = -1;
         else
-            rc = do_ssolarm(pid, func, n, xol, func, rep, bk, p, e);
+            rc = do_ssolarm(pid, base, n, xol, entry, rep, bk, p, e);
     } else if (starts(a, "ssoldisarm")) {
         rc = do_ssoldisarm(p, e);
     } else if (starts(a, "pte")) {

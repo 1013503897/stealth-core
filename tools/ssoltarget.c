@@ -66,21 +66,38 @@ __attribute__((aligned(4096), noinline)) int hook_me(int a, int b)
 {
     return a + b; /* leaf: x30 flows through, so call-original RETs back into tramp */
 }
+/* P3 multi-ov: a SECOND hooked method packed onto hook_me's SAME page (NOT aligned ->
+ * lands right after hook_me). The KPM traps the page ONCE and hosts BOTH entries as two
+ * overrides {ov0=hook_me, ov1=hook_me2} of one ssol_rgn -- the multi-target path. */
+__attribute__((noinline)) int hook_me2(int a, int b)
+{
+    return a * b; /* distinct body (mul) so a wrong dispatch is obvious */
+}
 volatile int g_tramp_ran = 0;
+volatile int g_tramp2_ran = 0;
 /* the "trampoline": runs, then calls the ORIGINAL via backup = bk_va (an unmapped VA).
  * Jumping to bk_va faults -> the KPM arms a one-shot bypass + redirects to hook_me's
  * body (run via SSOL, hook skipped); x30 flows through so the body RETs back here. */
 #define BK_VA 0x5590000000ULL
+#define BK_VA2 0x5591000000ULL
 __attribute__((aligned(4096), noinline)) int tramp(int a, int b)
 {
     g_tramp_ran = 1;
     int (*volatile orig)(int, int) = (int (*)(int, int))BK_VA; /* backup = bk_va */
     return orig(a, b) + 1000;
 }
+/* second trampoline for hook_me2, on its own page; uses a distinct bk_va so the KPM
+ * bypasses exactly hook_me2's original (per-entry bypass keying). */
+__attribute__((aligned(4096), noinline)) int tramp2(int a, int b)
+{
+    g_tramp2_ran = 1;
+    int (*volatile orig)(int, int) = (int (*)(int, int))BK_VA2;
+    return orig(a, b) + 2000;
+}
 
-/* page-aligned TEXT separator so `tramp` OWNS its page (main/neighbors land on the
- * NEXT page) -- otherwise main packs into tramp's page and its LR would wrongly fall
- * inside [replace, replace+0x1000). An aligned data array does NOT separate .text. */
+/* page-aligned TEXT separator so `tramp`/`tramp2` OWN their pages (main/neighbors land
+ * on a LATER page) -- otherwise main packs into a trampoline's page. An aligned data
+ * array does NOT separate .text. */
 __attribute__((aligned(4096), noinline, used)) static int _pgsep(void) { return 0; }
 
 static int file_exists(const char *p)
@@ -99,7 +116,12 @@ int main(int argc, char **argv)
     printf("ssol_mix=%p\n", (void *)&ssol_mix);
     printf("ssol_indirect=%p\n", (void *)&ssol_indirect);
     printf("hook_me=%p\n", (void *)&hook_me);
+    printf("hook_me2=%p\n", (void *)&hook_me2);
     printf("tramp=%p\n", (void *)&tramp);
+    printf("tramp2=%p\n", (void *)&tramp2);
+    /* hook_me + hook_me2 MUST share a page for the single-region multi-ov test */
+    printf("hm_hm2_same_page=%d\n",
+           (((uintptr_t)&hook_me & ~0xfffUL) == ((uintptr_t)&hook_me2 & ~0xfffUL)));
     printf("xol_va=0x5550000000\n");
     printf("go_file=%s\n", go);
     fflush(stdout);
@@ -117,15 +139,25 @@ int main(int argc, char **argv)
     long e2 = (long)(100 * 101 / 2) + (long)0x1234567890ABCDEFLL;
 
     g_tramp_ran = 0;
-    int (*volatile hm)(int, int) = hook_me; /* volatile fn-ptr -> real call (no fold) */
-    int r4 = hm(3, 4);                       /* hooked: redirected to tramp, which call-originals */
+    g_tramp2_ran = 0;
+    int (*volatile hm)(int, int) = hook_me;   /* volatile fn-ptr -> real call (no fold) */
+    int (*volatile hm2)(int, int) = hook_me2; /* the 2nd override on the same region */
+    int r4 = hm(3, 4);                         /* hooked: redirected to tramp -> call-original 7+1000 */
+    int r5 = hm2(3, 4);                        /* hooked: redirected to tramp2 -> call-original 12+2000 */
 
     printf("ssol_add(3,4)=%d expect=7 %s\n", r1, r1 == 7 ? "PASS" : "FAIL");
     printf("ssol_mix(100)=%ld expect=%ld %s\n", r2, e2, r2 == e2 ? "PASS" : "FAIL");
     printf("ssol_indirect(1)=%d expect=300 %s\n", r3, r3 == 300 ? "PASS" : "FAIL");
     printf("hook_me(3,4)=%d expect=1007 tramp_ran=%d %s\n", r4, g_tramp_ran,
            (r4 == 1007 && g_tramp_ran) ? "PASS" : "FAIL");
+    printf("hook_me2(3,4)=%d expect=2012 tramp2_ran=%d %s\n", r5, g_tramp2_ran,
+           (r5 == 2012 && g_tramp2_ran) ? "PASS" : "FAIL");
     printf("DONE\n");
     fflush(stdout);
-    return (r1 == 7 && r2 == e2 && r3 == 300 && r4 == 1007 && g_tramp_ran) ? 0 : 1;
+    /* linger ~3s so the driver can exercise ssolstat/ssolunhook while we're ALIVE
+     * (the realistic unhook-a-live-process scenario), before we exit. */
+    usleep(3000000);
+    return (r1 == 7 && r2 == e2 && r3 == 300 && r4 == 1007 && g_tramp_ran && r5 == 2012 && g_tramp2_ran)
+               ? 0
+               : 1;
 }
