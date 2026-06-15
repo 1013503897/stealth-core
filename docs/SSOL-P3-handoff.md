@@ -13,6 +13,13 @@
 （call-original）。克隆路线在复杂 app 上崩的两个结构性原因（代码/数据交织、克隆返回地址污染 ART 栈）
 机制层面全部解决。**剩下的是把它接进 Vector**（跨仓库 + gradle 构建），然后真机验。
 
+> **【2026-06-15 进度】§5.1 多目标 SSOL 区域 = DONE + 真机验证**（stealth-poc `46a34bf`，本地 main 未推）。
+> 一个 `ssol_rgn` 现在带 `MAX_SSOL_OV=16` 组 `{ov_off,ov_replace,ov_bk}`（仿 pghook `ov_off[]`），
+> 一页可挂多个 qc；`ssolhook` 新签名 `<pid> <region_base> <npages> <xol_va> <entry> <replace> <backup>`
+> 走 find-or-append；新增 `ssolunhook`（逐 ov 退役、最后一个 ov 走整区 disarm）。一次性旁路改按
+> **entry VA** keying。自测 hook_me+hook_me2 同页两 ov 全 PASS、call-original 各自正确、设备存活。
+> **§5.2 bk_va 由调用方传唯一未映射 VA**（KPM 不自分配）。**现从 §5.3 Vector 接线开始。**
+
 设备：Pixel 6 `1C091FDF6008DN`，APatch+KernelPatch，superkey `Lanhuachun2`，shctl 在
 `/data/local/tmp/shctl`，shpte.kpm 开机自动加载（bootstrap `load;probe;bridge`）。
 
@@ -91,16 +98,18 @@ ptep[],pte_orig[], n_sim,n_xol,n_hook,n_orig
 
 ## 5. 下一步要做的（P3 Vector 接线，按顺序）
 
-**5.1 KPM：`ssol_rgn` 扩成「一页多目标」**（LSPlant 一次 hook ~20 个 qc,很多共享代码页）。
-当前一个区域只存单个 `entry/replace/bk_va`。改成覆盖数组(仿 `pghook` 的 `ov_off[]/ov_replace[]`)：
-每页区域存 `N 组 {entry_off, replace, bk_va}`。`before_pf`:bk_va 派发改成在所有区域的所有 ov 里找
-`far==bk_va[k]`;entry 判定改成在本区域 ov 里找 `far-page==entry_off[k]`。一个 qc 一个 bk_va。
-（或更简单粗暴:一个 qc 一个 SSOL 区域,MAX_SSOL_RGN 已是 8,可调大;但同页多 qc 会重复陷同一页+重复快照,
-浪费且 UXN 互相覆盖 —— 所以**还是做成一页一区域多 ov 更对**,和 pghook 同构。)
+**5.1 KPM：`ssol_rgn` 扩成「一页多目标」 ✅ DONE（`46a34bf`）**。已实现:`ssol_rgn` 带
+`MAX_SSOL_OV=16` 组 `volatile {ov_off[], ov_replace[], ov_bk[]}`（OV_NONE 哨兵 = inert，仿 pghook）；
+`ssol_set_ov` key-last 发布、`OV_NONE` key-first 退役。`before_pf`:bk_va 派发扫所有区域所有 ov 找
+`far==ov_bk[k]`；entry 判定在本区域 ov 里找 `roff==ov_off[k]`。一次性旁路 re-key 成 **(tid, entry VA)**
+（`g_byp_entry[]`）。`do_ssolarm` 改 find-or-append（命中 (pid,page) 现有区域就追加 ov，否则新建）。
+`MAX_SSOL_RGN` 8→16。`ssolstat` 打印每条 ov。**做成「一页一区域多 ov」，和 pghook 同构（不是一 qc 一区域）。**
+*注:`ssolhook` 现在 base 与 entry 分开传，于是一个多页区域可把落在不同页的 entry 归到同一区域。*
 
-**5.2 KPM：bk_va 分配**。每个 hook 要一个唯一未映射 VA。简单方案:固定高基址 + hook 序号,如
-`0x5500000000 + idx*0x1000`。要保证目标进程里这些 VA 未映射(高地址通常空)。可由 KPM 在 ssolhook 时
-按区域+ov 序号自动算,或 Vector 侧传入。
+**5.2 KPM：bk_va 分配 ✅（定为调用方传入）**。每个 hook 一个唯一未映射 VA，由 **Vector 侧传入**
+（KPM 不自分配，`do_ssolarm` 直接存 `ov_bk`）。Vector 用固定高基址 + hook 序号,如 `0x5500000000 + idx*0x1000`,
+保证目标进程里未映射(高地址通常空)。自测里 hook_me/hook_me2 用 `0x5590000000`/`0x5591000000`。
+另已加 `ssolunhook <pid> <region_base> <entry>`(仿 pgunhook:逐 ov 退役,最后一个 ov 整区 disarm)供 `kpm_inline_unhooker`。
 
 **5.3 Vector：重写 `kpm_inline_hooker`(`Vector/native/src/kpm/kpmhook.c`)**:
 - 不再 `make_rgn`/建 DBI 克隆/发 `pghook`;改为算出 `qc` 所在页范围 → 发 `ssolhook <pid> <qc> <npages>
@@ -141,5 +150,6 @@ adb -s 1C091FDF6008DN push tools/run_ssoltest.sh /data/local/tmp/run_ssoltest.sh
 adb -s 1C091FDF6008DN shell "chmod 755 /data/local/tmp/ssoltarget /data/local/tmp/run_ssoltest.sh; su -c \"sed -i 's/\r\$//' /data/local/tmp/run_ssoltest.sh\""
 adb -s 1C091FDF6008DN reboot      # KPM 变了必须重启;等 boot_completed + bootstrap bridge
 adb -s 1C091FDF6008DN shell su -c 'sh /data/local/tmp/run_ssoltest.sh'
-# 期望:4 行全 PASS,hook_me(3,4)=1007,ssol[3] n_hook=1 n_orig=1,ssoldisarm regions=4,设备存活
+# 期望:5 行全 PASS(含 hook_me=1007 + hook_me2=2012),same_page=1,ssol[3] nov=2 n_hook=2 n_orig=2,
+#      ssolunhook ov1→"region still armed" / ov0→"disarmed region",末尾 nssol=0,设备存活
 ```
