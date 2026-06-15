@@ -121,6 +121,11 @@ static int (*fn_apply)(void *mm, unsigned long addr, unsigned long size, void *f
 static void *(*fn_vmalloc)(unsigned long size) = 0;
 static void (*fn_vfree)(void *addr) = 0;
 static unsigned long (*fn_vmalloc_to_pfn)(void *addr) = 0;
+/* SSOL single-step primitive (uprobes-style); resolved lazily in resolve_syms */
+static void (*fn_register_user_step_hook)(void *hook) = 0;
+static void (*fn_unregister_user_step_hook)(void *hook) = 0;
+static void (*fn_user_enable_single_step)(void *task) = 0;
+static void (*fn_user_disable_single_step)(void *task) = 0;
 
 /* ---- arm state ---- */
 enum { MODE_SELFHEAL = 0, MODE_REDIRECT = 1, MODE_REDIRECT_MAP = 2, MODE_REDIRECT_FIXED = 3 };
@@ -513,6 +518,99 @@ static enum ssol_action ssol_simulate(struct pt_regs *regs, uint32_t insn)
     return SSOL_XOL; /* PC-independent (ALU/MOV/LDR-STR reg/NOP/atomics/PAC branches) */
 }
 
+/* ===================== SSOL single-step engine (P1b) =====================
+ * uprobes' XOL trigger, driven by our UXN fault: for a PC-INDEPENDENT trapped
+ * instruction we copy it to a per-thread scratch slot, set pc there, and arm a HW
+ * single-step via the kernel's OWN exported primitives (user_enable_single_step +
+ * a registered user step-hook -- exactly what uprobes does). After the one insn
+ * runs at EL0, the software-step exception fires -> ssol_step_fn restores pc to the
+ * original next instruction and disables stepping. UXN stays armed throughout, so
+ * the next ORIGINAL instruction faults again -> the loop advances the stream with
+ * the original code at its original address (ART-intact, no clone, no code/data).
+ *
+ * P1b-1 (this commit) wires the step primitive + a `selfstep` self-test only; the
+ * full before_pf XOL dispatch is P1b-2. */
+
+#define DBG_HOOK_HANDLED 0
+#define DBG_HOOK_ERROR 1
+struct kp_list_head {
+    struct kp_list_head *next, *prev;
+};
+struct kp_step_hook {
+    struct kp_list_head node; /* kernel-managed list node; zero-init */
+    int (*fn)(struct pt_regs *regs, unsigned long esr);
+};
+
+/* per-thread SSOL context (keyed by tid, shhwbp slot-table style) */
+#define MAX_SSOL_CTX 64
+enum { SSOL_K_SELFSTEP = 1, SSOL_K_XOL = 2 };
+struct ssol_ctx {
+    volatile int active;
+    int tid;
+    int kind;
+    uint64_t resume_pc; /* pc ssol_step_fn restores after the step (XOL: orig+4) */
+    uint64_t xol_va;    /* scratch slot user VA (XOL) */
+};
+static struct ssol_ctx g_ctx[MAX_SSOL_CTX];
+static struct kp_step_hook g_step_hook;
+static volatile int g_step_registered = 0;
+static volatile long g_step_fires = 0; /* total step exceptions we consumed */
+static volatile long g_selfstep_armed = 0;
+static volatile long g_selfstep_fired = 0;
+
+static struct ssol_ctx *ctx_by_tid(int tid)
+{
+    for (int i = 0; i < MAX_SSOL_CTX; i++)
+        if (g_ctx[i].active && g_ctx[i].tid == tid) return &g_ctx[i];
+    return 0;
+}
+static struct ssol_ctx *ctx_free(void)
+{
+    for (int i = 0; i < MAX_SSOL_CTX; i++)
+        if (!g_ctx[i].active) return &g_ctx[i];
+    return 0;
+}
+
+/* registered user step-hook: fires on EVERY EL0 software-step exception (system
+ * wide). If current isn't mid-SSOL we return DBG_HOOK_ERROR so the kernel handles
+ * the step normally -- we never swallow a foreign stepper. */
+static int ssol_step_fn(struct pt_regs *regs, unsigned long esr)
+{
+    (void)esr;
+    if (!fn_task_pid_nr_ns) return DBG_HOOK_ERROR;
+    int tid = fn_task_pid_nr_ns((void *)get_current(), PIDTYPE_PID, 0);
+    struct ssol_ctx *c = ctx_by_tid(tid);
+    if (!c) return DBG_HOOK_ERROR;
+    g_step_fires++;
+    if (c->kind == SSOL_K_XOL)
+        regs->pc = c->resume_pc; /* resume original stream at orig+4 */
+    else
+        g_selfstep_fired++; /* SELFSTEP: just observe one step */
+    if (fn_user_disable_single_step) fn_user_disable_single_step((void *)get_current());
+    c->active = 0;
+    return DBG_HOOK_HANDLED;
+}
+
+static int ssol_ensure_step_hook(void)
+{
+    if (g_step_registered) return 0;
+    if (!fn_register_user_step_hook) return -1;
+    g_step_hook.node.next = 0;
+    g_step_hook.node.prev = 0;
+    g_step_hook.fn = ssol_step_fn;
+    fn_register_user_step_hook(&g_step_hook);
+    g_step_registered = 1;
+    return 0;
+}
+static void ssol_remove_step_hook(void)
+{
+    if (g_step_registered && fn_unregister_user_step_hook) {
+        fn_unregister_user_step_hook(&g_step_hook);
+        g_step_registered = 0;
+    }
+    for (int i = 0; i < MAX_SSOL_CTX; i++) g_ctx[i].active = 0;
+}
+
 /* ---- do_page_fault before-callback: self-heal the UXN execute fault ----
  * do_page_fault(unsigned long far, unsigned long esr, struct pt_regs *regs) */
 static void before_pf(hook_fargs3_t *fargs, void *udata)
@@ -798,6 +896,14 @@ static void resolve_syms(void)
     if (!fn_reg_hwbp) fn_reg_hwbp = (void *)kallsyms_lookup_name("register_user_hw_breakpoint");
     if (!fn_unreg_hwbp) fn_unreg_hwbp = (void *)kallsyms_lookup_name("unregister_hw_breakpoint");
     if (!fn_task_work_add) fn_task_work_add = (void *)kallsyms_lookup_name("task_work_add");
+    if (!fn_register_user_step_hook)
+        fn_register_user_step_hook = (void *)kallsyms_lookup_name("register_user_step_hook");
+    if (!fn_unregister_user_step_hook)
+        fn_unregister_user_step_hook = (void *)kallsyms_lookup_name("unregister_user_step_hook");
+    if (!fn_user_enable_single_step)
+        fn_user_enable_single_step = (void *)kallsyms_lookup_name("user_enable_single_step");
+    if (!fn_user_disable_single_step)
+        fn_user_disable_single_step = (void *)kallsyms_lookup_name("user_disable_single_step");
 }
 
 /* HWBP overflow handler: reroute the trapped target entry to `replace`. No perf
@@ -2009,6 +2115,70 @@ static long do_state(char *p, char *e)
     return 0;
 }
 
+/* P1b-1 self-test of the single-step primitive: arm ONE step on the CALLER (the
+ * shctl/manager thread) via the exact uprobes flow. On return to EL0 the caller
+ * single-steps one harmless instruction -> ssol_step_fn -> g_selfstep_fired++.
+ * Read it back with `ssolstat` (or a 2nd `selfstep`). Validates register_user_step_hook
+ * + user_enable_single_step + step delivery in isolation, with low blast radius. */
+static long do_selfstep(char *p, char *e)
+{
+    resolve_syms();
+    if (!fn_register_user_step_hook || !fn_user_enable_single_step || !fn_user_disable_single_step ||
+        !fn_task_pid_nr_ns) {
+        apps(p, e, "error: step symbols not resolved (run probe)\n");
+        return -1;
+    }
+    if (ssol_ensure_step_hook()) {
+        apps(p, e, "error: register_user_step_hook failed\n");
+        return -1;
+    }
+    void *cur = (void *)get_current();
+    int tid = fn_task_pid_nr_ns(cur, PIDTYPE_PID, 0);
+    if (ctx_by_tid(tid)) {
+        apps(p, e, "error: ctx busy for this tid\n");
+        return -1;
+    }
+    struct ssol_ctx *c = ctx_free();
+    if (!c) {
+        apps(p, e, "error: no free ctx\n");
+        return -1;
+    }
+    c->tid = tid;
+    c->kind = SSOL_K_SELFSTEP;
+    c->resume_pc = 0;
+    c->xol_va = 0;
+    c->active = 1; /* publish last: the step fires only after we return to EL0 */
+    g_selfstep_armed++;
+    fn_user_enable_single_step(cur); /* on return to EL0: 1 step -> ssol_step_fn */
+    p = apps(p, e, "ok: armed selfstep tid=");
+    p = appdec(p, e, tid);
+    p = apps(p, e, " armed=");
+    p = appdec(p, e, g_selfstep_armed);
+    p = apps(p, e, " fired(prev)=");
+    p = appdec(p, e, g_selfstep_fired);
+    apps(p, e, "\n");
+    return 0;
+}
+
+static long do_ssolstat(char *p, char *e)
+{
+    int nctx = 0;
+    for (int i = 0; i < MAX_SSOL_CTX; i++)
+        if (g_ctx[i].active) nctx++;
+    p = apps(p, e, "step_registered=");
+    p = appdec(p, e, g_step_registered);
+    p = apps(p, e, " selfstep_armed=");
+    p = appdec(p, e, g_selfstep_armed);
+    p = apps(p, e, " selfstep_fired=");
+    p = appdec(p, e, g_selfstep_fired);
+    p = apps(p, e, " step_fires=");
+    p = appdec(p, e, g_step_fires);
+    p = apps(p, e, " ctx_active=");
+    p = appdec(p, e, nctx);
+    apps(p, e, "\n");
+    return 0;
+}
+
 static long do_probe(char *p, char *e)
 {
     resolve_syms();
@@ -2034,6 +2204,14 @@ static long do_probe(char *p, char *e)
     p = apphex(p, e, (uint64_t)fn_vmalloc);
     p = apps(p, e, "\nvmalloc_to_pfn=");
     p = apphex(p, e, (uint64_t)fn_vmalloc_to_pfn);
+    p = apps(p, e, "\nregister_user_step_hook=");
+    p = apphex(p, e, (uint64_t)fn_register_user_step_hook);
+    p = apps(p, e, "\nunregister_user_step_hook=");
+    p = apphex(p, e, (uint64_t)fn_unregister_user_step_hook);
+    p = apps(p, e, "\nuser_enable_single_step=");
+    p = apphex(p, e, (uint64_t)fn_user_enable_single_step);
+    p = apps(p, e, "\nuser_disable_single_step=");
+    p = apphex(p, e, (uint64_t)fn_user_disable_single_step);
     apps(p, e, "\n");
     return 0;
 }
@@ -2120,6 +2298,10 @@ static long shpte_run(const char *args, char *buf, int bufcap)
 
     if (starts(a, "probe")) {
         rc = do_probe(p, e);
+    } else if (starts(a, "selfstep")) {
+        rc = do_selfstep(p, e);
+    } else if (starts(a, "ssolstat")) {
+        rc = do_ssolstat(p, e);
     } else if (starts(a, "pte")) {
         uint64_t pid = 0, addr = 0;
         const char *s = parse_ull(a + 3, &pid);
@@ -2316,6 +2498,7 @@ static long shpte_exit(void *__user reserved)
 {
     /* always restore + unhook so unload can't leave a UXN'd page or live hook */
     g_armed = 0;
+    ssol_remove_step_hook(); /* drop the user step-hook + clear SSOL ctxs */
     if (g_ptep) {
         *(volatile uint64_t *)g_ptep = g_pte_orig;
         flush_tlb_all();
