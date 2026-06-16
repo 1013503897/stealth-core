@@ -918,6 +918,19 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
                         g_ssol_refresh++;
                         s->n_refresh++;
                         stale = 1;
+                        /* if the drift is AT a hooked entry offset, that method's entry
+                         * bytes changed -> ART moved/evicted it and a neighbor now owns
+                         * this slot. Retire the stale override (key-first), else once the
+                         * refreshed snapshot matches live again (drift=0) the redirect
+                         * would WRONGLY route the neighbor to the moved method's
+                         * trampoline. lsplant re-arms at the method's new location. */
+                        for (int k = 0; k < MAX_SSOL_OV; k++) {
+                            if (s->ov_off[k] == roff) {
+                                s->ov_off[k] = OV_NONE;
+                                if (s->nov > 0) s->nov--;
+                                break;
+                            }
+                        }
                     }
                 }
             }
