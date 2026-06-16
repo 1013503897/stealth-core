@@ -608,9 +608,24 @@ struct ssol_rgn {
     uint64_t *ptep[MAX_RGN];
     uint64_t pte_orig[MAX_RGN];
     volatile long n_sim, n_xol, n_hook, n_orig;
+    volatile long n_drift, n_refresh; /* snapshot-staleness guard: drift hits / live refreshes */
 };
 static struct ssol_rgn g_ssol[MAX_SSOL_RGN];
 static volatile int g_nssol = 0;
+
+/* SSOL snapshot-staleness guard mode + counters (see ssol_read_live_u32 + the in-fault
+ * guard in before_pf). ART's JIT GC can free a neighbor method on a trapped page and a
+ * later compile can write NEW code into that freed slot -- the same physical page -- so
+ * the static snapshot mis-describes those bytes and simulate/XOL runs them -> SIGILL.
+ * 0=off (legacy: trust the snapshot), 1=observe (count drift, still run from snapshot --
+ * a regression-proof deploy default), 2=enforce (on drift, re-snapshot from live, run the
+ * REAL stream). Flip live via the `ssolguard` bridge command; no rebuild/reboot. */
+#define SSOL_GUARD_OFF     0
+#define SSOL_GUARD_OBSERVE 1
+#define SSOL_GUARD_ENFORCE 2
+static volatile int g_ssol_guard = SSOL_GUARD_ENFORCE;
+static volatile long g_ssol_drift = 0;   /* faults where snapshot != live */
+static volatile long g_ssol_refresh = 0; /* enforce-mode region refreshes */
 
 /* publish a new SSOL override key-last (replace + bk_va visible before the off key),
  * so a racing before_pf never matches an offset before its replacement/backup land. */
@@ -623,6 +638,56 @@ static inline void ssol_set_ov(struct ssol_rgn *s, int k, uint64_t off, uint64_t
 }
 
 static void sync_icache(void *addr, unsigned long size); /* defined below; used by the XOL copy */
+
+/* ===== SSOL snapshot-staleness guard (P3 5.6) =====
+ * Validate the static snapshot against LIVE user memory in the (non-sleepable) fault
+ * path, so ART's JIT page recycling can't make us execute stale bytes. We read the
+ * faulting VA directly with PAN disabled rather than via __va(pfn) -- this 6.1 GKI's
+ * linear-map PAGE_OFFSET is not assumed (the module deliberately avoids it). */
+static inline unsigned long ssol_irq_save(void)
+{
+    unsigned long f;
+    asm volatile("mrs %0, daif\n\tmsr daifset, #2" : "=r"(f)::"memory"); /* mask IRQ */
+    return f;
+}
+static inline void ssol_irq_restore(unsigned long f)
+{
+    asm volatile("msr daif, %0" ::"r"(f) : "memory");
+}
+/* One live instruction word at user VA `uaddr` in the current mm. The faulting page is
+ * present (we just execute-faulted on it) and readable (UXN gates exec, not read). IRQs
+ * off + PAN cleared (.inst d500409f = MSR PAN,#0 / d500419f = MSR PAN,#1) brackets the
+ * single load so an exception entry can't re-raise PAN mid-window and fault us. */
+static inline uint32_t ssol_read_live_u32(uint64_t uaddr, int *ok)
+{
+    uint32_t v;
+    unsigned long f = ssol_irq_save();
+    asm volatile(".inst 0xd500409f" ::: "memory"); /* MSR PAN, #0 -> allow EL1->EL0 */
+    v = *(const volatile uint32_t *)(uintptr_t)uaddr;
+    asm volatile(".inst 0xd500419f" ::: "memory"); /* MSR PAN, #1 -> restore */
+    ssol_irq_restore(f);
+    *ok = 1;
+    return v;
+}
+/* Re-read the region's live bytes into the snapshot (enforce-mode drift recovery). Only
+ * pages whose cached leaf PTE is still valid are refreshed; a not-present page is left as
+ * is and re-triggers later. One IRQ-off/PAN window per page bounds the masked interval to
+ * a single 4K copy. */
+static void ssol_refresh_region(struct ssol_rgn *s)
+{
+    for (int j = 0; j < s->npages; j++) {
+        uint64_t pte = *(volatile uint64_t *)s->ptep[j];
+        if (!(pte & PTE_VALID)) continue;
+        uint64_t uva = s->page + (uint64_t)j * 0x1000UL;
+        uint32_t *dst = s->insns + (uint64_t)j * 1024;
+        unsigned long f = ssol_irq_save();
+        asm volatile(".inst 0xd500409f" ::: "memory");
+        for (int w = 0; w < 1024; w++)
+            dst[w] = ((const volatile uint32_t *)(uintptr_t)uva)[w];
+        asm volatile(".inst 0xd500419f" ::: "memory");
+        ssol_irq_restore(f);
+    }
+}
 
 static struct ssol_ctx *ctx_by_tid(int tid)
 {
@@ -832,11 +897,39 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
             uint64_t roff = far - s->page;
             uint32_t insn = s->insns[roff >> 2];
 
+            /* snapshot-staleness guard (see g_ssol_guard): the simulate/XOL paths below
+             * EXECUTE the snapshot bytes (PC-relative literal-pool reads come from
+             * s->insns; the PC-independent path copies s->insns[roff] into the XOL slot
+             * and single-steps it). If ART recycled this page after we snapshotted it,
+             * those bytes are wrong -> corruption/SIGILL. Validate the faulting word
+             * against LIVE memory; enforce mode re-snapshots from live so we run the REAL
+             * current stream, and distrusts the hooked-entry redirect at a recycled
+             * offset (the method likely moved and a neighbor took the slot). */
+            int stale = 0;
+            if (g_ssol_guard) {
+                int ok = 0;
+                uint32_t live = ssol_read_live_u32(far, &ok);
+                if (ok && live != insn) {
+                    g_ssol_drift++;
+                    s->n_drift++;
+                    if (g_ssol_guard == SSOL_GUARD_ENFORCE) {
+                        ssol_refresh_region(s);
+                        insn = s->insns[roff >> 2];
+                        g_ssol_refresh++;
+                        s->n_refresh++;
+                        stale = 1;
+                    }
+                }
+            }
+
             /* hooked-fn entry: if this fault is at one of the region's hooked entries,
              * redirect to its trampoline -- UNLESS a one-shot call-original bypass is
              * armed for this thread+entry (set when that entry's bk_va was hit), in
              * which case run the body via SSOL instead. Inert slots hold OV_NONE, which
-             * never equals a real region offset (roff < npages*0x1000). */
+             * never equals a real region offset (roff < npages*0x1000). A drift-refreshed
+             * offset is NOT trusted as a hooked entry -- fall through to run the live
+             * bytes (lsplant re-establishes the hook on the method's new location). */
+            if (!stale)
             for (int k = 0; k < MAX_SSOL_OV; k++) {
                 if (s->ov_off[k] != roff) continue;
                 if (byp_take(tid, far)) break; /* call-original: fall through to SSOL */
@@ -2572,6 +2665,8 @@ static long do_ssolarm(uint64_t pid, uint64_t base, uint64_t npages, uint64_t xo
     s->n_xol = 0;
     s->n_hook = 0;
     s->n_orig = 0;
+    s->n_drift = 0;
+    s->n_refresh = 0;
     s->active = 1; /* publish before arming UXN */
     g_nssol++;
 
@@ -2774,6 +2869,12 @@ static long do_ssolstat(char *p, char *e)
     p = appdec(p, e, nctx);
     p = apps(p, e, " nssol=");
     p = appdec(p, e, g_nssol);
+    p = apps(p, e, " guard=");
+    p = appdec(p, e, g_ssol_guard);
+    p = apps(p, e, " drift=");
+    p = appdec(p, e, g_ssol_drift);
+    p = apps(p, e, " refresh=");
+    p = appdec(p, e, g_ssol_refresh);
     for (int i = 0; i < MAX_SSOL_RGN; i++) {
         struct ssol_rgn *s = &g_ssol[i];
         if (!s->active) continue;
@@ -2795,6 +2896,10 @@ static long do_ssolstat(char *p, char *e)
         p = appdec(p, e, s->n_hook);
         p = apps(p, e, " n_orig=");
         p = appdec(p, e, s->n_orig);
+        p = apps(p, e, " n_drift=");
+        p = appdec(p, e, s->n_drift);
+        p = apps(p, e, " n_refresh=");
+        p = appdec(p, e, s->n_refresh);
         for (int k = 0; k < MAX_SSOL_OV; k++) {
             if (s->ov_off[k] == OV_NONE) continue;
             p = apps(p, e, "\n   ov off=");
@@ -3019,6 +3124,47 @@ static long shpte_run(const char *args, char *buf, int bufcap)
         p = apps(p, e, " dead regions, nssol=");
         p = appdec(p, e, g_nssol);
         apps(p, e, "\n");
+    } else if (starts(a, "ssolguard")) {
+        /* ssolguard [mode]  -- set snapshot-staleness guard (0=off 1=observe 2=enforce);
+         * no arg just reports current mode + drift/refresh counters. parse_ull writes 0
+         * on empty input, so only apply when a digit was actually consumed. */
+        const char *start = skipsp(a + 9);
+        uint64_t mode = 0;
+        const char *after = parse_ull(start, &mode);
+        if (after != start && mode <= SSOL_GUARD_ENFORCE) g_ssol_guard = (int)mode;
+        p = apps(p, e, "ok: ssolguard mode=");
+        p = appdec(p, e, g_ssol_guard);
+        p = apps(p, e, " drift=");
+        p = appdec(p, e, g_ssol_drift);
+        p = apps(p, e, " refresh=");
+        p = appdec(p, e, g_ssol_refresh);
+        apps(p, e, "\n");
+    } else if (starts(a, "ssolpoison")) {
+        /* TEST-ONLY: corrupt one snapshot word so live != snapshot at the next fault,
+         * to deterministically exercise the staleness guard without waiting on ART JIT
+         * churn (logically identical: the snapshot mis-describes the live page).
+         * ssolpoison <slot> <word_off> <hexval>  (e.g. word_off 0 val 0 = UDF at entry). */
+        uint64_t slot = 0, woff = 0, val = 0;
+        const char *s = parse_ull(a + 10, &slot);
+        s = parse_ull(s, &woff);
+        parse_ull(s, &val);
+        if (slot >= MAX_SSOL_RGN || !g_ssol[slot].active || !g_ssol[slot].insns) {
+            apps(p, e, "error: bad/inactive ssol slot\n"), rc = -1;
+        } else if (woff >= (uint64_t)g_ssol[slot].npages * 1024) {
+            apps(p, e, "error: word_off out of region\n"), rc = -1;
+        } else {
+            uint32_t old = g_ssol[slot].insns[woff];
+            g_ssol[slot].insns[woff] = (uint32_t)val;
+            p = apps(p, e, "ok: poisoned slot=");
+            p = appdec(p, e, (long)slot);
+            p = apps(p, e, " woff=");
+            p = appdec(p, e, (long)woff);
+            p = apps(p, e, " old=");
+            p = apphex(p, e, old);
+            p = apps(p, e, " new=");
+            p = apphex(p, e, val);
+            apps(p, e, "\n");
+        }
     } else if (starts(a, "pgdisarm")) {
         rc = do_pgdisarm(p, e);
     } else if (starts(a, "pgunhook")) {
