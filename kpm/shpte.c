@@ -1697,6 +1697,26 @@ static long do_unhidemaps(char *p, char *e)
     return 0;
 }
 
+/* add (mm,page) to the general maps-hide set if not already present; mm is used for
+ * equality only (never dereferenced). Returns 1 if added/already-present, 0 if full.
+ * Shared by do_hidergn (the userspace trampoline-hide glue) and do_ssolarm (auto-hide
+ * the per-region xol scratch so a fix#1 re-arm's fresh xol can't leak on S2). */
+static int hide_add_locked(void *mm, uint64_t page)
+{
+    page &= ~0xFFFUL;
+    for (int i = 0; i < MAX_HIDE; i++)
+        if (g_hide[i].mm == mm && g_hide[i].page == page) return 2; /* already present */
+    for (int i = 0; i < MAX_HIDE; i++)
+        if (g_hide[i].mm == 0) {
+            g_hide[i].mm = mm;
+            g_hide[i].page = page;
+            g_nhide++;
+            ensure_maps_hooked(); /* best-effort: arm show_map/show_smap so the hide takes effect */
+            return 1; /* freshly added */
+        }
+    return 0; /* hide-set full */
+}
+
 /* hidergn <pid> <addr>: add the page containing `addr` (in pid's mm) to the general hide-set,
  * so an in-process maps/smaps scan never sees it. Used by the glue to hide the LSPlant
  * trampoline pool (rwxp anon). mm-gated like the clone hide; auto-cleared when the process is
@@ -1720,26 +1740,12 @@ static long do_hidergn(uint64_t pid, uint64_t addr, char *p, char *e)
     }
     fn_mmput(mm); /* pointer used for equality only, never dereferenced */
     uint64_t page = addr & ~0xFFFUL;
-    for (int i = 0; i < MAX_HIDE; i++)
-        if (g_hide[i].mm == mm && g_hide[i].page == page) {
-            apps(p, e, "ok: hidergn already present\n");
-            return 0;
-        }
-    int slot = -1;
-    for (int i = 0; i < MAX_HIDE; i++)
-        if (g_hide[i].mm == 0) {
-            slot = i;
-            break;
-        }
-    if (slot < 0) {
+    int hr = hide_add_locked(mm, page);
+    if (hr == 0) {
         apps(p, e, "error: hide-set full\n");
         return -1;
     }
-    g_hide[slot].mm = mm;
-    g_hide[slot].page = page;
-    g_nhide++;
-    ensure_maps_hooked(); /* best-effort: arm show_map/show_smap so the hide takes effect */
-    p = apps(p, e, "ok: hidergn page=");
+    p = apps(p, e, hr == 2 ? "ok: hidergn already present page=" : "ok: hidergn page=");
     p = apphex(p, e, page);
     p = apps(p, e, " nhide=");
     p = appdec(p, e, g_nhide);
@@ -2687,6 +2693,11 @@ static long do_ssolarm(uint64_t pid, uint64_t base, uint64_t npages, uint64_t xo
         *(volatile uint64_t *)s->ptep[j] = s->pte_orig[j] | PTE_UXN;
     flush_tlb_all();
 
+    /* auto-hide the xol scratch page (anon-exec) from in-process maps/smaps scans, so
+     * even a fix#1 re-arm (which the one-shot userspace trampoline-hide scan would miss)
+     * never leaks an unlabeled exec page on S2. */
+    if (s->mm && s->xol_va) hide_add_locked(s->mm, s->xol_va);
+
     p = apps(p, e, "ok: ssolarm slot=");
     p = appdec(p, e, si);
     p = apps(p, e, " pid=");
@@ -2888,6 +2899,8 @@ static long do_ssolstat(char *p, char *e)
     p = appdec(p, e, g_ssol_drift);
     p = apps(p, e, " refresh=");
     p = appdec(p, e, g_ssol_refresh);
+    p = apps(p, e, " nhide=");
+    p = appdec(p, e, g_nhide);
     for (int i = 0; i < MAX_SSOL_RGN; i++) {
         struct ssol_rgn *s = &g_ssol[i];
         if (!s->active) continue;
