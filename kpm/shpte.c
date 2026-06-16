@@ -2339,6 +2339,53 @@ static int ssol_inject_xol(void *mm, uint64_t xol_va, uint64_t template_va, uint
     return 0;
 }
 
+/* GC SSOL region slots whose owning process has exited (find_get_task_by_vpid -> NULL).
+ * The SSOL analogue of gc_dead_slots_locked (clone path): runs only in the serialized,
+ * sleepable supercall context (do_ssolarm / `ssolgc`), so it can vfree and never races
+ * do_ssolarm. Safe vs before_pf: a dead slot is published inert (active=0) before any
+ * free, and a dead pid can't pass before_pf's `tgid == s->pid` gate, so the dead region
+ * is never read while being torn down. Like the clone GC we DON'T touch the dead mm's
+ * page tables (s->ptep -> UXN restore) nor its user xol VA: that mm is being freed, so
+ * dereferencing its page-table pointers could UAF -- we only vfree the kernel-side
+ * vmalloc allocations (insns snapshot + xol_kaddr alias), which are ours regardless of
+ * the process. (Without this, exited gated processes leak SSOL slots until MAX_SSOL_RGN
+ * fills and new Java-qc hooks fail -> LSPlant falls back to DETECTABLE in-place.) */
+static int gc_dead_ssol_locked(void)
+{
+    int freed = 0;
+    for (int i = 0; i < MAX_SSOL_RGN; i++) {
+        struct ssol_rgn *s = &g_ssol[i];
+        if (!s->active) continue;
+        void *task = fn_find_get_task_by_vpid ? fn_find_get_task_by_vpid(s->pid) : 0;
+        if (!is_err_or_null(task)) continue; /* alive (ref leaked -- rare, acceptable) */
+        void *dead_mm = s->mm;
+        s->active = 0; /* publish inert before freeing (before_pf skips) */
+        if (s->insns && fn_vfree) fn_vfree(s->insns);
+        s->insns = 0;
+        if (s->xol_kaddr && fn_vfree) fn_vfree((void *)s->xol_kaddr);
+        s->xol_kaddr = 0;
+        s->mm = 0;
+        s->nov = 0;
+        if (g_nssol > 0) g_nssol--;
+        freed++;
+        /* drop this dead process's general hide-set entries (its mm is being freed; a
+         * stale mm pointer could false-match a reused mm and hide a line in a new
+         * process) -- identical rationale to gc_dead_slots_locked. */
+        if (dead_mm)
+            for (int j = 0; j < MAX_HIDE; j++)
+                if (g_hide[j].mm == dead_mm) {
+                    g_hide[j].mm = 0;
+                    g_hide[j].page = 0;
+                    if (g_nhide > 0) g_nhide--;
+                }
+    }
+    if (freed) {
+        maybe_unhook_pf();
+        maybe_unhook_maps();
+    }
+    return freed;
+}
+
 /* Core SSOL region arm. entry/replace/bk_va=0 -> pure pass-through (ssoltest);
  * nonzero -> entry override (ssolhook): a real call to `entry` routes to `replace`
  * (the trampoline); the hook frontend runs the original by jumping to `bk_va` (an
@@ -2419,7 +2466,14 @@ static long do_ssolarm(uint64_t pid, uint64_t base, uint64_t npages, uint64_t xo
             break;
         }
     if (si < 0) {
-        apps(p, e, "error: ssol region table full\n");
+        /* table full -- reap slots whose process exited, then retry (else this Java-qc
+         * hook would fall back to DETECTABLE in-place, breaking tracelessness) */
+        if (gc_dead_ssol_locked() > 0)
+            for (int i = 0; i < MAX_SSOL_RGN; i++)
+                if (!g_ssol[i].active) { si = i; break; }
+    }
+    if (si < 0) {
+        apps(p, e, "error: ssol region table full (no dead slots to reap)\n");
         return -1;
     }
     struct ssol_rgn *s = &g_ssol[si];
@@ -2957,6 +3011,13 @@ static long shpte_run(const char *args, char *buf, int bufcap)
         p = appdec(p, e, n);
         p = apps(p, e, " dead slots, npg=");
         p = appdec(p, e, g_npg);
+        apps(p, e, "\n");
+    } else if (starts(a, "ssolgc")) {
+        int n = gc_dead_ssol_locked();
+        p = apps(p, e, "ok: ssolgc reaped ");
+        p = appdec(p, e, n);
+        p = apps(p, e, " dead regions, nssol=");
+        p = appdec(p, e, g_nssol);
         apps(p, e, "\n");
     } else if (starts(a, "pgdisarm")) {
         rc = do_pgdisarm(p, e);
