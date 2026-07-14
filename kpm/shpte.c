@@ -202,6 +202,15 @@ static uint64_t *g_ptep = 0;        /* cached kernel VA of the leaf PTE */
 static uint64_t g_pte_orig = 0;     /* original PTE value (UXN clear) */
 static volatile long g_faults = 0;
 static volatile long g_redirects = 0;
+/* ESR gate telemetry: do_page_fault fires for EVERY fault system-wide (instruction AND
+ * data aborts route through it, distinguished only by ESR.EC). before_pf must claim ONLY
+ * a genuine UXN execute trap (EL0 instruction abort + permission fault). g_pf_passthru
+ * counts faults that fell inside a trapped region's page-range but were NOT our execute
+ * trap (a data abort, or a translation fault on a reclaimed file-backed .text page) -- these
+ * are now passed through to the real do_page_fault instead of being hijacked into the clone
+ * (which starved the real handler and yanked PC into clone code -> the flaky ART crash). A
+ * nonzero value here on a crashy target is the smoking gun that the ESR gate was needed. */
+static volatile long g_pf_passthru = 0;
 /* P4.1 maps-hide state */
 static volatile int g_maps_hooked = 0;
 static volatile uint64_t g_hide_page = 0; /* VMA vm_start to drop from maps */
@@ -781,12 +790,27 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
     uint64_t fpage = far & ~0xfffUL;
     struct pt_regs *regs = (struct pt_regs *)fargs->arg2;
 
+    /* ---- ESR gate: is this fault actually our UXN execute trap? ----
+     * do_page_fault(far, esr, regs) fires for EVERY EL0 fault in the system while hooked --
+     * instruction aborts AND data aborts, translation faults AND permission faults, all routed
+     * here and distinguished only by ESR. A UXN (execute-never) trap on a present code page
+     * raises EXACTLY one shape: an EL0 instruction abort (EC == 0x20) with a permission fault
+     * status (FSC == 0b0011LL, i.e. 0x0C..0x0F). Anything else that merely lands in a trapped
+     * region's page-range -- a data read/write abort, or a translation fault on a file-backed
+     * .text page the kernel reclaimed under memory pressure -- is NOT ours: claiming it would
+     * starve the real handler (skip_origin) and reroute an innocent access's PC into the clone.
+     * The clone (arm/redirect/pghook) paths gate on this; the SSOL path intentionally does NOT
+     * (it also dispatches on translation faults at its unmapped bk_va call-original VAs). */
+    uint64_t esr = fargs->arg1;
+    int is_xtrap = (((esr >> 26) & 0x3f) == 0x20) /* EC = instruction abort from EL0 */
+                   && ((esr & 0x3c) == 0x0c);      /* FSC = permission fault (any level) */
+
     /* ---- single-page path (arm / redirect / redirectmap / pagehook) ----
      * cheap fast-path: page compare first, only then compute the faulting tgid
      * (do_page_fault runs for every fault system-wide while we're hooked). On a
      * page match with a mismatched tgid (same VA, different process) we fall
      * through to the multi-page scan rather than claiming the fault. */
-    if (g_armed && fpage == g_target_page &&
+    if (g_armed && is_xtrap && fpage == g_target_page &&
         (!fn_task_pid_nr_ns ||
          fn_task_pid_nr_ns((void *)get_current(), PIDTYPE_TGID, 0) == g_target_pid)) {
         g_faults++;
@@ -838,6 +862,13 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
             if (fn_task_pid_nr_ns &&
                 fn_task_pid_nr_ns((void *)get_current(), PIDTYPE_TGID, 0) != s->pid)
                 continue; /* same VA in another process -> not our trap */
+            /* ESR gate: the fault landed in this region, but only an EL0 instruction-abort +
+             * permission fault is our UXN execute trap. A data abort here (RASP/ART touching the
+             * page as data) or a translation fault on a reclaimed .text page is NOT ours -- pass
+             * it through to the real do_page_fault (demand-page / resolve it) rather than yanking
+             * PC into the clone. Passing an execute-translation fault through un-traps that page
+             * until re-armed (hook temporarily missed on it) -- benign vs. the alternative crash. */
+            if (!is_xtrap) { g_pf_passthru++; break; }
             uint64_t roff = far - s->page; /* region-relative byte offset */
             uint64_t rep = 0;
             for (int k = 0; k < MAX_OV; k++) /* inert slots hold OV_NONE -> never match roff */
@@ -2363,6 +2394,8 @@ static long do_state(char *p, char *e)
     p = appdec(p, e, g_faults);
     p = apps(p, e, " redirects=");
     p = appdec(p, e, g_redirects);
+    p = apps(p, e, " pf_passthru=");
+    p = appdec(p, e, g_pf_passthru);
     p = apps(p, e, " maps_hooked=");
     p = appdec(p, e, g_maps_hooked);
     p = apps(p, e, " hide_page=");
