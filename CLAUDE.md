@@ -2,7 +2,9 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-`stealth-poc` is one subproject of the `at-xx-hook` mono-repo (see `../CLAUDE.md`). It is a
+`stealth-poc` lives in the `hook-lab/` workspace (see `../CLAUDE.md`) as the **kernel source of
+Vector's KPM traceless-hook backend** (`../Vector` links vendored copies of `lib/kpmhook`+`lib/dbi`).
+It stays an independent git repo (remote `github.com/1013503897/stealth-poc`). It is a
 clean-room PoC for **kernel-level traceless hooking** on Android ARM64: intercept a target's
 execution *without modifying any of its memory* (no `.text` patch, no injected SO, no anonymous
 executable maps), so it survives CRC / maps-scan anti-tamper. It is built on **APatch /
