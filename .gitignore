@@ -18,3 +18,12 @@
 # device-deploy artifacts (contain the APatch superkey -- never commit)
 _kpmboot/
 kpm_bootstrap.zip
+
+# large extracted libs / scratch db (kpm symbol tooling)
+/kpm/*.so
+/kpm/mc.db
+# compiled android tools (NDK clang outputs)
+/tools/kpmhooktool
+/tools/libartcensus
+/tools/rgntool
+/tools/ssoltarget
