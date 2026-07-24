@@ -20,7 +20,7 @@
 > **entry VA** keying。自测 hook_me+hook_me2 同页两 ov 全 PASS、call-original 各自正确、设备存活。
 > **§5.2 bk_va 由调用方传唯一未映射 VA**（KPM 不自分配）。**现从 §5.3 Vector 接线开始。**
 
-设备：Pixel 6 `1C091FDF6008DN`，APatch+KernelPatch，superkey `Lanhuachun2`，shctl 在
+设备：Pixel 6 `1C091FDF6008DN`，APatch+KernelPatch（superkey 已于 2026-07-24 移除，shctl 首参传任意占位符即可），shctl 在
 `/data/local/tmp/shctl`，shpte.kpm 开机自动加载（bootstrap `load;probe;bridge`）。
 
 ---
@@ -40,7 +40,7 @@
 
 ## 3. KPM 侧已实现的 SSOL 契约（`kpm/shpte.c`，全部已 push origin/main）
 
-桥命令（`shctl Lanhuachun2 control shpte <cmd>`）：
+桥命令（`shctl <KEY> control shpte <cmd>`，KEY 为任意占位符）：
 - `selfstep` / `ssolstat` — 单步原语自测 + 计数查看。
 - `ssoltest <pid> <func_va> <npages> <xol_va>` — 纯透传 SSOL 区域（无入口覆盖），自测用。
 - `ssolhook <pid> <func_va> <npages> <xol_va> <replace_va> <backup_va>` — **带入口覆盖 + call-original**。
