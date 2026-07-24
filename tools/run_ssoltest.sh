@@ -5,7 +5,7 @@
 # hook_me + hook_me2 (two overrides {tramp,bk_va} on ONE trapped page), signals the
 # target, reports PASS/FAIL + the simulate/XOL/hook/orig counters, then exercises
 # ssolunhook (remove ov1, then ov0 -> region disarms) while the target is still alive.
-KEY=Lanhuachun2
+KEY=x   # superkey removed 2026-07-24; KP no longer validates, any placeholder works
 SHCTL=/data/local/tmp/shctl
 TGT=/data/local/tmp/ssoltarget
 GO=/data/local/tmp/ssol_go

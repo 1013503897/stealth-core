@@ -11,7 +11,7 @@
 #   guard=observe + no poison      -> r1=7, drift=0 (live==snapshot)          [no false positive]
 #
 # Usage: run_ssolguard_test.sh <mode 0|1|2> <poison_hex|none>
-KEY=Lanhuachun2
+KEY=x   # superkey removed 2026-07-24; KP no longer validates, any placeholder works
 SHCTL=/data/local/tmp/shctl
 TGT=/data/local/tmp/ssoltarget
 GO=/data/local/tmp/ssol_go

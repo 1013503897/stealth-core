@@ -5,7 +5,7 @@
 #   guard refreshes from live + retires ov0 -> hook_me runs UN-HOOKED (returns 7, not
 #   1007 via tramp), nov goes 1->0, no crash, no wrong-redirect.
 # Contrast: without poison the same hook returns 1007 (redirected to tramp).
-KEY=Lanhuachun2
+KEY=x   # superkey removed 2026-07-24; KP no longer validates, any placeholder works
 SHCTL=/data/local/tmp/shctl
 TGT=/data/local/tmp/ssoltarget
 GO=/data/local/tmp/ssol_go
