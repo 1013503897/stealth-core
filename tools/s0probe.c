@@ -16,18 +16,20 @@
 // RASP memory scan sees clean code instead of the recompiled clone.
 //
 // This is a READ-ONLY probe: it changes no kernel state beyond the normal hook it arms and
-// then removes. It does not modify shpte.c, does not reboot, and needs no superkey (the
-// bridge is auto-armed on boot via /data/adb/kpms + shpte auto-bridge).
+// then removes. It does not reboot, and needs no superkey (the bridge is auto-armed at boot
+// by the boot-EMBEDDED shpte KPM's init -- NOT from /data/adb/kpms, which is never loaded).
 //
 // Run as root so /proc/self/pagemap exposes the PRESENT bit unconditionally:
 //   adb shell su -c '/data/local/tmp/s0probe'
 // Build: build_s0probe.ps1 (links lib/dbi.c + lib/kpmhook.c, like kpmhooktool).
 
+#include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -103,7 +105,10 @@ static int count_anon_exec(void)
     return n;
 }
 
-/* PRESENT bit (bit 63) of /proc/self/pagemap for `addr`'s page. -1 on read error. */
+/* PRESENT bit (bit 63) of /proc/self/pagemap for `addr`'s page. -1 on read error.
+ * NOTE: the /proc pagemap walker iterates VMAs, so a VMA-less ghost page reads as a
+ * hole (present=0) even though the MMU has a live mapping -- another enumeration blind
+ * spot the ghost path opens (vs the legacy anon clone, which reads present=1). */
 static int pagemap_present(uint64_t addr)
 {
     int fd = open("/proc/self/pagemap", O_RDONLY);
@@ -114,6 +119,19 @@ static int pagemap_present(uint64_t addr)
     close(fd);
     if (r != (ssize_t)sizeof entry) return -1;
     return (int)((entry >> 63) & 1);
+}
+
+/* mincore() on the clone page -- the classic "is this VA backed by a VMA" enumeration
+ * probe. Legacy anon-RX clone: returns 0 with the resident bit set (fully enumerable).
+ * Ghost VMA-less clone: mincore fails ENOMEM because the range has no VMA -> the scanner
+ * is blind to it. Returns 1 = mapped+resident, 0 = mapped+not-resident, -1 = ENOMEM
+ * (VMA-less / unmapped -> enumeration blind), -2 = other error. */
+static int mincore_state(uint64_t addr)
+{
+    unsigned char vec = 0;
+    uint64_t page = addr & ~(uint64_t)0xfff;
+    if (mincore((void *)(uintptr_t)page, 0x1000, &vec) != 0) return (errno == ENOMEM) ? -1 : -2;
+    return vec & 1;
 }
 
 static void hexdump(const unsigned char *b, int n)
@@ -129,13 +147,15 @@ static void hexdump(const unsigned char *b, int n)
 int main(void)
 {
     kpm_hook_force_enable(); /* standalone: bypass the Vector-only process gate */
+    kpm_hook_set_ghost(1);   /* Rev1-(1): host the clone VMA-less (pghookg) -- what we measure */
     if (kpm_hook_init() != 0) {
-        printf("FATAL: bridge not armed -- need shpte.kpm loaded + bridge armed.\n");
-        printf("       (on this device that is automatic: /data/adb/kpms + auto-bridge)\n");
+        printf("FATAL: bridge not armed -- need shpte embedded in boot + bridge armed.\n");
+        printf("       (on this device that is automatic: boot-embedded KPM + shpte auto-bridge)\n");
         return 1;
     }
-    printf("== S0 probe: measuring the clone-readable exposure ==\n");
+    printf("== S0 probe (GHOST main-path): measuring clone enumerability + residual read ==\n");
     printf("KPM bridge is LIVE (probe replied) -> shpte loaded + auto-bridge armed.\n");
+    printf("mode: ghost=ON (pghookg) -- clone hosted VMA-less; expect maps/mincore/pagemap BLIND.\n");
     printf("pid=%d victim=%p replace=%p\n", getpid(), (void *)&victim, (void *)&replace_victim);
 
     volatile int warm = victim(1); /* page in victim .text so resolve_pte finds it present */
@@ -145,7 +165,11 @@ int main(void)
 
     g_bk = kpm_inline_hooker((void *)&victim, (void *)&replace_victim);
     if (!g_bk) {
-        printf("ERROR: hook failed (NULL backup) -- KPM pghook rejected. Nothing to measure.\n");
+        char dbg[1024];
+        kpm_query("dump", dbg, sizeof dbg);
+        printf("ERROR: hook failed (NULL backup) -- pghookg rejected or no ghost VA.\n");
+        printf("       Likely causes: ghost inject rc<0 (GUP read of RW clone failed), or\n");
+        printf("       pick_ghost_va found no gap. KPM state:\n%s\n", dbg);
         kpm_hook_shutdown();
         return 1;
     }
@@ -175,6 +199,14 @@ int main(void)
     printf("    anon r-x exec mappings: before=%d after=%d (clone added no VISIBLE exec region)\n",
            anon_before, anon_after);
 
+    /* [1b] mincore() -- the VMA-existence enumeration probe */
+    int mc = mincore_state(bk);
+    printf("[1b] mincore(clone page) = %s\n",
+           mc == 1    ? "RESIDENT (mapped VMA -> enumerable; legacy anon clone)"
+           : mc == 0  ? "mapped, not resident (still a VMA -> enumerable)"
+           : mc == -1 ? "ENOMEM (no VMA -> mincore is BLIND to it; ghost works)"
+                      : "error (other)");
+
     /* [2] READABLE directly at its VA? */
     unsigned char buf[64];
     memcpy(buf, (void *)(uintptr_t)bk, sizeof buf);
@@ -201,18 +233,26 @@ int main(void)
            (void *)&victim);
     hexdump(vbuf, 32);
 
-    printf("== VERDICT ==\n");
-    if (!covered && present == 1) {
-        printf("EXPOSURE CONFIRMED: the clone at 0x%" PRIx64 " is HIDDEN from /proc/self/maps yet\n", bk);
-        printf("  directly READABLE + EXECUTABLE + PRESENT. A detector that scans memory by\n");
-        printf("  address (walking the gaps, not trusting maps) still reads the hook clone.\n");
-        printf("  => This is the residual attack surface the Shadow-Page (S1..S3) upgrade closes.\n");
+    printf("== VERDICT (ghost main-path) ==\n");
+    int enum_blind = (!covered) && (mc == -1);
+    if (enum_blind) {
+        printf("GHOST OK -- clone 0x%" PRIx64 " is ENUMERATION-BLIND:\n", bk);
+        printf("  [1] absent from /proc/self/maps, [1b] mincore ENOMEM (no VMA),\n");
+        printf("  [4] pagemap present=%d (VMA-less -> reads as a hole).\n", present);
+        printf("  A RASP that walks maps / mincore-probes gaps / scans pagemap for present-but-\n");
+        printf("  unlisted pages CANNOT locate this clone. vs the LEGACY anon-RX baseline (prior\n");
+        printf("  run: maps-hidden but mincore-RESIDENT + pagemap-present -> discoverable), the\n");
+        printf("  enumeration surface measured in S0 is now CLOSED.\n");
+        printf("  Honest boundary: [2] a direct read at the KNOWN VA still succeeds and [3] it\n");
+        printf("  still executes -- ghost defeats DISCOVERY, not read-at-a-leaked-pointer. Sealing\n");
+        printf("  that residual is the Shadow-Page (S1..S3) job (see 2026-07-28 doc), a later tier.\n");
     } else if (covered) {
-        printf("clone is STILL LISTED in maps (auto-hide inactive?) -- the readable exposure is\n");
-        printf("  even more direct: line above shows an anon r-x region a maps-scan flags outright.\n");
+        printf("UNEXPECTED: clone is LISTED in maps (line above) -- ghost inject did not take.\n");
+        printf("  Check the KPM dump for ghost_va / a pghookg->pghook fallback (glue reverted).\n");
     } else {
-        printf("INCONCLUSIVE: covered=%d present=%d (investigate before drawing S0 conclusions)\n",
-               covered, present);
+        printf("UNEXPECTED: covered=%d mincore=%d present=%d -- ghost VA is unmapped-but-mincore\n",
+               covered, mc, present);
+        printf("  didn't ENOMEM as expected; investigate before drawing S0 conclusions.\n");
     }
 
     kpm_inline_unhooker((void *)&victim);

@@ -47,7 +47,7 @@
 #include <stdint.h>
 
 KPM_NAME("shpte");
-KPM_VERSION("0.6.1");
+KPM_VERSION("0.6.2");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("wxy");
 KPM_DESCRIPTION("P2/P3/P4: UXN redirect + maps hide + VMA-less ghost memory");
@@ -174,6 +174,7 @@ static volatile uint64_t g_hook_replace = 0; /* 0 = no override */
 #define MAX_PG 16            /* trapped REGIONS live at once (LSPlant ~20 funcs grouped by region) */
 #define MAX_OV 8             /* hooked function entries per trapped region */
 #define MAX_RGN 64           /* RV-2: max pages in one clean-bounded region (64: reach farther clean boundaries in dense libart) */
+#define MAX_GHOST_PG 512     /* Rev1-(1): max pages in a ghost clone region -- the DBI clone of a MAX_RGN(64)-page source can expand ~5-6x; 512 covers it with headroom (2 MiB vmalloc worst case) */
 #define OV_NONE (~0ULL)      /* sentinel: inert override slot (a real region offset is < npages*0x1000) */
 /* RV-2: each slot now traps a clean-bounded MULTI-PAGE region [page, page+npages) and
  * routes it to one whole-region clone. The clone covers complete functions (region
@@ -188,6 +189,16 @@ struct pghook {
     uint64_t page;     /* region base (R_lo) -- first UXN-trapped page */
     volatile int npages; /* pages in the region [page, page+npages*0x1000) */
     uint64_t clone;    /* whole-region clone base (user VA) */
+    /* Rev1-(1): ghost main-path. When ghost=1 the recompiled clone lives in VMA-less
+     * kernel memory (vmalloc, injected at ghost_va) instead of a userspace anon RX mmap,
+     * so it is unreachable by /proc/maps + mincore enumeration. before_pf then routes to
+     * ghost_va (not clone). `clone` in ghost mode only names the RW source the KPM copied
+     * into the ghost region at arm time (routing never uses it). Sized by the CLONE (DBI
+     * expansion), not the source region -- offmap indices point into the clone. */
+    volatile int ghost;   /* 1 = clone hosted at ghost_va (VMA-less) */
+    uint64_t ghost_va;    /* user VA base of the VMA-less clone region (routing target) */
+    void *ghost_kaddr;    /* vmalloc base backing ghost_va (teardown vfree) */
+    int ghost_npages;     /* pages in the ghost clone region (clone size, page-rounded) */
     volatile int nlive;             /* live (non-inert) overrides; 0 => region can disarm */
     volatile uint64_t ov_off[MAX_OV];     /* REGION-relative byte offset, or OV_NONE if inert */
     volatile uint64_t ov_replace[MAX_OV]; /* replacement VA for ov_off[k] */
@@ -889,7 +900,9 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
                 uint64_t off = roff;
                 uint32_t idx = (uint32_t)(off >> 2);
                 if (s->offmap && idx < (uint32_t)s->nmap) off = (uint64_t)s->offmap[idx] << 2;
-                regs->pc = s->clone + off; /* everything else runs from the clone */
+                /* Rev1-(1): ghost slots run from the VMA-less clone (unreachable by
+                 * maps/mincore enumeration); legacy slots run from the userspace clone. */
+                regs->pc = (s->ghost ? s->ghost_va : s->clone) + off;
             }
             s->redirects++;
             fargs->skip_origin = 1;
@@ -1121,6 +1134,9 @@ static int maps_hide_vma(hook_fargs2_t *fargs)
         for (int i = 0; i < MAX_PG; i++) {
             struct pghook *s = &g_pg[i];
             if (!s->active || !s->clone) continue;
+            if (s->ghost) continue; /* ghost clone is VMA-less: nothing in maps to hide, and
+                                     * s->clone is only the benign RW source buffer (don't
+                                     * range-hide it -- a merged anon-RW neighbor would leak) */
             if ((uint64_t)s->clone < vm_start || (uint64_t)s->clone >= vm_end) continue;
             if (s->mm && !vma_owned_by(vma, s->mm)) continue; /* vma must belong to the host's mm */
             hit = 1;
@@ -1573,6 +1589,97 @@ static int ghost_inject(int pid, void *task, void *mm, uint64_t ghost_va, uint64
     g_ghost_va = ghost_va;
     g_ghost_pid = pid;
     return 0;
+}
+
+/* Rev1-(1): multi-page VMA-less ghost clone for the pghook MAIN path (per-slot, unlike
+ * the single-slot g_ghost_* above which stays for the legacy hookto/ghostredirect). vmalloc
+ * a `clone_npages`-page region, copy the userspace DBI clone bytes (`nbytes` from `src_va`
+ * in the target) into it, sync I-cache, then inject a no-VMA PTE for every clone page at
+ * [ghost_va, ghost_va+clone_npages*0x1000) with attributes cloned from the target's own
+ * .text page (`template_va`, present + exec). Each vmalloc page is a distinct physical page
+ * BY CONSTRUCTION (unlike vmap, vmalloc never aliases PFNs -- so the article's same-PFN
+ * splice, borrow-point (5), cannot occur here). Injects page-by-page with the proven
+ * single-page inject_cb (PFN resolved OUTSIDE apply_to_page_range's ptl). On success
+ * *out_kaddr = vmalloc base. Caller holds task+mm and does mmput. Returns 0 or <0 (nothing
+ * left allocated on failure). Sleepable (bridge/supercall) context only. */
+static int ghost_inject_region(void *task, void *mm, uint64_t ghost_va, int clone_npages,
+                               uint64_t src_va, int nbytes, uint64_t template_va, void **out_kaddr)
+{
+    if (out_kaddr) *out_kaddr = 0;
+    if (clone_npages <= 0 || clone_npages > MAX_GHOST_PG) return -1;
+    if (nbytes <= 0 || nbytes > clone_npages * 0x1000) return -2;
+    ghost_va &= ~0xFFFUL;
+
+    /* every ghost page must currently be unmapped (don't clobber a live mapping) */
+    for (int j = 0; j < clone_npages; j++) {
+        struct pte_out chk;
+        chk.n = 0;
+        chk.val = 0;
+        fn_apply_existing(mm, ghost_va + (uint64_t)j * 0x1000, 0x1000, (void *)pte_cb, &chk);
+        if (chk.n > 0 && (chk.val & PTE_VALID)) return -3;
+    }
+    /* attrs from a known-good exec page (the region's own .text base) -- no hard-coded MAIR */
+    struct pte_out tpl;
+    tpl.n = 0;
+    tpl.val = 0;
+    fn_apply_existing(mm, template_va & ~0xFFFUL, 0x1000, (void *)pte_cb, &tpl);
+    if (tpl.n == 0 || !(tpl.val & PTE_VALID)) return -4;
+    uint64_t attrs = tpl.val & ~PFN_MASK;
+
+    void *kaddr = fn_vmalloc((unsigned long)clone_npages * 0x1000);
+    if (is_err_or_null(kaddr)) return -5;
+    if (fn_access_process_vm(task, src_va, kaddr, nbytes, 0) != nbytes) {
+        fn_vfree(kaddr);
+        return -6;
+    }
+    sync_icache(kaddr, (unsigned long)clone_npages * 0x1000);
+
+    /* inject each clone page's no-VMA PTE (PFN resolved outside the apply ptl). On any
+     * failure, clear the PTEs already injected + vfree, so nothing dangles. */
+    for (int j = 0; j < clone_npages; j++) {
+        unsigned long pfn = fn_vmalloc_to_pfn((char *)kaddr + (uint64_t)j * 0x1000);
+        uint64_t pte_val = (((uint64_t)pfn << 12) & PFN_MASK) | attrs;
+        if (!pfn || fn_apply(mm, ghost_va + (uint64_t)j * 0x1000, 0x1000, (void *)inject_cb, &pte_val)) {
+            uint64_t zero = 0;
+            for (int k = 0; k < j; k++)
+                fn_apply_existing(mm, ghost_va + (uint64_t)k * 0x1000, 0x1000, (void *)inject_cb, &zero);
+            flush_tlb_all();
+            fn_vfree(kaddr);
+            return -7;
+        }
+    }
+    flush_tlb_all();
+    if (out_kaddr) *out_kaddr = kaddr;
+    return 0;
+}
+
+/* Rev1-(1): tear down a slot's VMA-less ghost clone -- clear its PTEs in the target's mm
+ * (only if the process is still alive; a dead process already dropped them with its page
+ * tables) then vfree the backing vmalloc. Called from the pghook teardown paths AFTER the
+ * region's UXN is cleared + flushed, so no fault can route into a freed ghost page.
+ * Sleepable (bridge/supercall) context. */
+static void ghost_region_free(struct pghook *s)
+{
+    if (!s->ghost || !s->ghost_kaddr) return;
+    if (fn_find_get_task_by_vpid && fn_get_task_mm && fn_mmput && fn_apply_existing) {
+        void *task = fn_find_get_task_by_vpid(s->pid);
+        if (!is_err_or_null(task)) {
+            void *mm = fn_get_task_mm(task);
+            if (!is_err_or_null(mm)) {
+                uint64_t zero = 0;
+                for (int j = 0; j < s->ghost_npages; j++)
+                    fn_apply_existing(mm, s->ghost_va + (uint64_t)j * 0x1000, 0x1000,
+                                      (void *)inject_cb, &zero);
+                flush_tlb_all();
+                fn_mmput(mm);
+            }
+        }
+    }
+    if (fn_vfree) fn_vfree(s->ghost_kaddr);
+    s->ghost = 0;
+    s->ghost_va = 0;
+    s->ghost_kaddr = 0;
+    s->ghost_npages = 0;
 }
 
 /* inline_hooker primitive (for LSPlant): route `target`'s entry to `replace`, and
@@ -2055,6 +2162,7 @@ static int gc_dead_slots_locked(void)
         s->npages = 0;
         if (s->offmap && fn_vfree) fn_vfree(s->offmap);
         s->offmap = 0;
+        ghost_region_free(s); /* reclaim the VMA-less clone vmalloc (dead process dropped its PTEs) */
         s->mm = 0;
         if (g_npg > 0) g_npg--;
         freed++;
@@ -2083,7 +2191,8 @@ static int gc_dead_slots_locked(void)
  * `replace` is optional (0 => whole page just runs from the clone, no override).
  * Tear the whole table down with `pgdisarm`. */
 static long do_pghook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t mapaddr, uint64_t ninsn,
-                      uint64_t target_off, uint64_t replace, char *p, char *e)
+                      uint64_t target_off, uint64_t replace, int ghost, uint64_t ghost_va,
+                      uint64_t clone_words, char *p, char *e)
 {
     resolve_syms();
     if (!fn_access_process_vm || !fn_find_get_task_by_vpid || !fn_get_task_mm || !fn_mmput ||
@@ -2134,7 +2243,7 @@ static long do_pghook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t mapa
         p = apps(p, e, " page=");
         p = apphex(p, e, page);
         p = apps(p, e, " backup=");
-        p = apphex(p, e, clone + (uint64_t)s->offmap[target_off / 4] * 4);
+        p = apphex(p, e, (s->ghost ? s->ghost_va : clone) + (uint64_t)s->offmap[target_off / 4] * 4);
         p = apps(p, e, " hook_off=");
         p = apphex(p, e, target_off);
         p = apps(p, e, " replace=");
@@ -2239,6 +2348,46 @@ static long do_pghook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t mapa
         s->pte_orig[j] = pte_orig[j];
     }
     s->redirects = 0;
+    /* reset ghost fields (this slot may be reused from a reaped one) */
+    s->ghost = 0;
+    s->ghost_va = 0;
+    s->ghost_kaddr = 0;
+    s->ghost_npages = 0;
+    if (ghost) {
+        /* Rev1-(1): host the clone in VMA-less memory. Copy the RW clone bytes at `clone`
+         * (a GUP-readable userspace buffer, NOT an RX mmap) into a vmalloc region injected
+         * at ghost_va, attrs from the region's own .text base (`page`). The ghost region is
+         * sized by the CLONE (clone_words, DBI-expanded), not the source region, since offmap
+         * indices point into the clone. On failure, drop the slot cleanly so the glue falls
+         * back to the userspace-clone pghook path -- no tracelessness regression, just the
+         * readable-clone exposure it has today. */
+        int cnp = (int)((clone_words * 4 + 0xFFFUL) / 0x1000);
+        void *gk = 0;
+        long gr = -100;
+        if (!ghost_va || !clone_words) {
+            gr = -101; /* pghookg needs a ghost VA + clone size */
+        } else {
+            void *gmm = fn_get_task_mm(task);
+            if (!is_err_or_null(gmm)) {
+                gr = ghost_inject_region(task, gmm, ghost_va, cnp, clone, (int)(clone_words * 4),
+                                         page /* template = region .text base */, &gk);
+                fn_mmput(gmm);
+            }
+        }
+        if (gr != 0) {
+            if (s->offmap && fn_vfree) fn_vfree(s->offmap);
+            s->offmap = 0;
+            maybe_unhook_pf(); /* this slot never activated; drop the pf hook if it was the only one */
+            p = apps(p, e, "error: ghost inject failed rc=");
+            p = appdec(p, e, gr);
+            apps(p, e, " (glue falls back to userspace clone)\n");
+            return -1;
+        }
+        s->ghost = 1;
+        s->ghost_va = ghost_va & ~0xFFFUL;
+        s->ghost_kaddr = gk;
+        s->ghost_npages = cnp;
+    }
     s->active = 1; /* publish the fully-populated slot before arming UXN */
     g_npg++;
 
@@ -2261,8 +2410,14 @@ static long do_pghook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t mapa
     p = appdec(p, e, npages);
     p = apps(p, e, " clone=");
     p = apphex(p, e, clone);
+    if (s->ghost) {
+        p = apps(p, e, " ghost_va=");
+        p = apphex(p, e, s->ghost_va);
+        p = apps(p, e, " ghost_npages=");
+        p = appdec(p, e, s->ghost_npages);
+    }
     p = apps(p, e, " backup=");
-    p = apphex(p, e, clone + (uint64_t)s->offmap[target_off / 4] * 4);
+    p = apphex(p, e, (s->ghost ? s->ghost_va : clone) + (uint64_t)s->offmap[target_off / 4] * 4);
     p = apps(p, e, " hook_off=");
     p = apphex(p, e, target_off);
     p = apps(p, e, " replace=");
@@ -2301,6 +2456,7 @@ static long do_pgdisarm(char *p, char *e)
         s->npages = 0;
         if (s->offmap && fn_vfree) fn_vfree(s->offmap);
         s->offmap = 0;
+        ghost_region_free(s); /* UXN cleared+flushed in the first loop -> safe to free */
     }
     g_npg = 0;
     maybe_unhook_pf();
@@ -2358,6 +2514,7 @@ static long do_pgunhook(uint64_t pid, uint64_t page, uint64_t off, char *p, char
         s->npages = 0;
         if (s->offmap && fn_vfree) fn_vfree(s->offmap);
         s->offmap = 0;
+        ghost_region_free(s); /* UXN cleared+flushed above -> no fault can route here now */
         if (g_npg > 0) g_npg--;
         maybe_unhook_pf();
         maybe_unhook_maps(); /* last region gone -> reveal maps again (unless manual hidemaps) */
@@ -3274,6 +3431,27 @@ static long shpte_run(const char *args, char *buf, int bufcap)
             apps(p, e, "usage: pgunhook <pid> <page> <off>\n"), rc = -1;
         else
             rc = do_pgunhook(pid, page, off, p, e);
+    } else if (starts(a, "pghookg")) {
+        /* Rev1-(1): ghost variant of pghook -- clone hosted in VMA-less memory at <ghost_va>.
+         * <clone> is the RW source buffer (not an RX mmap); <clone_words> is its size (DBI-
+         * expanded, offmap indices point into it). Must precede the "pghook" prefix branch. */
+        uint64_t pid = 0, page = 0, clone = 0, map = 0, n = 0, toff = 0, rep = 0, gva = 0, cw = 0;
+        const char *s = parse_ull(a + 7, &pid);
+        s = parse_ull(s, &page);
+        s = parse_ull(s, &clone);
+        s = parse_ull(s, &map);
+        s = parse_ull(s, &n);
+        s = parse_ull(s, &toff);
+        s = parse_ull(s, &rep);
+        s = parse_ull(s, &gva);
+        parse_ull(s, &cw);
+        if (!pid || !page || !clone || !map || !n || !gva || !cw)
+            apps(p, e,
+                 "usage: pghookg <pid> <page> <clone> <map> <ninsn> <target_off> <replace> "
+                 "<ghost_va> <clone_words>\n"),
+                rc = -1;
+        else
+            rc = do_pghook(pid, page, clone, map, n, toff, rep, 1 /*ghost*/, gva, cw, p, e);
     } else if (starts(a, "pghook")) {
         uint64_t pid = 0, page = 0, clone = 0, map = 0, n = 0, toff = 0, rep = 0;
         const char *s = parse_ull(a + 6, &pid);
@@ -3288,7 +3466,7 @@ static long shpte_run(const char *args, char *buf, int bufcap)
                  "usage: pghook <pid> <page> <clone> <map> <ninsn> [target_off] [replace]\n"),
                 rc = -1;
         else
-            rc = do_pghook(pid, page, clone, map, n, toff, rep, p, e);
+            rc = do_pghook(pid, page, clone, map, n, toff, rep, 0 /*ghost*/, 0, 0, p, e);
     } else if (starts(a, "redirect")) {
         uint64_t pid = 0, addr = 0, clone = 0;
         const char *s = parse_ull(a + 8, &pid);
