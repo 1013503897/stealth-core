@@ -47,7 +47,7 @@
 #include <stdint.h>
 
 KPM_NAME("shpte");
-KPM_VERSION("0.6.0");
+KPM_VERSION("0.6.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("wxy");
 KPM_DESCRIPTION("P2/P3/P4: UXN redirect + maps hide + VMA-less ghost memory");
@@ -60,6 +60,16 @@ KPM_DESCRIPTION("P2/P3/P4: UXN redirect + maps hide + VMA-less ghost memory");
 #define VMA_END_OFF 8
 #define VMA_VM_MM_OFF 16
 #define SEQ_SKIP 1
+
+/* vm_mm is the ONE version-sensitive field the maps-hide gate reads: it sits at +16 on
+ * >=6.1 (maple-tree vm_area_struct) but at +64 on <6.1 (vm_next/vm_prev/vm_rb precede it).
+ * vm_start(+0)/vm_end(+8) are stable across both, so the RANGE match never broke -- only the
+ * mm-gate did (on 5.10 it read vm_next as if it were vm_mm -> gate never matched -> the clone
+ * leaked as a naked anon r-xp region, BTF-verified on oriole 5.10.107 vs 6.1.145). The offset
+ * is AUTO-LEARNED the first time vma_owned_by() finds a known mm pointer in a matched vma;
+ * VMA_VM_MM_OFF is only the seed. */
+static volatile int g_vma_mm_off = VMA_VM_MM_OFF;
+static volatile int g_vma_mm_calibrated = 0;
 
 #define GHOST_MAGIC 0xDEADBEEFCAFEF00DULL
 #define PFN_MASK 0x0000FFFFFFFFF000ULL /* PTE output-address bits [47:12] */
@@ -1066,6 +1076,25 @@ static void before_showmap(hook_fargs2_t *fargs, void *udata)
     void *m = (void *)fargs->arg0;
     fargs->local.data0 = *(volatile uint64_t *)((char *)m + SEQ_COUNT_OFF);
 }
+/* Is `vma` owned by `mm`? Instead of reading vm_mm at a hardcoded (version-specific) offset,
+ * scan the vma's pointer-field region for the known `mm` pointer -- a match can only be the
+ * real vm_mm field (mm is a unique kernel address). The first match caches vm_mm's byte offset
+ * (g_vma_mm_off) so subsequent calls are a single read. This is what makes maps-hide kernel-
+ * version-independent: vm_mm is +16 on >=6.1 but +64 on <6.1, and the old hardcoded +16 read
+ * vm_next on 5.10 -> the gate never matched -> the clone leaked (see the g_vma_mm_off note). */
+static int vma_owned_by(void *vma, void *mm)
+{
+    if (g_vma_mm_calibrated)
+        return *(void *volatile *)((char *)vma + g_vma_mm_off) == mm;
+    for (int off = 16; off <= 112; off += 8)
+        if (*(void *volatile *)((char *)vma + off) == mm) {
+            g_vma_mm_off = off;
+            g_vma_mm_calibrated = 1;
+            return 1;
+        }
+    return 0;
+}
+
 /* shared core: returns 1 (and rewinds the seq entry) if `vma` is one of our clones.
  * Gate on the vma's OWNER mm (not the reader): hides the clone whether the host scans
  * its own /proc/self/{maps,smaps} OR an external process scans /proc/<host>/..., while a
@@ -1088,22 +1117,21 @@ static int maps_hide_vma(hook_fargs2_t *fargs)
      * whole merged VMA (the residual S2 anon-r-xp the in-app probe flags). The containing VMA
      * is all-ours anon r-xp (nothing legit is anon r-xp under W^X), so hiding it whole is safe. */
     if (!hit && g_npg > 0) {
-        void *vmm = *(void *volatile *)((char *)vma + VMA_VM_MM_OFF);
         uint64_t vm_end = *(volatile uint64_t *)((char *)vma + VMA_END_OFF);
         for (int i = 0; i < MAX_PG; i++) {
             struct pghook *s = &g_pg[i];
             if (!s->active || !s->clone) continue;
             if ((uint64_t)s->clone < vm_start || (uint64_t)s->clone >= vm_end) continue;
-            if (s->mm && vmm != s->mm) continue; /* vma must belong to the host's mm */
+            if (s->mm && !vma_owned_by(vma, s->mm)) continue; /* vma must belong to the host's mm */
             hit = 1;
             break;
         }
     }
     /* general hide-set (e.g. the LSPlant trampoline pool), mm-gated like the clones */
     if (!hit && g_nhide > 0) {
-        void *vmm = *(void *volatile *)((char *)vma + VMA_VM_MM_OFF);
         for (int i = 0; i < MAX_HIDE; i++) {
-            if (g_hide[i].page != vm_start || g_hide[i].mm != vmm) continue;
+            if (g_hide[i].page != vm_start) continue;
+            if (g_hide[i].mm && !vma_owned_by(vma, g_hide[i].mm)) continue;
             hit = 1;
             break;
         }
@@ -3010,10 +3038,21 @@ static long do_probe(char *p, char *e)
     return 0;
 }
 
+static long do_bridge(char *p, char *e);  /* fwd decl (defined below) */
+
 static long shpte_init(const char *args, const char *event, void *__user reserved)
 {
     logki("shpte: init event=%s\n", event ? event : "");
     resolve_syms();
+    /* Auto-arm the sysinfo bridge at load so an injected agent (phoenixvec) can drive the KPM
+     * WITHOUT a control supercall. Required on keyless APatch builds where the KPM control
+     * supercall path is unavailable and the module is embedded (loaded at pre-kernel-init).
+     * Same pattern as shpoc hooking a syscall from init — safe at KPM load time. */
+    {
+        char b[96];
+        do_bridge(b, b + sizeof(b));
+        logki("shpte: auto-bridge armed=%d\n", g_bridge_hooked);
+    }
     return 0;
 }
 
