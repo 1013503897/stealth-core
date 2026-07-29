@@ -47,7 +47,7 @@
 #include <stdint.h>
 
 KPM_NAME("shpte");
-KPM_VERSION("0.6.2");
+KPM_VERSION("0.6.3");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("wxy");
 KPM_DESCRIPTION("P2/P3/P4: UXN redirect + maps hide + VMA-less ghost memory");
@@ -210,6 +210,27 @@ struct pghook {
 };
 static struct pghook g_pg[MAX_PG];
 static volatile int g_npg = 0;
+
+/* Rev2-(2): fork safety. A fork of a hooked process inherits the UXN-trapped .text
+ * (copy_page_range copies the leaf PTE incl. our UXN bit) but NOT the VMA-less ghost clone
+ * (copy_page_range walks VMAs; ghost has none). before_pf gates on the forker's tgid, so the
+ * child's execute fault on its .text mismatches -> passthrough -> permission fault with no
+ * handler -> SIGSEGV (e.g. a RASP that forks a watchdog). We do NOT keep the hook alive in the
+ * child (Vector re-hooks each app process at LSPlant specialization); we just make the child
+ * SAFE by clearing the inherited UXN so it runs the original .text. Detected at
+ * wake_up_new_task (the forker's context, where only cheap tgid reads are done); the PTE clear
+ * is DEFERRED to the child's own task_work context (sleepable) per the D-state rule. */
+#define MAX_FORKFIX 16
+struct forkfix {
+    struct kp_callback_head tw; /* MUST be first: tw_forkfix recovers the slot by cast */
+    int parent_tgid;            /* the hooked forker whose UXN pages to clear in the child */
+    volatile int active;
+};
+static struct forkfix g_forkfix[MAX_FORKFIX];
+static void *g_addr_wake = 0;          /* wake_up_new_task */
+static volatile int g_wake_hooked = 0; /* wake_up_new_task wrapped? (ref-counted by g_npg) */
+static volatile long g_forks_fixed = 0;
+static volatile long g_fork_pages_cleared = 0;
 
 /* publish a new override key-last so a racing before_pf never matches an offset
  * before its replacement pointer is in place */
@@ -1269,6 +1290,7 @@ static void resolve_syms(void)
     if (!fn_reg_hwbp) fn_reg_hwbp = (void *)kallsyms_lookup_name("register_user_hw_breakpoint");
     if (!fn_unreg_hwbp) fn_unreg_hwbp = (void *)kallsyms_lookup_name("unregister_hw_breakpoint");
     if (!fn_task_work_add) fn_task_work_add = (void *)kallsyms_lookup_name("task_work_add");
+    if (!g_addr_wake) g_addr_wake = (void *)kallsyms_lookup_name("wake_up_new_task"); /* Rev2-(2) fork fix */
     if (!fn_register_user_step_hook)
         fn_register_user_step_hook = (void *)kallsyms_lookup_name("register_user_step_hook");
     if (!fn_unregister_user_step_hook)
@@ -2141,6 +2163,98 @@ static long do_pagehook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t ma
     return rc;
 }
 
+/* Rev2-(2): task_work run in the CHILD's own context after a fork of a hooked process --
+ * clear the UXN the child inherited on the forker's hooked .text pages, so the child executes
+ * the original code instead of faulting into a slot that gates on the forker's tgid. Sleepable
+ * context (return-to-user / do_exit); pure page-table reads + one PTE write per page, no perf/
+ * blocking -- D-state-safe. Skips slots whose mm the child SHARES (CLONE_VM w/o CLONE_THREAD:
+ * clearing there would un-trap the parent too); only a genuine copied mm is un-trapped. */
+static void tw_forkfix(struct kp_callback_head *h)
+{
+    struct forkfix *f = (struct forkfix *)h; /* tw is the first member */
+    if (!f->active) return;
+    int ptgid = f->parent_tgid;
+    if (fn_get_task_mm && fn_mmput && fn_apply_existing) {
+        void *mm = fn_get_task_mm((void *)get_current()); /* the child's own mm */
+        if (!is_err_or_null(mm)) {
+            int touched = 0;
+            for (int i = 0; i < MAX_PG; i++) {
+                struct pghook *s = &g_pg[i];
+                if (!s->active || s->pid != ptgid) continue;
+                if (s->mm && mm == s->mm) continue; /* SHARED mm -> not a real fork; don't touch */
+                for (int j = 0; j < s->npages; j++) {
+                    struct pte_out o;
+                    o.n = 0;
+                    o.val = 0;
+                    o.ptep = 0;
+                    fn_apply_existing(mm, s->page + (uint64_t)j * 0x1000, 0x1000, (void *)pte_cb, &o);
+                    if (o.n > 0 && o.ptep && (o.val & PTE_VALID) && (o.val & PTE_UXN)) {
+                        *(volatile uint64_t *)o.ptep = o.val & ~PTE_UXN; /* un-trap: run original */
+                        g_fork_pages_cleared++;
+                        touched = 1;
+                    }
+                }
+            }
+            if (touched) flush_tlb_all();
+            fn_mmput(mm);
+        }
+    }
+    f->active = 0; /* release the fixup slot */
+    g_forks_fixed++;
+}
+
+/* Rev2-(2): wake_up_new_task(struct task_struct *p) inline-hook. Runs in the FORKER's context
+ * (it calls wake_up_new_task on its new child). Cheap-only here: if the child is a genuine new
+ * PROCESS (tgid differs from the forker) of a process that has active pghook regions, queue a
+ * task_work on the child to clear its inherited UXN (deferred to the child's own context). New
+ * THREADS (same tgid, shared mm) need nothing -- they route through the existing slot. */
+static void before_pgfork(hook_fargs1_t *fargs, void *udata)
+{
+    (void)udata;
+    if (!g_wake_hooked || g_npg == 0) return;
+    if (!fn_task_pid_nr_ns || !fn_task_work_add) return;
+    void *child = (void *)fargs->arg0;
+    if (!child) return;
+    int ctgid = fn_task_pid_nr_ns(child, PIDTYPE_TGID, 0);
+    int ptgid = fn_task_pid_nr_ns((void *)get_current(), PIDTYPE_TGID, 0);
+    if (ctgid <= 0 || ctgid == ptgid) return; /* new thread (same tgid) -> shares mm, hook works */
+
+    int hooked = 0;
+    for (int i = 0; i < MAX_PG; i++)
+        if (g_pg[i].active && g_pg[i].pid == ptgid) { hooked = 1; break; }
+    if (!hooked) return; /* the forker isn't hooked -> nothing to fix */
+
+    struct forkfix *f = 0;
+    for (int i = 0; i < MAX_FORKFIX; i++)
+        if (!g_forkfix[i].active) { f = &g_forkfix[i]; break; }
+    if (!f) return; /* pool full -> skip (child may crash if it runs the .text; rare) */
+    f->parent_tgid = ptgid;
+    f->tw.next = 0;
+    f->tw.func = tw_forkfix;
+    f->active = 1; /* publish before queueing */
+    if (fn_task_work_add(child, &f->tw, TWA_RESUME)) f->active = 0; /* dead child -> drop */
+}
+
+/* wake_up_new_task hook lifecycle, ref-counted by g_npg (like the maps-hide hook): install on
+ * the first armed pghook region, remove when the last one disarms. Sleepable install context. */
+static int ensure_wake_hooked(void)
+{
+    if (g_wake_hooked) return 0;
+    if (!g_addr_wake) g_addr_wake = (void *)kallsyms_lookup_name("wake_up_new_task");
+    if (!g_addr_wake) return -1;
+    if (hook_wrap1(g_addr_wake, (void *)before_pgfork, 0, 0) != HOOK_NO_ERR) return -1;
+    g_wake_hooked = 1;
+    return 0;
+}
+static void maybe_unhook_wake(void)
+{
+    if (g_npg != 0) return; /* still have armed regions -> keep following forks */
+    if (g_wake_hooked && g_addr_wake) {
+        hook_unwrap(g_addr_wake, (void *)before_pgfork, 0);
+        g_wake_hooked = 0;
+    }
+}
+
 /* GC region slots whose owning process has exited (find_get_task_by_vpid -> NULL). Runs in
  * the serialized, sleepable supercall context (do_pghook / `pggc`), so it can vfree and never
  * races do_pghook. Safe vs before_pf: a dead slot's offmap is only ever dereferenced after the
@@ -2179,6 +2293,7 @@ static int gc_dead_slots_locked(void)
     if (freed) {
         maybe_unhook_pf();
         maybe_unhook_maps();
+        maybe_unhook_wake(); /* Rev2-(2): if that was the last pghook region, stop following forks */
     }
     return freed;
 }
@@ -2399,6 +2514,9 @@ static long do_pghook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t mapa
     /* auto-hide: hide this clone from /proc/pid/maps the moment the region is armed
      * (best-effort -- the redirect still works if the maps hook can't install) */
     int maps_rc = ensure_maps_hooked();
+    /* Rev2-(2): follow forks of this process so a child doesn't SIGSEGV on the inherited
+     * UXN'd .text (best-effort -- the hook still works if wake follow can't install) */
+    ensure_wake_hooked();
 
     p = apps(p, e, "ok: pghook slot=");
     p = appdec(p, e, si);
@@ -2461,6 +2579,7 @@ static long do_pgdisarm(char *p, char *e)
     g_npg = 0;
     maybe_unhook_pf();
     maybe_unhook_maps(); /* last region gone -> reveal maps again (unless manual hidemaps) */
+    maybe_unhook_wake(); /* Rev2-(2): no armed regions -> stop following forks */
     p = apps(p, e, "ok: pgdisarm slots=");
     p = appdec(p, e, n);
     p = apps(p, e, " redirects=");
@@ -2518,6 +2637,7 @@ static long do_pgunhook(uint64_t pid, uint64_t page, uint64_t off, char *p, char
         if (g_npg > 0) g_npg--;
         maybe_unhook_pf();
         maybe_unhook_maps(); /* last region gone -> reveal maps again (unless manual hidemaps) */
+        maybe_unhook_wake(); /* Rev2-(2): no armed regions -> stop following forks */
         p = apps(p, e, "ok: pgunhook slot=");
         p = appdec(p, e, i);
         p = apps(p, e, " disarmed region=");
@@ -2712,6 +2832,7 @@ static int gc_dead_ssol_locked(void)
     if (freed) {
         maybe_unhook_pf();
         maybe_unhook_maps();
+        maybe_unhook_wake(); /* Rev2-(2): if that was the last pghook region, stop following forks */
     }
     return freed;
 }
@@ -3638,8 +3759,13 @@ static long shpte_exit(void *__user reserved)
             g_pg[i].npages = 0;
             if (g_pg[i].offmap && fn_vfree) fn_vfree(g_pg[i].offmap);
             g_pg[i].offmap = 0;
+            ghost_region_free(&g_pg[i]); /* Rev2-(2): reclaim any VMA-less ghost clone */
         }
         g_npg = 0;
+    }
+    if (g_wake_hooked && g_addr_wake) { /* Rev2-(2): drop the fork-follow hook */
+        hook_unwrap(g_addr_wake, (void *)before_pgfork, 0);
+        g_wake_hooked = 0;
     }
     if (g_pf_hooked && g_addr_pf) {
         hook_unwrap(g_addr_pf, (void *)before_pf, 0);

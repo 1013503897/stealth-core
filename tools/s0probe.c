@@ -31,6 +31,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "../lib/kpmhook.h"
@@ -144,8 +145,16 @@ static void hexdump(const unsigned char *b, int n)
     printf("\n");
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    /* fork-test mode (argv[1]): default = none (pure ① measurement, no fork);
+     * "forkbare" = fork a child that _exits immediately (tests fork/copy_page_range of the
+     * hooked state WITHOUT the child faulting); "fork" = child calls victim() (tests the
+     * child's inherited-UXN fault path). Gated so we can isolate a fork vs fault crash. */
+    const char *forkmode = (argc > 1) ? argv[1] : "";
+    int do_forkbare = (strcmp(forkmode, "forkbare") == 0);
+    int do_fork = (strcmp(forkmode, "fork") == 0);
+
     kpm_hook_force_enable(); /* standalone: bypass the Vector-only process gate */
     kpm_hook_set_ghost(1);   /* Rev1-(1): host the clone VMA-less (pghookg) -- what we measure */
     if (kpm_hook_init() != 0) {
@@ -232,6 +241,36 @@ int main(void)
     printf("\n[contrast] original victim .text @%p first 32 bytes (unmodified / CRC-clean):\n    ",
            (void *)&victim);
     hexdump(vbuf, 32);
+
+    /* [5] Rev2 ② fork safety (argv-gated -- see main). A forked child inherits the UXN-trapped
+     * victim page (via copy_page_range) but NOT the VMA-less ghost clone; before_pf gates on the
+     * parent's tgid, so the child's execute fault mismatches. `forkbare` isolates fork itself
+     * (child _exits, never faults); `fork` makes the child call victim() (the fault path). With
+     * ② the KPM follows the fork and clears the child's inherited UXN so it runs the original. */
+    if (do_forkbare || do_fork) {
+        printf("\n[5] fork-safety (Rev2 ②) mode=%s: forking...\n", forkmode);
+        fflush(stdout); /* flush before fork so the child doesn't re-emit our buffer */
+        pid_t kid = fork();
+        if (kid == 0) {
+            if (do_fork) {
+                int cv = victim(5); /* original victim(5)=25; must NOT fault on the inherited UXN page */
+                _exit(cv & 0x7f);   /* pass the value out via exit status */
+            }
+            _exit(42); /* forkbare: exit immediately, never touch the trapped page */
+        } else if (kid > 0) {
+            int st = 0;
+            waitpid(kid, &st, 0);
+            if (WIFEXITED(st))
+                printf("    child EXITED ok (code=%d) -> %s\n", WEXITSTATUS(st),
+                       do_fork ? "FORK-SAFE (② un-trapped the child)" : "fork/copy_page_range OK");
+            else if (WIFSIGNALED(st))
+                printf("    child KILLED by signal %d -> FORK-CRASH\n", WTERMSIG(st));
+            else
+                printf("    child ended oddly (status=0x%x)\n", st);
+        } else {
+            printf("    fork() failed -- skipping\n");
+        }
+    }
 
     printf("== VERDICT (ghost main-path) ==\n");
     int enum_blind = (!covered) && (mc == -1);

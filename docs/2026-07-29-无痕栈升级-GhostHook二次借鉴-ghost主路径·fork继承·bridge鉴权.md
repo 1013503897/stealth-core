@@ -13,7 +13,8 @@
 ## 落地状态
 
 - **① ghost 主路径 —— 已实现 + 双端设备验证通过（2026-07-29，KPM v0.6.2）**。`kpm/shpte.c` 加 `ghost_inject_region`/`ghost_region_free` + 新 verb `pghookg`（多页/多槽，与 legacy 单槽 `g_ghost_*` 分离）；`before_pf` 路由 `s->ghost?ghost_va:clone`；`lib/kpmhook` 加 `kpm_hook_set_ghost()` 开关（默认 off，老 `pghook` 路径字节等价、ghost 注入失败自动回退，clone 建成 RW buffer 不再 mprotect RX）。`tools/s0probe`（ghost=ON）在 **19301(5.10) + 1C091(6.1)** 各连跑 3 次全绿：clone 的 ghost_va **maps NONE + mincore ENOMEM + pagemap present=0**（枚举全盲），直读/执行仍成立（诚实边界）；`pgunhook`→`ghost_region_free` 拆卸无泄漏（`npg` 不累加）。**关键正确性**：DBI clone 位置无关（`make_rgn` 在 mmap 拿到 clone 地址前就 recompile → clone 字节不依赖运行地址），搬进 ghost 必然正确。
-- ② fork 继承 / ③ bridge 鉴权 —— **未开工**（下一版）。
+- **② fork 安全 —— 已实现 + 编译过，待设备验证（Rev2, KPM v0.6.3）**。⚠️**关键发现**：被 hook 进程 fork 出的子进程，若执行到继承来的 UXN 页，会因 **VMA 允许执行(VM_EXEC) 但 PTE 是 UXN 的不一致 → 无限 fault 循环 → soft-lockup 看门狗重启**（不是干净 SIGSEGV！），实测在 0.6.2 上 19301 重启复现；`s0probe forkbare`(子进程立即退不碰页)稳定 → 证明崩在**子进程 fault 路径**而非 fork/copy_page_range 本身。这是现有 legacy/ghost 栈的**潜在雷**（GCash 只是从没 fork-触碰 hooked 页）。**②-safe-child 修法**：hook `wake_up_new_task` 检测被 hook 进程的真 fork(child tgid≠forker tgid 且 child_mm≠s->mm)，defer task_work 到子进程上下文清掉继承的 UXN → 子进程跑原始码、无 fault 循环；**不追求 hook 在子进程存活**（Vector 每进程 specialization 时重挂）。`s0probe fork`(argv 门控)验证：0.6.2=重启(基线)、0.6.3 应=FORK-SAFE 无重启。**未提交**（待验）。
+- ③ bridge 鉴权 —— **降级/暂缓**：合法驱动方(Vector 注入进的 app 进程)与进程内 RASP 同 uid，uid 门挡不住真威胁(进程内提取 magic)、只挡跨进程弱威胁，还有把测试工具锁门外的坑，性价比低。
 
 ## 0. TL;DR — 借鉴点与优先级
 
