@@ -51,6 +51,14 @@ void kpm_hook_force_enable(void);
 void kpm_hook_set_ghost(int on);
 
 /*
+ * Enable the kernel fs-hide for THIS process: register our tgid so the KPM spoofs its statfs
+ * f_type (overlayfs -> erofs) and drops overlay/magisk lines from its /proc/self/mountinfo +
+ * /proc/self/mounts -- defeats the "hidden overlayfs" mount detection. Reader-gated to our tgid
+ * (root's own views stay truthful). Call once from postAppSpecialize. No-op on a pre-0.6.6 KPM.
+ */
+void kpm_hook_fshide_enable(void);
+
+/*
  * Probe the bridge and cache getpid(). Returns 0 if this process is gated-in AND the
  * bridge is live; <0 otherwise (gated out, or bridge not armed) -- in which case no
  * hook is attempted. Optional: kpm_inline_hooker() lazily runs this on first use.
