@@ -47,10 +47,10 @@
 #include <stdint.h>
 
 KPM_NAME("shpte");
-KPM_VERSION("0.6.3");
+KPM_VERSION("0.6.6");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("wxy");
-KPM_DESCRIPTION("P2/P3/P4: UXN redirect + maps hide + VMA-less ghost memory");
+KPM_DESCRIPTION("P2/P3/P4: UXN redirect + maps hide + VMA-less ghost + fs-hide (statfs+mountinfo)");
 
 /* struct offsets verified from this device's kernel BTF (6.1 GKI):
  *   seq_file.count=+24, seq_file.pad_until=+32 ; vm_area_struct.vm_start=+0, vm_mm=+16 */
@@ -136,6 +136,37 @@ static void (*fn_register_user_step_hook)(void *hook) = 0;
 static void (*fn_unregister_user_step_hook)(void *hook) = 0;
 static void (*fn_user_enable_single_step)(void *task) = 0;
 static void (*fn_user_disable_single_step)(void *task) = 0;
+
+/* ---- fs-hide: mount anti-detection (P1 = statfs f_type spoof, P2 = mountinfo line filter) ----
+ * Kills the "hidden overlayfs" signal: a rooted /system is an overlayfs whose mount is DenyList-
+ * hidden, so statfs(/system).f_type == OVERLAYFS but the mount table shows no matching overlay ->
+ * inconsistency. P1 makes statfs report the underlying fs (erofs); P2 drops the leftover overlay/
+ * magisk lines from /proc/pid/mountinfo + /proc/pid/mounts. All hooks run in the reader's OWN context
+ * (syscall-exit for statfs, seq-show for mountinfo) -- NO fault-handler/perf/D-state risk. Reader-
+ * gated (only hide-set tgids are affected; root's own mount/df/statfs stay truthful). Default OFF.
+ *
+ * P1 choke = the statfs/fstatfs SYSCALLS, NOT the exported vfs_statfs symbol: vfs_statfs is a
+ * direct call GKI inlines into user_statfs, so hooking it misses the syscall path (device-proven).
+ * The indirect calls (show_mountinfo/show_vfsmnt via seq_operations->show) CAN be hooked like
+ * maps-hide's show_map -- no inlining trap there. arm64 asm-generic: statfs=43, fstatfs=44; both
+ * put struct statfs* in arg1, f_type is the first 8 bytes. */
+#define OVERLAYFS_SUPER_MAGIC 0x794c7630u
+#define MAX_FSHIDE 64
+#define KSYS_STATFS 43
+#define KSYS_FSTATFS 44
+static volatile int g_fshide_on = 0;                    /* master switch (default off) */
+static volatile int g_fs_statfs_on = 1;                 /* P1 sub-switch */
+static volatile int g_fs_mountinfo_on = 1;              /* P2 sub-switch */
+static volatile uint32_t g_fs_spoof_magic = 0xE0F5E1E2; /* EROFS_SUPER_MAGIC_V1; `fshide magic` overrides */
+static int g_fshide_set[MAX_FSHIDE];                    /* hide-set: tgids to spoof for (reader-gate) */
+static volatile int g_fshide_n = 0;
+static volatile int g_sys_statfs_hooked = 0;
+static volatile long g_sys_statfs_calls = 0;            /* statfs/fstatfs syscall hook firings */
+static volatile long g_statfs_spoofed = 0;              /* successful OVL->erofs rewrites */
+static void *g_addr_show_mountinfo = 0;                 /* show_mountinfo (/proc/pid/mountinfo) */
+static void *g_addr_show_vfsmnt = 0;                    /* show_vfsmnt   (/proc/pid/mounts) */
+static volatile int g_mountinfo_hooked = 0;
+static volatile long g_mountinfo_hidden = 0;            /* mount lines dropped for gated readers */
 
 /* ---- arm state ---- */
 enum { MODE_SELFHEAL = 0, MODE_REDIRECT = 1, MODE_REDIRECT_MAP = 2, MODE_REDIRECT_FIXED = 3 };
@@ -1269,6 +1300,261 @@ static void after_status(hook_fargs4_t *fargs, void *udata)
     }
 }
 
+/* ---- fs-hide P1: statfs f_type overlayfs -> underlying fs, for hide-set readers only ----
+ * Concurrency: g_fshide_set[] is written from the serialized bridge/ctl0 context and read from
+ * the fs-hide hooks (caller context, another thread). Each slot is a single aligned int, and
+ * the reader scans the whole array, so a racing add/del only ever means a just-added tgid isn't
+ * seen for one call or a just-deleted one matches once more -- both benign (no garbage pointer,
+ * unlike the pghook override table). No barrier needed. */
+static int fs_in_hideset(int tgid)
+{
+    for (int i = 0; i < MAX_FSHIDE; i++)
+        if (g_fshide_set[i] == tgid) return 1;
+    return 0;
+}
+static int fs_caller_gated(void)
+{
+    if (g_fshide_n == 0 || !fn_task_pid_nr_ns) return 0;
+    int tgid = fn_task_pid_nr_ns((void *)get_current(), PIDTYPE_TGID, 0);
+    if (tgid <= 0) return 0;
+    return fs_in_hideset(tgid);
+}
+/* ---- P1: statfs/fstatfs syscall f_type overlayfs -> underlying fs, gated readers only ----
+ * Post-process the syscall's user buffer in the caller's syscall-exit context (sleepable) --
+ * reading/writing its own user memory is safe; NO fault-handler/perf/D-state risk. Both syscalls
+ * carry struct statfs* in arg1; f_type is its first 8 bytes. (We hook the SYSCALL, not the
+ * exported vfs_statfs symbol, which GKI inlines into user_statfs -- device-proven.) */
+static void after_sys_statfs(hook_fargs6_t *fargs, void *udata)
+{
+    (void)udata;
+    if (!g_fshide_on || !g_fs_statfs_on) return;
+    g_sys_statfs_calls++;
+    if (fargs->ret != 0) return;                            /* statfs/fstatfs failed */
+    if (!fs_caller_gated()) return;                         /* reader-gate: hide-set apps only */
+    uint64_t ubuf = (uint64_t)syscall_argn(fargs, 1);       /* struct statfs *buf */
+    if (!ubuf || !fn_access_process_vm) return;
+    long ft = 0;
+    if (fn_access_process_vm((void *)get_current(), ubuf, &ft, sizeof(ft), 0) != (int)sizeof(ft))
+        return;
+    if ((uint32_t)ft != OVERLAYFS_SUPER_MAGIC) return;      /* only rewrite overlayfs */
+    ft = (long)(uint32_t)g_fs_spoof_magic;
+    compat_copy_to_user((void *)ubuf, &ft, sizeof(ft));     /* overlayfs -> erofs in user's struct */
+    g_statfs_spoofed++;
+}
+static int ensure_sys_statfs_hooked(void)
+{
+    if (g_sys_statfs_hooked) return 0;
+    hook_err_t e1 = fp_hook_syscalln(KSYS_STATFS, 2, 0, (void *)after_sys_statfs, 0);
+    hook_err_t e2 = fp_hook_syscalln(KSYS_FSTATFS, 2, 0, (void *)after_sys_statfs, 0);
+    if (e1 != HOOK_NO_ERR && e2 != HOOK_NO_ERR) return -1;  /* both failed */
+    g_sys_statfs_hooked = 1;
+    return 0;
+}
+static void maybe_unhook_sys_statfs(void)
+{
+    if (g_fshide_on) return;
+    if (g_sys_statfs_hooked) {
+        fp_unhook_syscalln(KSYS_STATFS, 0, (void *)after_sys_statfs);
+        fp_unhook_syscalln(KSYS_FSTATFS, 0, (void *)after_sys_statfs);
+        g_sys_statfs_hooked = 0;
+    }
+}
+
+/* ---- P2: drop overlay/magisk mount lines from /proc/pid/mountinfo + /proc/pid/mounts ----
+ * show_mountinfo/show_vfsmnt(seq_file*, void*) are reached via seq_operations->show (an indirect
+ * call -> NOT inlined, unlike vfs_statfs), so the maps-hide technique applies verbatim: before
+ * snapshots seq->count; after, if the just-written line is a root-solution artifact, rewind count
+ * (drop the whole line) + SEQ_SKIP. Reader-gated: only hide-set tgids get a filtered table; root's
+ * own `mount`/`cat /proc/mounts` stay complete. Deciding purely by line CONTENT means arg1's exact
+ * type (struct mount* vs vfsmount*) is irrelevant. */
+static int mem_find(const char *buf, uint64_t start, uint64_t end, const char *pat)
+{
+    int pl = 0;
+    while (pat[pl]) pl++;
+    if (pl == 0 || end < start || (end - start) < (uint64_t)pl) return 0;
+    for (uint64_t i = start; i + pl <= end; i++) {
+        int k = 0;
+        while (k < pl && buf[i + k] == pat[k]) k++;
+        if (k == pl) return 1;
+    }
+    return 0;
+}
+/* A mountinfo/mounts line worth hiding = one that names the root solution's storage or an overlay.
+ * These markers appear only in magisk/APatch/KernelSU mounts on a stock-looking device. */
+static int mount_line_is_artifact(const char *buf, uint64_t s, uint64_t e)
+{
+    return mem_find(buf, s, e, "/data/adb") || mem_find(buf, s, e, "overlay") ||
+           mem_find(buf, s, e, "magisk") || mem_find(buf, s, e, "KSU") ||
+           mem_find(buf, s, e, "worker");
+}
+static void before_mountinfo(hook_fargs2_t *fargs, void *udata)
+{
+    (void)udata;
+    if (!g_mountinfo_hooked) return;
+    void *m = (void *)fargs->arg0;
+    fargs->local.data0 = *(volatile uint64_t *)((char *)m + SEQ_COUNT_OFF); /* snapshot line start */
+}
+static void after_mountinfo(hook_fargs2_t *fargs, void *udata)
+{
+    (void)udata;
+    if (!g_mountinfo_hooked || !g_fshide_on || !g_fs_mountinfo_on) return;
+    if (!fs_caller_gated()) return;                        /* reader-gate: hide-set apps only */
+    void *m = (void *)fargs->arg0;
+    char *buf = *(char **)((char *)m + 0);                 /* seq_file.buf @ +0 */
+    if (!buf) return;
+    uint64_t start = fargs->local.data0;
+    uint64_t end = *(volatile uint64_t *)((char *)m + SEQ_COUNT_OFF);
+    if (!mount_line_is_artifact(buf, start, end)) return;
+    *(volatile uint64_t *)((char *)m + SEQ_COUNT_OFF) = start; /* rewind: drop the whole line */
+    *(volatile uint64_t *)((char *)m + SEQ_PAD_OFF) = 0;       /* pad_until=0 */
+    fargs->ret = SEQ_SKIP;
+    g_mountinfo_hidden++;
+}
+static int ensure_mountinfo_hooked(void)
+{
+    if (g_mountinfo_hooked) return 0;
+    if (!g_addr_show_mountinfo) g_addr_show_mountinfo = (void *)kallsyms_lookup_name("show_mountinfo");
+    if (!g_addr_show_mountinfo) return -1;
+    if (hook_wrap2(g_addr_show_mountinfo, (void *)before_mountinfo, (void *)after_mountinfo, 0) !=
+        HOOK_NO_ERR)
+        return -1;
+    g_mountinfo_hooked = 1;
+    /* also filter /proc/pid/mounts (show_vfsmnt, same callbacks) -- best effort */
+    if (!g_addr_show_vfsmnt) g_addr_show_vfsmnt = (void *)kallsyms_lookup_name("show_vfsmnt");
+    if (g_addr_show_vfsmnt)
+        hook_wrap2(g_addr_show_vfsmnt, (void *)before_mountinfo, (void *)after_mountinfo, 0);
+    return 0;
+}
+static void maybe_unhook_mountinfo(void)
+{
+    if (g_fshide_on) return;
+    if (g_mountinfo_hooked) {
+        if (g_addr_show_vfsmnt)
+            hook_unwrap(g_addr_show_vfsmnt, (void *)before_mountinfo, (void *)after_mountinfo);
+        if (g_addr_show_mountinfo)
+            hook_unwrap(g_addr_show_mountinfo, (void *)before_mountinfo, (void *)after_mountinfo);
+        g_mountinfo_hooked = 0;
+    }
+}
+static int fshide_add(int tgid)
+{
+    if (tgid <= 0) return -1;
+    if (fs_in_hideset(tgid)) return 0; /* idempotent */
+    for (int i = 0; i < MAX_FSHIDE; i++)
+        if (g_fshide_set[i] == 0) { g_fshide_set[i] = tgid; g_fshide_n++; return 0; }
+    return -1; /* hide-set full */
+}
+static void fshide_del(int tgid)
+{
+    for (int i = 0; i < MAX_FSHIDE; i++)
+        if (g_fshide_set[i] == tgid) {
+            g_fshide_set[i] = 0;
+            if (g_fshide_n > 0) g_fshide_n--;
+        }
+}
+/* fshide on|off|add <tgid>|del <tgid>|magic <hex>|statfs on|off|mountinfo on|off|dump -- driven
+ * via KPM_CTL0 or the sysinfo bridge (Vector registers its own tgid on injection into a gated
+ * app). `on` arms whichever sub-mechanisms are enabled (statfs P1 + mountinfo P2). */
+static long do_fshide(const char *sub, char *p, char *e)
+{
+    sub = skipsp(sub);
+    long rc = 0;
+    if (starts(sub, "on")) {
+        g_fshide_on = 1;
+        if (g_fs_statfs_on && ensure_sys_statfs_hooked() != 0) {
+            apps(p, e, "error: hook statfs syscalls failed\n");
+            return -1;
+        }
+        if (g_fs_mountinfo_on && ensure_mountinfo_hooked() != 0) {
+            apps(p, e, "error: hook show_mountinfo failed\n");
+            return -1;
+        }
+        apps(p, e, "ok: fshide on\n");
+    } else if (starts(sub, "off")) {
+        g_fshide_on = 0;
+        maybe_unhook_sys_statfs();
+        maybe_unhook_mountinfo();
+        apps(p, e, "ok: fshide off\n");
+    } else if (starts(sub, "statfs")) {
+        const char *v = skipsp(sub + 6);
+        g_fs_statfs_on = starts(v, "off") ? 0 : 1;
+        if (g_fshide_on && g_fs_statfs_on) ensure_sys_statfs_hooked();
+        p = apps(p, e, "ok: statfs sub=");
+        p = appdec(p, e, g_fs_statfs_on);
+        apps(p, e, " (re-arm/off takes effect on next fshide on/off)\n");
+    } else if (starts(sub, "mountinfo")) {
+        const char *v = skipsp(sub + 9);
+        g_fs_mountinfo_on = starts(v, "off") ? 0 : 1;
+        if (g_fshide_on && g_fs_mountinfo_on) ensure_mountinfo_hooked();
+        p = apps(p, e, "ok: mountinfo sub=");
+        p = appdec(p, e, g_fs_mountinfo_on);
+        apps(p, e, " (re-arm/off takes effect on next fshide on/off)\n");
+    } else if (starts(sub, "add")) {
+        uint64_t v = 0;
+        parse_ull(sub + 3, &v);
+        if (!v) {
+            apps(p, e, "usage: fshide add <tgid>\n");
+            return -1;
+        }
+        if (fshide_add((int)v) != 0) {
+            apps(p, e, "error: hide-set full\n");
+            return -1;
+        }
+        p = apps(p, e, "ok: added tgid ");
+        p = appdec(p, e, (long)v);
+        apps(p, e, "\n");
+    } else if (starts(sub, "del")) {
+        uint64_t v = 0;
+        parse_ull(sub + 3, &v);
+        fshide_del((int)v);
+        apps(p, e, "ok: deleted\n");
+    } else if (starts(sub, "magic")) {
+        uint64_t v = 0;
+        parse_ull(sub + 5, &v);
+        if (v) g_fs_spoof_magic = (uint32_t)v;
+        p = apps(p, e, "ok: spoof magic=");
+        p = apphex(p, e, g_fs_spoof_magic);
+        apps(p, e, "\n");
+    } else if (starts(sub, "dump")) {
+        p = apps(p, e, "fshide on=");
+        p = appdec(p, e, g_fshide_on);
+        p = apps(p, e, " nset=");
+        p = appdec(p, e, g_fshide_n);
+        p = apps(p, e, " magic=");
+        p = apphex(p, e, g_fs_spoof_magic);
+        p = apps(p, e, "\n P1 statfs: on=");
+        p = appdec(p, e, g_fs_statfs_on);
+        p = apps(p, e, " hooked=");
+        p = appdec(p, e, g_sys_statfs_hooked);
+        p = apps(p, e, " calls=");
+        p = appdec(p, e, g_sys_statfs_calls);
+        p = apps(p, e, " spoofed=");
+        p = appdec(p, e, g_statfs_spoofed);
+        p = apps(p, e, "\n P2 mountinfo: on=");
+        p = appdec(p, e, g_fs_mountinfo_on);
+        p = apps(p, e, " hooked=");
+        p = appdec(p, e, g_mountinfo_hooked);
+        p = apps(p, e, " hidden=");
+        p = appdec(p, e, g_mountinfo_hidden);
+        p = apps(p, e, " show_mountinfo=");
+        p = apphex(p, e, (uint64_t)g_addr_show_mountinfo);
+        p = apps(p, e, " show_vfsmnt=");
+        p = apphex(p, e, (uint64_t)g_addr_show_vfsmnt);
+        p = apps(p, e, "\n tgids:");
+        for (int i = 0; i < MAX_FSHIDE; i++)
+            if (g_fshide_set[i]) {
+                p = apps(p, e, " ");
+                p = appdec(p, e, g_fshide_set[i]);
+            }
+        apps(p, e, "\n");
+    } else {
+        apps(p, e, "usage: fshide on|off|add <tgid>|del <tgid>|magic <hex>|statfs on|off|"
+                   "mountinfo on|off|dump\n");
+        rc = -1;
+    }
+    return rc;
+}
+
 static void resolve_syms(void)
 {
     if (!fn_find_get_task_by_vpid)
@@ -1283,6 +1569,9 @@ static void resolve_syms(void)
     if (!g_addr_show_map) g_addr_show_map = (void *)kallsyms_lookup_name("show_map");
     if (!g_addr_show_smap) g_addr_show_smap = (void *)kallsyms_lookup_name("show_smap");
     if (!g_addr_status) g_addr_status = (void *)kallsyms_lookup_name("proc_pid_status");
+    if (!g_addr_show_mountinfo) /* fs-hide P2 */
+        g_addr_show_mountinfo = (void *)kallsyms_lookup_name("show_mountinfo");
+    if (!g_addr_show_vfsmnt) g_addr_show_vfsmnt = (void *)kallsyms_lookup_name("show_vfsmnt");
     if (!fn_apply) fn_apply = (void *)kallsyms_lookup_name("apply_to_page_range");
     if (!fn_vmalloc) fn_vmalloc = (void *)kallsyms_lookup_name("vmalloc");
     if (!fn_vfree) fn_vfree = (void *)kallsyms_lookup_name("vfree");
@@ -3687,13 +3976,15 @@ static long shpte_run(const char *args, char *buf, int bufcap)
         rc = do_unbridge(p, e);
     } else if (starts(a, "bridge")) {
         rc = do_bridge(p, e);
+    } else if (starts(a, "fshide")) {
+        rc = do_fshide(a + 6, p, e);
     } else if (starts(a, "dump")) {
         rc = do_state(p, e);
     } else {
         apps(p, e,
              "usage: probe | pte | arm | redirect | redirectmap | pagehook | "
              "pghook | pgunhook | pgdisarm | hookto | hwhookto | hidemaps | unhidemaps | "
-             "ghosttest | ghostredirect | ghostfree | bridge | unbridge | disarm | dump\n");
+             "ghosttest | ghostredirect | ghostfree | bridge | unbridge | fshide | disarm | dump\n");
         rc = -1;
     }
     return rc;
@@ -3782,6 +4073,18 @@ static long shpte_exit(void *__user reserved)
     if (g_tracer_hooked && g_addr_status) {
         hook_unwrap(g_addr_status, (void *)before_status, (void *)after_status);
         g_tracer_hooked = 0;
+    }
+    if (g_sys_statfs_hooked) { /* fs-hide P1 (statfs/fstatfs syscall hooks) */
+        fp_unhook_syscalln(KSYS_STATFS, 0, (void *)after_sys_statfs);
+        fp_unhook_syscalln(KSYS_FSTATFS, 0, (void *)after_sys_statfs);
+        g_sys_statfs_hooked = 0;
+    }
+    if (g_mountinfo_hooked) { /* fs-hide P2 (show_mountinfo / show_vfsmnt) */
+        if (g_addr_show_vfsmnt)
+            hook_unwrap(g_addr_show_vfsmnt, (void *)before_mountinfo, (void *)after_mountinfo);
+        if (g_addr_show_mountinfo)
+            hook_unwrap(g_addr_show_mountinfo, (void *)before_mountinfo, (void *)after_mountinfo);
+        g_mountinfo_hooked = 0;
     }
     if (g_bridge_hooked) {
         fp_unhook_syscalln(BRIDGE_NR, (void *)before_bridge, 0);
