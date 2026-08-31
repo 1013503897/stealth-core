@@ -1,5 +1,7 @@
 # stealth-poc
 
+> 🇨🇳 中文版说明见 [`README.zh-CN.md`](./README.zh-CN.md)。
+
 Clean-room PoC for kernel-level **traceless hooking** on Android (ARM64), built on
 APatch / KernelPatch (KPM). Goal: intercept a target's execution **without modifying
 any of its memory** (no `.text` patch, no injected SO, no anonymous executable maps),
@@ -35,6 +37,9 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 | **RV-2** | **Clean-bounded multi-page region clones**: a `pghook` slot now traps a contiguous page **region** whose `R_hi` falls in an inter-function gap, cloned in one piece — so a function spanning a page boundary (or a page-neighbor that does) is wholly in the clone and `RET`s normally. Region-relative routing + `fn_vmalloc`'d offmap in the KPM; clean-`R_hi` scan + region clone in `lib/kpmhook`. Verified by `tools/rgntool.c`: a ~1100-insn page-spanning fn runs its FULL body via a 2-page clone (backup returns `n+1100`), its 2nd-page neighbor runs normally; single-page (`npages=1`) regressions stay green | ✅ verified |
 | **L1d** | **LIVE in-app traceless hook of real libart**: the custom Vector routes the **LSPosed manager**'s libart hooks through our KPM — `dump` shows **6-page and 11-page region clones** of real ART code (`redirects=39823`), manager UI fully functional, `.text` untouched. Required: bridge carrier moved `personality`→**`sysinfo`** (Android app seccomp arg-filters `personality`); gate moved cmdline→**UID** (cmdline is still `zygote64` at `LSPlant::Init` time); deploy via `apd module install` (device anti-tamper blocks direct module writes) | ✅ verified |
 | **L1e** | **100% inline-hook coverage**: the manager installs **6** simultaneous libart inline hooks; at `MAX_RGN=16` only **2/6** found a clean region boundary (clean ends — a function RET landing exactly on a page boundary — are sparse in dense libart). Raising **`MAX_RGN` 16→64** brings **all 6** through as region clones (6/39/19/11/25/39 pages; the 4 ex-Dobby ones needed 19/25/39/39), `dump npg=6`, manager fully functional, zero crash, zero Dobby fallback | ✅ verified |
+| **SSOL** | **Traceless Java hooking via single-step-out-of-line** (Layer 2 for dense framework JIT). Keeps the original code at its original address and executes it one instruction at a time out-of-line (XOL), *simulating* PC-relative insns and fixing mid-step faults — so ART's PC→method map / stack unwind / GC / deopt all work unchanged (region-clone can't: literal pools → SIGILL, clone return addresses → SIGSEGV). It is "traceless uprobes": uprobes' XOL machinery triggered by our **UXN execute-fault** instead of a code-writing `BRK`. KPM side done — entry-override + call-original bypass, multi-target SSOL region (N overrides/page), snapshot-staleness guard + drift refresh, dead-process GC, auto-hidden xol scratch page; `hookdemo` all 5 surfaces CLEAN | ✅ verified (KPM side) |
+| **fs-hide** | **Kernel-side filesystem anti-detection** (`fshide`): `vfs_statfs` spoofs the gated process's overlay `f_type` back to the underlying fs (erofs), and `show_mountinfo` SKIPs the overlay/magisk mount lines — a **reader-gate** (tgid/uid hide-set), so only the target process is fooled while root's own `mount`/`df` stay honest. Kills Duck Detector's Mount / hidden-overlayfs "Danger" verdict without any userspace hook | ✅ M1+M2 verified |
+| **Rev1/Rev2** | **Ghost main-path** (Rev1 ①): the `pghook` host clone itself now lives in VMA-less ghost memory. **Fork safety** (Rev2 ②): forked children are un-trapped so their own-`.text` execute faults never false-hit | ✅ verified |
 
 ## Requirements
 
@@ -42,7 +47,10 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
   Pixel 6 (oriole), Android 16, kernel `6.1.145-android14` GKI, KernelPatch kpimg `d01` (= 0.13.1).
   ⚠️ Cloud phones can't run this (no custom kernel / KPM). Use a physical, expendable test device.
 - **Host (Windows)**: Android NDK (uses `26.1.10909125`, clang 17) — no WSL/gcc needed.
-  `adb` + the device's APatch **superkey**.
+  `adb` + the device's APatch **superkey**. ⚠️ On the lab Pixel 6 the superkey was
+  **removed/migrated (2026-07-24)**, so `shctl` auth changed — confirm with the user before use.
+  `shpte` now **auto-arms the sysinfo bridge at init**, so an injected agent can drive it
+  **without the superkey** (that is the path Vector uses).
 - KernelPatch source checked out at the **matching tag** for the kpm SDK headers
   (`vendor/KernelPatch`, tag `0.13.1`).
 
@@ -51,11 +59,13 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 ```
 kpm/        shpoc.c     P0 syscall-hook smoke test
             shhwbp.c    P1.5/P1.6 HWBP hook: per-thread bp table + state machine
-            shpte.c     P2/P4/P5/L1a main module. cmds: pte | arm | redirect | redirectmap |
-                        pagehook (whole-page UXN hook) | pghook/pgunhook/pgdisarm (multi-page,
-                        multi-override-per-page table) | hookto/hwhookto (inline_hooker+ghost
-                        backup) | ghosttest/ghostredirect/ghostfree | hidemaps | hidetracer |
-                        bridge | disarm | dump
+            shpte.c     P2/P4/P5/L1/SSOL/fs-hide main module. cmds: pte | arm | redirect |
+                        redirectmap | pagehook (whole-page UXN hook) | pghook/pgunhook/pgdisarm
+                        (multi-page, multi-override-per-page RV-2 region table) | hookto/hwhookto/
+                        hwunhook (inline_hooker+ghost backup) | ghosttest/ghostredirect/ghostfree |
+                        ssolhook/ssolunhook/ssolguard/ssolgc/ssoldisarm (single-step-out-of-line,
+                        Java) | hidemaps/unhidemaps/hidergn | hidetracer | fshide (statfs/mountinfo
+                        anti-detect) | bridge/unbridge | disarm | dump
             shmin.c     minimal ctl0 isolation test
             build.ps1   build a .kpm with NDK clang  (build.ps1 -Src shhwbp.c)
 cli/        shctl.c     KPM control CLI (supercall: load/unload/list/info/control)
@@ -101,16 +111,71 @@ tools/      hbtarget.c  self-contained single-thread HWBP test target (pid + &ti
             rgntool.c               RV-2: multi-page region clone test (a ~1100-insn page-spanning
                                     fn + a 2nd-page neighbor, via lib/kpmhook over the bridge)
             run_rgn_test.sh         RV-2 harness (spanning fn full body via the region clone)
+            s0probe.c   S0: measure clone-readable residual exposure (upgraded probe)
+            fsprobe.c   fs-hide probe (statfs f_type / mountinfo, as a target sees them)
+            ssoltarget.c            SSOL target
+            run_ssoltest.sh / run_ssolguard_test.sh / run_ssolretire_test.sh   SSOL harnesses
 lib/        dbi.c/.h    libdbi: reusable AArch64 position-independent function recompiler
             dbi_test.c  host/device-runnable unit test (build_dbi_test.ps1)
             kpmhook.c/.h L1a: LSPlant InitInfo inline_hooker/unhooker glue -> KPM multi-page
-                        pghook table over the syscall bridge (whole-page DBI clone; Vector links this)
+                        pghook table over the syscall bridge (region DBI clone; Vector links this).
+                        Also carries kpm_hook_fshide_enable (arm fs-hide + register self tgid)
+            ssol.c/.h   SSOL userspace glue
 vendor/     KernelPatch  (SDK headers + docs; tag 0.13.1)
 
 The DBI recompiler is being consolidated into `lib/libdbi` for reuse by the userspace agent
 (it's what the Vector/LSPlant integration links against). `tools/ghostexec.c` already uses it;
 `tools/dbitarget2..4.c` still carry their own (now-superseded) copies.
 ```
+
+## Quick self-test (pure userspace — no KPM load, no superkey)
+
+The two core algorithms ship **pure-userspace unit tests** — they don't load the KPM, don't touch the
+kernel, and need no superkey, so they run on any arm64 Android device (cloud phones included). Fastest
+way to confirm the toolchain + recompiler/simulator are correct:
+
+```powershell
+powershell lib/build_dbi_test.ps1       # libdbi: AArch64 position-independent recompiler
+powershell lib/build_ssol_test.ps1      # libssol: SSOL instruction simulator (+ on-silicon cross-check)
+```
+```bash
+adb push lib/dbi_test lib/ssol_test /data/local/tmp/
+adb shell chmod 755 /data/local/tmp/dbi_test /data/local/tmp/ssol_test
+adb shell /data/local/tmp/dbi_test      # expect: libdbi: ALL TESTS PASSED
+adb shell /data/local/tmp/ssol_test     # expect: [native cross-check enabled] / ssol: ALL TESTS PASSED
+```
+
+Last run on Pixel 6 (`1C091FDF6008DN`): both exit 0, `ALL TESTS PASSED`.
+
+## End-to-end over the bridge (no superkey — verified)
+
+Once `shpte` is loaded and the bridge is armed (auto-armed at init, or `control shpte bridge`), **any
+process drives the whole KPM without the superkey** — that is exactly what `bridgetool` does:
+`syscall(179 /*sysinfo*/, "SHPTBRDG", cmd, len, out, outlen)`; a real `sysinfo(&info)` call (arg0 ≠
+magic) passes straight through. Every `shctl KEY control shpte "<cmd>"` in `tools/run_*.sh` has an
+equivalent `bridgetool "<cmd>"`.
+
+```bash
+# probe device state first (pure syscall; empty reply if the KPM isn't loaded — safe)
+adb push tools/bridgetool /data/local/tmp/ ; adb shell chmod 755 /data/local/tmp/bridgetool
+adb shell /data/local/tmp/bridgetool probe   # armed bridge -> all resolved kernel symbols; rc=0
+adb shell /data/local/tmp/bridgetool dump    # current armed slots / npg / redirects / maps_hidden
+
+# flagship RV-2 end-to-end: rgntool self-hooks a page-spanning fn over the bridge (no shctl/superkey)
+adb push tools/rgntool /data/local/tmp/ ; adb shell chmod 755 /data/local/tmp/rgntool
+adb shell /data/local/tmp/rgntool            # self-hook -> verify -> self-unhook (cleans up its slot)
+```
+
+`rgntool` expects: `[R span] n=k -> backup=1100+k` (the whole page-spanning function ran from the
+region clone), the page-neighbor `nbfn(n)=n*2` normal, `unhook: 1`. `kpmhooktool` (L1a, many overrides
+per page, mimics LSPlant) likewise self-hooks via `lib/kpmhook`.
+
+> Verified on Pixel 6 (`1C091FDF6008DN`, superkey removed): `shpte` already running in-kernel, bridge
+> armed; `bridgetool probe` returned all symbols; `rgntool` all-green + clean self-teardown. `dump` also
+> showed a **live production session** — 7 region clones (one 63 pages) on a real process, `.text`
+> untouched, `maps_hidden=388` (i.e. L1d/L1e live in-app traceless-hook of real libart). ⚠️ If `dump`
+> shows existing slots, the device is in production use — self-hooking tests (rgntool/kpmhooktool) are
+> safe (own slot + self-cleanup), but never run `pgdisarm`/`unbridge`/`unload` against live slots.
 
 ## Build & run (P1.5 demo)
 
@@ -179,7 +244,8 @@ The full traceless-hook pipeline is implemented and device-verified: HWBP multi-
 execution (P4.2). The original `.text` is never modified (CRC-clean) and the recompiled clone runs
 from memory invisible to both `/proc/*/maps` and `mincore`. P5 adds the productization primitives
 (reusable `libdbi`, HWBP/UXN `inline_hooker` with ghost `backup`, no-superkey syscall bridge,
-TracerPid spoof). Anti-detection coverage: CRC + maps scan + ptrace/TracerPid.
+TracerPid spoof). Anti-detection coverage: CRC + maps scan + ptrace/TracerPid + fs/mount
+(`fshide`: overlay `statfs`/`mountinfo` spoof, reader-gated).
 
 ### Productization: LSPlant/Vector (and a future Frida-Gum stealth backend)
 The intended end-product is a modified **Vector** (JingMatrix's Zygisk ART-hook framework; cloned at
@@ -202,8 +268,12 @@ The intended end-product is a modified **Vector** (JingMatrix's Zygisk ART-hook 
   **Remaining:** multi-slot `hwhookto` (HWBP, entry-only) as a fallback for functions still too large for a
   clean region past 64 pages, or hosts needing more than `MAX_PG` regions; and a Vector-passed package-name
   gate to replace the UID gate.
-- **Layer 2** (Java methods): fork LSPlant's `DoHook` to trap the compiled `entry_point` via HWBP/UXN
-  instead of swapping the `ArtMethod` pointer (defeats pointer-roaming detection).
+- **Layer 2** (Java methods): **SSOL** (single-step-out-of-line) is the correct + scalable path for
+  dense framework JIT — keep the original code in place and step it one instruction at a time
+  (triggered by our UXN fault, not a code-writing `BRK`), so ART's PC→method map / unwind / GC / deopt
+  stay intact where a region clone would SIGILL (literal pools) or SIGSEGV (clone return addresses).
+  **KPM side done + device-verified** (`hookdemo` all 5 surfaces CLEAN); region-clone stays for L1
+  native and simple-app Java hooks. Remaining: Vector/LSPlant `DoHook` wiring. See `docs/SSOL-design.md`.
 - **Frida-Gum** (optional, larger): re-back Gum's `Interceptor` with `hwhookto` and Stalker's code
   cache with ghost memory; plus process/port/thread hiding hooks. Same KPM, different frontend.
 

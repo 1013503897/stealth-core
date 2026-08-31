@@ -42,11 +42,11 @@ $kpm = Join-Path $here "$stem.kpm"
 
 Write-Host "[*] clang: $clang"
 Write-Host "[*] KP kernel headers: $kp"
-Write-Host "[*] compiling shpoc.c ..."
+Write-Host "[*] compiling $Src ..."
 & $clang @cflags @incFlags -c $src -o $obj
 if ($LASTEXITCODE -ne 0) { throw "compile failed ($LASTEXITCODE)" }
 
-Write-Host "[*] relocatable link -> shpoc.kpm ..."
+Write-Host "[*] relocatable link -> $stem.kpm ..."
 & $clang "--target=aarch64-none-elf" "-nostdlib" "-r" $obj -o $kpm
 if ($LASTEXITCODE -ne 0) { throw "link failed ($LASTEXITCODE)" }
 

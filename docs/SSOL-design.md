@@ -1,9 +1,13 @@
 # Traceless Java hooking via SSOL ("single-step out of line") — design
 
-**Status:** design, not implemented. Supersedes the region-clone path for COMPLEX apps (see the
-"FINAL VERDICT" in the goal memo / `L2-java-traceless.md`). The region-clone (`do_pghook` + `dbi.c`)
-stays for L1 native libart hooks and simple-app Java hooks where it is verified; SSOL is the
-correct+scalable path for dense framework JIT.
+**Status:** **KPM side implemented + device-verified** (`hookdemo` all 5 surfaces CLEAN) — entry-override
++ call-original bypass, multi-target SSOL region (N overrides/page), snapshot-staleness guard + drift
+refresh, dead-process GC, auto-hidden xol scratch page. Remaining: Vector/LSPlant `DoHook` wiring.
+Supersedes the region-clone path for COMPLEX apps (see the "FINAL VERDICT" in the goal memo /
+`L2-java-traceless.md`). The region-clone (`do_pghook` + `dbi.c`) stays for L1 native libart hooks and
+simple-app Java hooks where it is verified; SSOL is the correct+scalable path for dense framework JIT.
+
+> 本文其余章节写于设计阶段，为「怎么做/为什么」的设计依据，实现细节以 `kpm/shpte.c` 的 `ssol*` 路径为准。
 
 ---
 
