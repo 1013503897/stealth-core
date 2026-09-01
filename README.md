@@ -7,6 +7,13 @@ APatch / KernelPatch (KPM). Goal: intercept a target's execution **without modif
 any of its memory** (no `.text` patch, no injected SO, no anonymous executable maps),
 so it survives CRC / maps-scan style anti-tamper checks.
 
+### TL;DR
+
+- **What** — intercept a function *without touching its bytes*: no `.text` patch, no injected `.so`, no anonymous executable map.
+- **How** — a kernel module (KPM) sets `PTE_UXN` on the target's code page; the execute-fault is routed into a position-independent **clone** (DBI-recompiled) that lives in VMA-less "ghost" memory. The original page is never modified. Backends: **region clone** (real libart), **HWBP** (entry-only), **SSOL** (Java / dense JIT).
+- **Use** — call `kpm_inline_hooker(target, hooker) → backup` from userspace over a **no-superkey** syscall bridge (Vector's `HookInline` funnels into this). Smallest working example: [`tools/demohook.c`](tools/demohook.c) (`105 → hook → 106 → unhook → 105`, `.text` untouched).
+- **Beats** — CRC / self-checksum · `/proc/maps` + `mincore` scans · ptrace/TracerPid · overlayfs mount detection.
+
 **Related project:** this repo is the kernel + userspace-glue **source** of the KPM traceless-hook
 backend used by [**Vector**](https://github.com/1013503897/Vector) — our fork of JingMatrix's Zygisk
 ART-hook framework. Vector vendors `lib/kpmhook` + `lib/dbi` from here and routes its `HookInline`
@@ -109,6 +116,9 @@ tools/      hbtarget.c  self-contained single-thread HWBP test target (pid + &ti
             run_hookto_test.sh / run_hwhook_test.sh / run_bridge_test.sh / run_tracer_test.sh
             run_pagehook_test.sh    P5 harness (single page-shared func hooked, neighbors normal)
             run_pghook_test.sh      P5 harness (two pages hooked simultaneously, neighbors normal)
+            demohook.c              minimal API example: self-hooks one page-isolated fn via
+                                    kpm_inline_hooker (105 -> hook -> 106 -> unhook -> 105);
+                                    build_demohook.ps1 (read this first to learn the call path)
             kpmhooktool.c           L1a: in-process agent mimicking LSPlant's call pattern --
                                     inline-hooks vx1/vx2/vx3 (3 overrides on ONE page) + vy1 (a
                                     second page) via lib/kpmhook over the no-superkey bridge
@@ -300,6 +310,13 @@ Remaining / future:
 
 Android（ARM64）上**内核级无痕 Hook** 的 clean-room PoC，基于 **APatch / KernelPatch（KPM）**。
 
+### TL;DR
+
+- **做什么** —— 拦截一个函数却*不动它任何字节*：不 patch `.text`、不注入 `.so`、不建匿名可执行映射。
+- **怎么做** —— 内核模块（KPM）给目标代码页置 `PTE_UXN`，执行陷阱被路由进一份位置无关的**克隆**（DBI 重编译），克隆跑在 VMA-less「ghost」内存里；原页从不被改。后端三选：**region 克隆**（真 libart）、**HWBP**（仅入口）、**SSOL**（Java / 稠密 JIT）。
+- **怎么调** —— 用户态经**无 superkey** 的 syscall 桥调 `kpm_inline_hooker(target, hooker) → backup`（Vector 的 `HookInline` 收敛到这里）。最小可跑示例：[`tools/demohook.c`](tools/demohook.c)（`105 →hook→ 106 →unhook→ 105`，`.text` 不动）。
+- **过什么检测** —— CRC / 自校验 · `/proc/maps` + `mincore` 扫描 · ptrace/TracerPid · overlayfs 挂载检测。
+
 > 深入的工程约定与硬核教训见 [`CLAUDE.md`](./CLAUDE.md)。
 
 **关联项目**：本仓是 [**Vector**](https://github.com/1013503897/Vector)（我们 fork 的 JingMatrix Zygisk ART-hook 框架）所用 **KPM 无痕后端的内核 + 用户态胶水源头**。Vector 从这里 vendored `lib/kpmhook` + `lib/dbi`，其 `HookInline` **先走 `kpm_inline_hooker`**（KPM 无痕）、桥未开时退 Dobby。见下方状态表 **L1b/L1d/L1e** 与《产品化》一节。
@@ -397,6 +414,7 @@ tools/      测试靶子 + 端到端 harness（各 .c 与 shctl 同法编译）
   ghosttool/ghostexec        P4.2 ghost 内存靶（注入读 / 从 ghost 页执行）
   hooktool/hwhooktool        inline_hooker 靶（UXN 隔离 / HWBP 非隔离）
   pagetool/pgtool/rgntool    整页 / 多页 / region 克隆靶
+  demohook                   最小 API 示例：自 hook 一个页隔离函数（105→hook→106→unhook→105），先读它学调用链
   kpmhooktool                L1a：模拟 LSPlant 调用模式的进程内 agent
   ssoltarget                 SSOL 靶
   libartcensus               L1c：ELF 页跨越普查（零风险，量化是否需要多页克隆）
