@@ -23,6 +23,7 @@ kpm_bootstrap.zip
 /kpm/*.so
 /kpm/mc.db
 # compiled android tools (NDK clang outputs)
+/tools/demohook
 /tools/kpmhooktool
 /tools/libartcensus
 /tools/rgntool
