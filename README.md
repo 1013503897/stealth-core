@@ -44,15 +44,18 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 ## Requirements
 
 - **Device**: ARM64, bootloader unlocked, **APatch + KernelPatch** installed. Verified on
-  Pixel 6 (oriole), Android 16, kernel `6.1.145-android14` GKI, KernelPatch kpimg `d01` (= 0.13.1).
+  Pixel 6 (oriole), Android 16, kernel `6.1.145-android14` GKI, **KernelPatch 0.13.3** (verified
+  live via the unauthenticated `SUPERCALL_KERNELPATCH_VER`; `kver` reported `6.1.145` to match).
   ⚠️ Cloud phones can't run this (no custom kernel / KPM). Use a physical, expendable test device.
 - **Host (Windows)**: Android NDK (uses `26.1.10909125`, clang 17) — no WSL/gcc needed.
   `adb` + the device's APatch **superkey**. ⚠️ On the lab Pixel 6 the superkey was
   **removed/migrated (2026-07-24)**, so `shctl` auth changed — confirm with the user before use.
   `shpte` now **auto-arms the sysinfo bridge at init**, so an injected agent can drive it
   **without the superkey** (that is the path Vector uses).
-- KernelPatch source checked out at the **matching tag** for the kpm SDK headers
-  (`vendor/KernelPatch`, tag `0.13.1`).
+- KernelPatch SDK headers (`vendor/KernelPatch`, tag `0.13.1`) — ABI-compatible with the device's
+  0.13.3 (the loaded `shpte` KPM is verified working). `shctl`'s `KP_VER_CODE` packs a version into
+  each supercall's `vcmd`, but the 0.13.x dispatcher **ignores those bits** (`cmd = arg1 & 0xFFFF`),
+  so it is cosmetic; only the SDK-header ABI actually has to match.
 
 ## Layout
 

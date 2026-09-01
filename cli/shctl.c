@@ -31,8 +31,11 @@
 #define SC_KPM_INFO 0x1032
 
 // KernelPatch version code = (MAJOR<<16)|(MINOR<<8)|PATCH.
-// Target device runs kpimg d01 == 0.13.1 -> 0x0d01.
-#define KP_VER_CODE ((0 << 16) | (13 << 8) | 1)
+// Device runs KernelPatch 0.13.3 (verified live via unauthenticated
+// SUPERCALL_KERNELPATCH_VER=0x1008). NB: the 0.13.x supercall dispatcher takes
+// cmd = arg1 & 0xFFFF and IGNORES the version bits packed into vcmd, so this value
+// is cosmetic; the real ABI contract is the vendor/KernelPatch SDK headers.
+#define KP_VER_CODE ((0 << 16) | (13 << 8) | 3)
 
 static long vcmd(long cmd)
 {

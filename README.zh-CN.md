@@ -168,7 +168,7 @@ adb shell /data/local/tmp/ssol_test    # 期望: [native cross-check enabled] / 
 
 ## 部署与运行（真机）
 
-需要**物理 ARM64 设备** + APatch/KernelPatch。云手机跑不了（无自定义内核 / KPM）。已实测：Pixel 6（oriole），Android 16，kernel `6.1.145-android14` GKI，KernelPatch kpimg `d01`（= 0.13.1）。
+需要**物理 ARM64 设备** + APatch/KernelPatch。云手机跑不了（无自定义内核 / KPM）。已实测：Pixel 6（oriole），Android 16，kernel `6.1.145-android14` GKI，**KernelPatch 0.13.3**（经免鉴权的 `SUPERCALL_KERNELPATCH_VER` 现场查得；`kver` 同时回报 `6.1.145` 对得上）。
 
 > ⚠️ 本机 Pixel 6 的 **superkey 已于 2026-07-24 移除/迁移**，`shctl` 认证方式已变——用前先与用户确认。`shpte` 现支持 init 时自动开桥，用户态 agent 经 sysinfo bridge 无 superkey 驱动。
 >
@@ -210,8 +210,8 @@ adb shell /data/local/tmp/rgntool            # 自 hook -> 验证 -> 自 unhook�
 
 两个独立的版本 pin 必须与设备匹配，否则 load/supercall 会**静默失败**：
 
-- `vendor/KernelPatch` checkout 在 tag **0.13.1**；它提供的 kpm SDK 头必须匹配设备上的 kpimg 版本（实测 kpimg `d01` = 0.13.1）。
-- `cli/shctl.c` 里的 `KP_VER_CODE`（`(0<<16)|(13<<8)|1`）把 KernelPatch 版本编进每次 supercall 的 `vcmd`；升级 KernelPatch 就同步 bump。
+- `vendor/KernelPatch` checkout 在 tag **0.13.1**，提供 kpm SDK 头。设备实际是 **0.13.3**（现场查得），两者 **ABI 兼容**——当前加载的 `shpte` KPM 实测正常工作，故 SDK 头无需强行对齐到 0.13.3。真正必须匹配的是 SDK 头的 ABI，不是那个数字。
+- `cli/shctl.c` 的 `KP_VER_CODE`（现为 `0.13.3`）会打进每次 supercall 的 `vcmd` 高位，**但 0.13.x 的 supercall 分发器只取 `cmd = arg1 & 0xFFFF`、忽略版本高位**（`vendor/KernelPatch/.../supercall.c` 里 `// todo: from 0.10.5` 那段被注释掉了），所以它是**运行时无效的装饰值**——查询版本时我压根没传高位，supercall 照样生效即为铁证。升级 KP 时按需对齐 SDK 头 tag 即可，`KP_VER_CODE` 改不改都不影响运行。
 
 ## 硬核教训（别再用血踩一遍）
 
