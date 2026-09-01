@@ -27,3 +27,6 @@ kpm_bootstrap.zip
 /tools/libartcensus
 /tools/rgntool
 /tools/ssoltarget
+
+# 内部工程约定/指引，不入库（本地保留，供 Claude Code 读）
+CLAUDE.md
