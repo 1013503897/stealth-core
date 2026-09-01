@@ -7,6 +7,12 @@ APatch / KernelPatch (KPM). Goal: intercept a target's execution **without modif
 any of its memory** (no `.text` patch, no injected SO, no anonymous executable maps),
 so it survives CRC / maps-scan style anti-tamper checks.
 
+**Related project:** this repo is the kernel + userspace-glue **source** of the KPM traceless-hook
+backend used by [**Vector**](https://github.com/1013503897/Vector) — our fork of JingMatrix's Zygisk
+ART-hook framework. Vector vendors `lib/kpmhook` + `lib/dbi` from here and routes its `HookInline`
+through `kpm_inline_hooker` (KPM traceless) first, falling back to Dobby when the KPM bridge is
+unarmed. See the **L1b/L1d/L1e** status rows and the *Productization* section below.
+
 Reference (concepts only): the kanxue article *Android 内核无痕 Hook 理解和感悟* and
 the public `xiaojianbang-stealth-hook` repo. **No third-party code is copied** — this
 is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs.
@@ -295,6 +301,8 @@ Remaining / future:
 Android（ARM64）上**内核级无痕 Hook** 的 clean-room PoC，基于 **APatch / KernelPatch（KPM）**。
 
 > 深入的工程约定与硬核教训见 [`CLAUDE.md`](./CLAUDE.md)。
+
+**关联项目**：本仓是 [**Vector**](https://github.com/1013503897/Vector)（我们 fork 的 JingMatrix Zygisk ART-hook 框架）所用 **KPM 无痕后端的内核 + 用户态胶水源头**。Vector 从这里 vendored `lib/kpmhook` + `lib/dbi`，其 `HookInline` **先走 `kpm_inline_hooker`**（KPM 无痕）、桥未开时退 Dobby。见下方状态表 **L1b/L1d/L1e** 与《产品化》一节。
 
 ## 这是什么
 
