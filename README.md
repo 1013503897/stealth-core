@@ -268,7 +268,7 @@ TracerPid spoof). Anti-detection coverage: CRC + maps scan + ptrace/TracerPid + 
 
 ### Productization: LSPlant/Vector (and a future Frida-Gum stealth backend)
 The intended end-product is a modified **Vector** (JingMatrix's Zygisk ART-hook framework; cloned at
-`../Vector`) whose hook backend is our KPM. Findings (see memory `lsplant-vector-integration`):
+`../Vector`) whose hook backend is our KPM. Findings:
 - Vector's `inline_hooker(target, hooker) → backup` maps **exactly** onto `hwhookto` (HWBP, since
   real libart funcs share pages) + ghost backup; `inline_unhooker` → `hwunhook` + `ghostfree`.
 - JingMatrix's LSPlant `InitInfo` has **no `mem_map`** → the article's `alloc_ghost` is unnecessary.
@@ -316,8 +316,6 @@ Android（ARM64）上**内核级无痕 Hook** 的 clean-room PoC，基于 **APat
 - **怎么做** —— 内核模块（KPM）给目标代码页置 `PTE_UXN`，执行陷阱被路由进一份位置无关的**克隆**（DBI 重编译），克隆跑在 VMA-less「ghost」内存里；原页从不被改。后端三选：**region 克隆**（真 libart）、**HWBP**（仅入口）、**SSOL**（Java / 稠密 JIT）。
 - **怎么调** —— 用户态经**无 superkey** 的 syscall 桥调 `kpm_inline_hooker(target, hooker) → backup`（Vector 的 `HookInline` 收敛到这里）。最小可跑示例：[`tools/demohook.c`](tools/demohook.c)（`105 →hook→ 106 →unhook→ 105`，`.text` 不动）。
 - **过什么检测** —— CRC / 自校验 · `/proc/maps` + `mincore` 扫描 · ptrace/TracerPid · overlayfs 挂载检测。
-
-> 深入的工程约定与硬核教训见 [`CLAUDE.md`](./CLAUDE.md)。
 
 **关联项目**：本仓是 [**Vector**](https://github.com/1013503897/Vector)（我们 fork 的 JingMatrix Zygisk ART-hook 框架）所用 **KPM 无痕后端的内核 + 用户态胶水源头**。Vector 从这里 vendored `lib/kpmhook` + `lib/dbi`，其 `HookInline` **先走 `kpm_inline_hooker`**（KPM 无痕）、桥未开时退 Dobby。见下方状态表 **L1b/L1d/L1e** 与《产品化》一节。
 
@@ -540,7 +538,7 @@ adb shell /data/local/tmp/rgntool            # 自 hook -> 验证 -> 自 unhook�
 
 ## 产品化：LSPlant / Vector（及未来的 Frida-Gum 无痕后端）
 
-目标成品是一个改造版 **Vector**（`../Vector`），其 hook 后端换成本仓 KPM。要点（另见 memory `lsplant-vector-integration`）：
+目标成品是一个改造版 **Vector**（`../Vector`），其 hook 后端换成本仓 KPM。要点：
 
 - Vector 的 `inline_hooker(target, hooker) → backup` **精确对应** `hwhookto`（HWBP，因真实 libart 函数共享页）+ ghost backup；`inline_unhooker` → `hwunhook` + `ghostfree`。
 - **Layer 1**（LSPlant init 时的 native libart hook）：把 Vector 的 `inline_hooker`/`unhooker` 换成经 syscall bridge 调 KPM。载体是扩到每页多 override、跨多页的 **UXN `pghook`**（RV-2 region 克隆）。L1a–L1e 已完成并**真机应用内实测**：LSPosed 管理器 6 个 libart inline hook 全走 region 克隆、零 Dobby 回退、`.text` 不动。
