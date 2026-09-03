@@ -11,7 +11,7 @@ so it survives CRC / maps-scan style anti-tamper checks.
 
 - **What** — intercept a function *without touching its bytes*: no `.text` patch, no injected `.so`, no anonymous executable map.
 - **How** — a kernel module (KPM) sets `PTE_UXN` on the target's code page; the execute-fault is routed into a position-independent **clone** (DBI-recompiled) that lives in VMA-less "ghost" memory. The original page is never modified. Backends: **region clone** (real libart), **HWBP** (entry-only), **SSOL** (Java / dense JIT).
-- **Use** — call `kpm_inline_hooker(target, hooker) → backup` from userspace over a **no-superkey** syscall bridge (Vector's `HookInline` funnels into this). Smallest working example: [`tools/demohook.c`](tools/demohook.c) (`105 → hook → 106 → unhook → 105`, `.text` untouched).
+- **Use** — call `kpm_inline_hooker(target, hooker) → backup` from userspace over a syscall bridge (Vector's `HookInline` funnels into this). Smallest working example: [`tools/demohook.c`](tools/demohook.c) (`105 → hook → 106 → unhook → 105`, `.text` untouched).
 - **Beats** — CRC / self-checksum · `/proc/maps` + `mincore` scans · ptrace/TracerPid · overlayfs mount detection.
 
 **Related project:** this repo is the kernel + userspace-glue **source** of the KPM traceless-hook
@@ -43,8 +43,8 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 | **P3.5** | DBI: `BLRAAZ`/`BRAAZ` PAC-call demote (article §5.7); stock NDK doesn't emit it, PAC-ret `paciasp`/`retaa` are PC-independent and pass through verbatim | ⬜ todo |
 | **P4.1** | `/proc/*/maps` hide: hook `show_map`, drop the clone's entry from the `seq_file` output (article §5.8) — beats CRC scan **and** maps scan together | ✅ verified |
 | **P4.2** | VMA-less **ghost memory**: inject a PTE for the clone with **no VMA** (`vmalloc`+`vmalloc_to_pfn`+`apply_to_page_range`); step A = inject+read (invisible to `maps`/`mincore`), step B = execute the DBI clone from the ghost page (`sync_icache`) — complete no-trace hook, no maps-hide hook needed | ✅ verified |
-| **P5** | Productization groundwork for LSPlant/Vector (and a future Frida-Gum stealth backend): `lib/libdbi` (reusable recompiler) · **HWBP-redirect `inline_hooker`** for real non-page-isolated funcs (`hwhookto`) + UXN variant (`hookto`) with ghost `backup` · no-superkey **syscall bridge** · **TracerPid spoof** (anti-debug) | ✅ verified |
-| **L1a** | LSPlant `inline_hooker` carrier: `pghook` scaled to **many overrides per page** (`MAX_OV`, barrier-safe sentinel table) across **`MAX_PG=24`** pages + `pgunhook` (per-fn `inline_unhooker`); **`lib/kpmhook`** userspace glue maps LSPlant's `InitInfo` callbacks onto the bridge (whole-page DBI clone per page, mmap RX). ~20 simultaneous libart-style hooks, several sharing a page, all from one no-superkey agent | ✅ verified |
+| **P5** | Productization groundwork for LSPlant/Vector (and a future Frida-Gum stealth backend): `lib/libdbi` (reusable recompiler) · **HWBP-redirect `inline_hooker`** for real non-page-isolated funcs (`hwhookto`) + UXN variant (`hookto`) with ghost `backup` · **syscall bridge** · **TracerPid spoof** (anti-debug) | ✅ verified |
+| **L1a** | LSPlant `inline_hooker` carrier: `pghook` scaled to **many overrides per page** (`MAX_OV`, barrier-safe sentinel table) across **`MAX_PG=24`** pages + `pgunhook` (per-fn `inline_unhooker`); **`lib/kpmhook`** userspace glue maps LSPlant's `InitInfo` callbacks onto the bridge (whole-page DBI clone per page, mmap RX). ~20 simultaneous libart-style hooks, several sharing a page, all from one userspace agent | ✅ verified |
 | **L1b** | **Vector wiring** (`../Vector`): `native_api.h` `HookInline`/`UnhookInline` (the funnel for both `lsplant::InitInfo` sites + the `NativeAPIEntries` ABI) try `kpm_inline_hooker`/`unhooker` first, **fall back to Dobby** when the bridge is unarmed; `lib/kpmhook`+`lib/dbi` vendored into `native/src/kpm`; `:zygisk:assembleDebug` → `libzygisk.so` | ✅ runtime-verified (live on the LSPosed manager — see L1d/L1e) |
 | **L1c** | **Page-span census** (`tools/libartcensus.c`, zero-risk on-disk ELF scan): real libart `.text` has **12.2% of functions spanning page boundaries (lower bound), 46.5% of code bytes in spanning runs, max fn ~27 pages** → the single-page whole-page clone is **unusable for real libart**; **multi-page clones are mandatory** (scopes RV-2) | ✅ measured |
 | **RV-2** | **Clean-bounded multi-page region clones**: a `pghook` slot now traps a contiguous page **region** whose `R_hi` falls in an inter-function gap, cloned in one piece — so a function spanning a page boundary (or a page-neighbor that does) is wholly in the clone and `RET`s normally. Region-relative routing + `fn_vmalloc`'d offmap in the KPM; clean-`R_hi` scan + region clone in `lib/kpmhook`. Verified by `tools/rgntool.c`: a ~1100-insn page-spanning fn runs its FULL body via a 2-page clone (backup returns `n+1100`), its 2nd-page neighbor runs normally; single-page (`npages=1`) regressions stay green | ✅ verified |
@@ -56,19 +56,12 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 
 ## Requirements
 
-- **Device**: ARM64, bootloader unlocked, **APatch + KernelPatch** installed. Verified on
-  Pixel 6 (oriole), Android 16, kernel `6.1.145-android14` GKI, **KernelPatch 0.13.3** (verified
-  live via the unauthenticated `SUPERCALL_KERNELPATCH_VER`; `kver` reported `6.1.145` to match).
-  ⚠️ Cloud phones can't run this (no custom kernel / KPM). Use a physical, expendable test device.
-- **Host (Windows)**: Android NDK (uses `26.1.10909125`, clang 17) — no WSL/gcc needed.
-  `adb` + the device's APatch **superkey**. ⚠️ On the lab Pixel 6 the superkey was
-  **removed/migrated (2026-07-24)**, so `shctl` auth changed — confirm with the user before use.
-  `shpte` now **auto-arms the sysinfo bridge at init**, so an injected agent can drive it
-  **without the superkey** (that is the path Vector uses).
-- KernelPatch SDK headers (`vendor/KernelPatch`, tag `0.13.1`) — ABI-compatible with the device's
-  0.13.3 (the loaded `shpte` KPM is verified working). `shctl`'s `KP_VER_CODE` packs a version into
-  each supercall's `vcmd`, but the 0.13.x dispatcher **ignores those bits** (`cmd = arg1 & 0xFFFF`),
-  so it is cosmetic; only the SDK-header ABI actually has to match.
+- **Device**: ARM64, bootloader unlocked, **APatch + KernelPatch** installed. Reference platform:
+  Pixel 6 (oriole), Android 16, kernel `6.1.145-android14` GKI, **KernelPatch 0.13.3**.
+- **Host (Windows)**: Android NDK (`26.1.10909125`, clang 17) — no WSL/gcc needed — plus `adb`.
+- **KernelPatch SDK headers** (`vendor/KernelPatch`, tag `0.13.1`) — ABI-compatible with the device's
+  0.13.3 (the loaded `shpte` KPM is verified working). Only the SDK-header ABI has to match; `shctl`'s
+  `KP_VER_CODE` version bits are cosmetic (the 0.13.x dispatcher masks `cmd = arg1 & 0xFFFF`).
 
 ## Layout
 
@@ -108,7 +101,7 @@ tools/      hbtarget.c  self-contained single-thread HWBP test target (pid + &ti
             run_ghost_test.sh       P4.2-A harness (inject + read; invisible to maps/mincore)
             run_ghostexec_test.sh   P4.2-B harness (clone runs from VMA-less ghost memory)
             hooktool.c / hwhooktool.c   P5 inline_hooker tests (UXN isolated / HWBP non-isolated)
-            bridgetool.c            P5 syscall-bridge test (drive KPM with no superkey)
+            bridgetool.c            P5 syscall-bridge test (drive the KPM from userspace)
             tracertest.c            P5 TracerPid spoof test (ptrace a child, read its status)
             pagetool.c              P5 whole-page UXN hook: funcA/B/C share a page (single `pagehook`)
             pgtool.c                P5 MULTI-page table: funcA/funcB on different pages, both
@@ -121,7 +114,7 @@ tools/      hbtarget.c  self-contained single-thread HWBP test target (pid + &ti
                                     build_demohook.ps1 (read this first to learn the call path)
             kpmhooktool.c           L1a: in-process agent mimicking LSPlant's call pattern --
                                     inline-hooks vx1/vx2/vx3 (3 overrides on ONE page) + vy1 (a
-                                    second page) via lib/kpmhook over the no-superkey bridge
+                                    second page) via lib/kpmhook over the syscall bridge
             run_kpmhook_test.sh     L1a harness (arm bridge, run kpmhooktool, observe multi-
                                     override + partial/full unhook + page disarm)
             libartcensus.c          L1c: zero-risk page-span census of a system lib's .text
@@ -147,122 +140,28 @@ The DBI recompiler is being consolidated into `lib/libdbi` for reuse by the user
 `tools/dbitarget2..4.c` still carry their own (now-superseded) copies.
 ```
 
-## Quick self-test (pure userspace — no KPM load, no superkey)
+## Build
 
-The two core algorithms ship **pure-userspace unit tests** — they don't load the KPM, don't touch the
-kernel, and need no superkey, so they run on any arm64 Android device (cloud phones included). Fastest
-way to confirm the toolchain + recompiler/simulator are correct:
-
-```powershell
-powershell lib/build_dbi_test.ps1       # libdbi: AArch64 position-independent recompiler
-powershell lib/build_ssol_test.ps1      # libssol: SSOL instruction simulator (+ on-silicon cross-check)
-```
-```bash
-adb push lib/dbi_test lib/ssol_test /data/local/tmp/
-adb shell chmod 755 /data/local/tmp/dbi_test /data/local/tmp/ssol_test
-adb shell /data/local/tmp/dbi_test      # expect: libdbi: ALL TESTS PASSED
-adb shell /data/local/tmp/ssol_test     # expect: [native cross-check enabled] / ssol: ALL TESTS PASSED
-```
-
-Last run on Pixel 6: both exit 0, `ALL TESTS PASSED`.
-
-## End-to-end over the bridge (no superkey — verified)
-
-Once `shpte` is loaded and the bridge is armed (auto-armed at init, or `control shpte bridge`), **any
-process drives the whole KPM without the superkey** — that is exactly what `bridgetool` does:
-`syscall(179 /*sysinfo*/, "SHPTBRDG", cmd, len, out, outlen)`; a real `sysinfo(&info)` call (arg0 ≠
-magic) passes straight through. Every `shctl KEY control shpte "<cmd>"` in `tools/run_*.sh` has an
-equivalent `bridgetool "<cmd>"`.
-
-```bash
-# probe device state first (pure syscall; empty reply if the KPM isn't loaded — safe)
-adb push tools/bridgetool /data/local/tmp/ ; adb shell chmod 755 /data/local/tmp/bridgetool
-adb shell /data/local/tmp/bridgetool probe   # armed bridge -> all resolved kernel symbols; rc=0
-adb shell /data/local/tmp/bridgetool dump    # current armed slots / npg / redirects / maps_hidden
-
-# flagship RV-2 end-to-end: rgntool self-hooks a page-spanning fn over the bridge (no shctl/superkey)
-adb push tools/rgntool /data/local/tmp/ ; adb shell chmod 755 /data/local/tmp/rgntool
-adb shell /data/local/tmp/rgntool            # self-hook -> verify -> self-unhook (cleans up its slot)
-```
-
-`rgntool` expects: `[R span] n=k -> backup=1100+k` (the whole page-spanning function ran from the
-region clone), the page-neighbor `nbfn(n)=n*2` normal, `unhook: 1`. `kpmhooktool` (L1a, many overrides
-per page, mimics LSPlant) likewise self-hooks via `lib/kpmhook`.
-
-> Verified on Pixel 6 (superkey removed): `shpte` already running in-kernel, bridge
-> armed; `bridgetool probe` returned all symbols; `rgntool` all-green + clean self-teardown. `dump` may
-> also show other pre-existing sessions — some region clones (tens of pages) on a real process, `.text`
-> untouched, `maps_hidden` non-zero (i.e. L1d/L1e live in-app traceless-hook of real libart). ⚠️ If `dump`
-> shows existing slots, the device already has other test sessions — self-hooking tests (rgntool/kpmhooktool) are
-> safe (own slot + self-cleanup), but never run `pgdisarm`/`unbridge`/`unload` against live slots.
-
-## Build & run (P1.5 demo)
+Windows + NDK clang — no WSL/gcc. Build scripts are PowerShell; the NDK is hardcoded to
+`26.1.10909125` (clang 17) — edit `$ndk` in the scripts for a different install.
 
 ```powershell
-# build
-powershell kpm/build.ps1 -Src shhwbp.c          # -> kpm/shhwbp.kpm
-powershell cli/build_shctl.ps1                  # -> cli/shctl   (android arm64)
-
-# push (shctl/hbtarget persist across reboot; re-push the .kpm after changes)
-adb push kpm/shhwbp.kpm /data/local/tmp/ ; adb push cli/shctl /data/local/tmp/
-adb push tools/hbtarget /data/local/tmp/ ; adb shell su -c 'chmod 755 /data/local/tmp/shctl /data/local/tmp/hbtarget'
-
-# load + drive (KEY = APatch superkey)
-adb shell su -c '/data/local/tmp/shctl KEY load /data/local/tmp/shhwbp.kpm'
-adb shell su -c '/data/local/tmp/shctl KEY control shhwbp probe'        # resolve symbols
-adb shell su -c 'setsid /data/local/tmp/hbtarget >/data/local/tmp/hbt.out 2>&1 </dev/null &'
-adb shell cat /data/local/tmp/hbt.out                                   # -> pid=.. tick=0x..
-# hook syntax: hook <hexaddr> <pid> <tid> [tid ...]; <pid> is the tgid to follow new
-# threads of; single-thread target => tid == pid, so pass pid twice
-adb shell su -c '/data/local/tmp/shctl KEY control shhwbp "hook <tickaddr> <pid> <pid>"'
-adb shell su -c '/data/local/tmp/shctl KEY control shhwbp dump'         # hits low, x0=arg, return captured
-adb shell su -c '/data/local/tmp/shctl KEY control shhwbp unhook'
-adb shell su -c '/data/local/tmp/shctl KEY unload shhwbp'
+powershell kpm/build.ps1 -Src shpte.c   # -> kpm/shpte.kpm   (KPM kernel module)
+powershell cli/build_shctl.ps1          # -> cli/shctl       (android arm64 control CLI)
 ```
 
-Always wrap device supercalls in `timeout N` during development, and **unhook before unload**.
+KPM build flags are load-bearing: **`-O0`** (clang `-O2` miscompiles for the KP module loader) and
+**`-mbranch-protection=bti`** (the breakpoint handler is called indirectly by kernel perf), then a
+relocatable link (`-r -nostdlib`, `-ffreestanding -mgeneral-regs-only`). `tools/*.c` targets compile
+like `shctl` (`--target=aarch64-linux-android33`).
 
-### P1.6 multi-thread demo (one shot)
-
-`mttarget` spawns main + 4 worker threads all calling `tick`; the harness enumerates
-`/proc/<pid>/task`, installs a per-thread HWBP on every thread, and dumps per-thread hits:
-
-```powershell
-powershell cli/build_shctl.ps1                                          # also builds nothing extra
-# build mttarget (no script): NDK clang, same target as shctl
-& "$ndk\...\clang.exe" --target=aarch64-linux-android33 -O2 tools/mttarget.c -o tools/mttarget
-adb push tools/mttarget tools/run_mt_test.sh /data/local/tmp/
-adb shell su -c 'chmod 755 /data/local/tmp/mttarget /data/local/tmp/run_mt_test.sh'
-adb shell su -c 'sh /data/local/tmp/run_mt_test.sh KEY'                  # full load→hook all→dump→unhook→unload
-```
-
-Expected: `slots=5`, and every TID shows `e=N r=N` with `x0` = its own `who` (0..4) — proof each
-thread is followed independently. (If two devices are attached, add `-s <serial>` to every `adb`.)
-
-## Hard-won lessons (don't relearn these the hard way)
-
-1. **clang `-O2` miscompiles for the KP module loader** → runtime SP/PC-alignment panic & reboot.
-   KP's own demos use gcc; with clang you must build KPMs at **`-O0`** (locked in `build.ps1`,
-   plus `-mbranch-protection=bti` because the bp handler is called indirectly by kernel perf).
-2. **Never call blocking/perf kernel APIs from the KP supercall/control context or from the
-   breakpoint-exception handler.** Calling `register/unregister/modify_user_hw_breakpoint` on a
-   remote task there wedges the thread in uninterruptible D-state **while holding a KernelPatch
-   lock** → every subsequent supercall (incl. APatch `su`) hangs → only a *physical* reboot
-   recovers it. Fix: defer all perf calls to the **target task's own context via `task_work_add`**
-   (sleepable, local install, runs before the faulting instruction re-executes).
-3. arm64 only auto-single-steps over an execute breakpoint when the perf event uses the
-   **default** overflow handler. With a custom handler (needed to capture regs) it does **not**,
-   so a plain execute bp re-triggers forever. Solution: the **entry↔return state machine** —
-   move the bp to LR on entry, back to entry on return.
-4. `pgrep -f <path>` matches its **own** command line — use `ps -A` / `pgrep -x <comm>` to count.
-
-## Next
+## Design summary
 
 The full traceless-hook pipeline is implemented and device-verified: HWBP multi-thread following
 (P1.6) → UXN net + `do_page_fault` routing (P2) → DBI recompiler (P3) → VMA-less ghost-memory
 execution (P4.2). The original `.text` is never modified (CRC-clean) and the recompiled clone runs
 from memory invisible to both `/proc/*/maps` and `mincore`. P5 adds the productization primitives
-(reusable `libdbi`, HWBP/UXN `inline_hooker` with ghost `backup`, no-superkey syscall bridge,
+(reusable `libdbi`, HWBP/UXN `inline_hooker` with ghost `backup`, syscall bridge,
 TracerPid spoof). Anti-detection coverage: CRC + maps scan + ptrace/TracerPid + fs/mount
 (`fshide`: overlay `statfs`/`mountinfo` spoof, reader-gated).
 
@@ -318,7 +217,7 @@ Android（ARM64）上**内核级无痕 Hook** 的 clean-room PoC，基于 **APat
 
 - **做什么** —— 拦截一个函数却*不动它任何字节*：不 patch `.text`、不注入 `.so`、不建匿名可执行映射。
 - **怎么做** —— 内核模块（KPM）给目标代码页置 `PTE_UXN`，执行陷阱被路由进一份位置无关的**克隆**（DBI 重编译），克隆跑在 VMA-less「ghost」内存里；原页从不被改。后端三选：**region 克隆**（真 libart）、**HWBP**（仅入口）、**SSOL**（Java / 稠密 JIT）。
-- **怎么调** —— 用户态经**无 superkey** 的 syscall 桥调 `kpm_inline_hooker(target, hooker) → backup`（Vector 的 `HookInline` 收敛到这里）。最小可跑示例：[`tools/demohook.c`](tools/demohook.c)（`105 →hook→ 106 →unhook→ 105`，`.text` 不动）。
+- **怎么调** —— 用户态经 syscall 桥调 `kpm_inline_hooker(target, hooker) → backup`（Vector 的 `HookInline` 收敛到这里）。最小可跑示例：[`tools/demohook.c`](tools/demohook.c)（`105 →hook→ 106 →unhook→ 105`，`.text` 不动）。
 - **过什么检测** —— CRC / 自校验 · `/proc/maps` + `mincore` 扫描 · ptrace/TracerPid · overlayfs 挂载检测。
 
 **关联项目**：本仓是 [**Vector**](https://github.com/1013503897/Vector)（我们 fork 的 JingMatrix Zygisk ART-hook 框架）所用 **KPM 无痕后端的内核 + 用户态胶水源头**。Vector 从这里 vendored `lib/kpmhook` + `lib/dbi`，其 `HookInline` **先走 `kpm_inline_hooker`**（KPM 无痕）、桥未开时退 Dobby。见下方状态表 **L1b/L1d/L1e** 与《产品化》一节。
@@ -331,7 +230,7 @@ Android（ARM64）上**内核级无痕 Hook** 的 clean-room PoC，基于 **APat
 - 不注入 SO、不建匿名可执行映射（过得了 `/proc/*/maps` 扫描）；
 - 重编译后的克隆代码跑在 **连 `/proc/*/maps` 和 `mincore` 都看不见** 的内存里。
 
-它是 Vector（`../Vector`，JingMatrix 的 Zygisk ART-hook 框架）**KPM 无痕后端的内核源头**——Vector 通过 vendored 的 `lib/kpmhook` + `lib/dbi` 经无 superkey 的 sysinfo bridge 驱动本仓的 KPM。本仓保持独立 git（remote `github.com/1013503897/stealth-poc`）。
+它是 Vector（`../Vector`，JingMatrix 的 Zygisk ART-hook 框架）**KPM 无痕后端的内核源头**——Vector 通过 vendored 的 `lib/kpmhook` + `lib/dbi` 经 sysinfo bridge 驱动本仓的 KPM。本仓保持独立 git（remote `github.com/1013503897/stealth-poc`）。
 
 参考（仅概念）：看雪文章《Android 内核无痕 Hook 理解和感悟》与公开的 `xiaojianbang-stealth-hook`。**未拷贝任何第三方代码**——全部对着 KernelPatch kpm SDK API 和稳定的 Linux/ARM ABI 自研实现。
 
@@ -368,7 +267,7 @@ ssolhook/ssolunhook/ssolguard/ssolgc/ssoldisarm/ssolstat/ssoltest/ssolpoison   S
 hidemaps/unhidemaps/hidergn   从 /proc/*/maps 抹掉克隆的 VMA
 hidetracer/unhidetracer       伪造 TracerPid=0（反调试）
 fshide       fs 反检测（statfs f_type 伪装 + mountinfo 行过滤）
-bridge/unbridge  开/关无 superkey 的 sysinfo 桥
+bridge/unbridge  开/关 sysinfo 桥
 selfstep/dump    自测/诊断
 ```
 
@@ -385,7 +284,7 @@ selfstep/dump    自测/诊断
 | **P3.5** | `BLRAAZ`/`BRAAZ` PAC-call 降级（需 pauth 构建的目标；stock NDK 不产出） | ⬜ todo |
 | **P4.1** | `/proc/*/maps` 隐藏：hook `show_map`，从 seq_file 输出里抹掉克隆行（CRC + maps 扫描一起过） | ✅ |
 | **P4.2** | **VMA-less ghost 内存**：`vmalloc`+`vmalloc_to_pfn`+`apply_to_page_range` 给克隆注入一个**无 VMA** 的 PTE——maps/mincore 均不可见，且直接从 ghost 页执行 DBI 克隆（`sync_icache`）；无需 maps-hide 兜底 | ✅ |
-| **P5** | 产品化原语：可复用 `lib/dbi`、HWBP/UXN `inline_hooker`（`hwhookto`/`hookto` + ghost backup）、无 superkey syscall bridge、TracerPid 伪造 | ✅ |
+| **P5** | 产品化原语：可复用 `lib/dbi`、HWBP/UXN `inline_hooker`（`hwhookto`/`hookto` + ghost backup）、syscall bridge、TracerPid 伪造 | ✅ |
 | **L1a–L1e** | LSPlant `inline_hooker` 载体：`pghook` 扩到每页多 override（barrier-safe sentinel 表）× 多页；`lib/kpmhook` 把 LSPlant `InitInfo` 回调映射到桥；**RV-2 干净边界多页 region 克隆**（页跨越函数整体在克隆里、正常 `RET`）；把 `MAX_RGN` 提到 64 后，LSPosed 管理器 **6 个** libart inline hook 全部走 region 克隆（零 Dobby 回退），**真机应用内实测无痕 hook 真实 libart**、`.text` 不动 | ✅ 真机实测 |
 | **SSOL** | **单步出线（single-step out of line）Java 无痕 hook**：把原始代码留在原地、逐指令 XOL 执行——PC 始终在原始地址，ART 的 PC→method 映射/栈回溯/GC/deopt 全部照常工作，解决稠密框架 JIT 上 region 克隆的「代码/数据交织」「克隆返回地址」两大结构性脆弱点。相当于「用 UXN 陷阱触发的 uprobes」。KPM 侧核心 + 多目标 region + 抗漂移 guard + 死进程 GC 已实现，hookdemo 五个面全 CLEAN | ✅ 真机实测（KPM 侧） |
 | **fs-hide** | 内核态文件系统反检测：`vfs_statfs` 把 gated 进程看到的 overlay `f_type` 伪装成底层 fs、`show_mountinfo` SKIP 掉 overlay/magisk 挂载行（reader-gate，只骗要骗的进程）。触发场景：某商业 root/mount 检测器把 Mount/hidden-overlayfs 判 Danger | ✅ M1+M2 |
@@ -437,9 +336,9 @@ vendor/     KernelPatch（SDK 头 + 文档；tag 0.13.1）
 - **SSOL 单步出线**：稠密框架 JIT 上，region 克隆有两个结构性坑（① 代码/数据交织，字面量池被当指令执行 → SIGILL；② 克隆返回地址上栈，ART unwinder/GC 认不出 → SIGSEGV）。SSOL 把原码留在原地，只逐指令 XOL、对 PC 相关指令做 simulate、mid-step fault 修正——PC 之间永远在原始地址，ART 全套机制照常。触发用已有的 UXN 执行 fault（不写 BRK，故无痕）。
 - **fork 安全**（Rev2 ②）：给 fork 出的子进程**解陷阱**，子进程在自己 `.text` 上的执行 fault 不再误命中。
 
-### 最重要的不变量：deferred-work 安全模型
+### 关键不变量：deferred-work 安全模型
 
-perf/断点内核 API（`register/unregister/modify_user_hw_breakpoint`）和其它阻塞调用，**绝不能在 supercall/`KPM_CTL0` 上下文或断点异常 handler 里跑**——那会让线程卡在不可中断 D-state **同时持有 KernelPatch 锁**，之后每一次 supercall（含 APatch `su`）都挂，只能**物理重启**。全仓强制的模式：
+perf/断点内核 API（`register/unregister/modify_user_hw_breakpoint`）和其它可能阻塞的调用，**不在 supercall/`KPM_CTL0` 上下文或断点异常 handler 里直接跑**——那会让线程卡在不可中断 D-state 同时持有 KernelPatch 锁，阻塞后续 supercall。全仓强制的模式：
 
 - 断点/fault handler 只**快照寄存器**，然后 `task_work_add(target_task, ..., TWA_RESUME)` 入队；
 - 真正的 perf 调用推迟到**目标任务自己的上下文**（可睡眠、返回用户态前）执行。
@@ -460,85 +359,18 @@ powershell cli/build_shctl.ps1
 
 **KPM 构建 flag 是 load-bearing 的，未在真机重测前不要改**：
 
-- **只能 `-O0`**。clang `-O2` 对 KP 模块加载器会 miscompile → 运行期 SP/PC 对齐 panic + 设备重启。（上游 demo 用 gcc `-O2`，不迁移到 clang。）
+- **只能 `-O0`**（clang `-O2` 对 KP 模块加载器会 miscompile）。
 - **`-mbranch-protection=bti`**——断点 handler 被内核 perf 间接调用，需要 BTI landing pad。
 - `--target=aarch64-none-elf -nostdinc -ffreestanding -mgeneral-regs-only`，再做可重定位链接（`-r -nostdlib`）；`-I` 集镜像上游 kpm Makefile。
 
 `tools/*.c` 靶子没有构建脚本，与 `shctl` 同法编译（`--target=aarch64-linux-android33`）。
 
-## 快速自检（纯用户态，无需内核加载 / superkey）
-
-两个核心算法有**纯用户态单元测试**——不 load KPM、不碰内核、不需要 superkey，任意 arm64 Android 设备（含云手机）都能跑，是验证工具链 + 重编译器/模拟器是否正确的最快 smoke test：
-
-```powershell
-# 1) libdbi —— AArch64 位置无关重编译器（重编译一个函数、原件 vs 克隆逐一比对）
-powershell lib/build_dbi_test.ps1
-# 2) libssol —— SSOL 指令模拟器（golden 向量 + 在真芯片上交叉校验 simulate 结果）
-powershell lib/build_ssol_test.ps1
-```
-
-```bash
-adb push lib/dbi_test lib/ssol_test /data/local/tmp/
-adb shell chmod 755 /data/local/tmp/dbi_test /data/local/tmp/ssol_test
-adb shell /data/local/tmp/dbi_test     # 期望: libdbi: ALL TESTS PASSED
-adb shell /data/local/tmp/ssol_test    # 期望: [native cross-check enabled] / ssol: ALL TESTS PASSED
-```
-
-> 最近一次在 Pixel 6 实测：两者 exit 0、`ALL TESTS PASSED`。
-
-## 部署与运行（真机）
-
-需要**物理 ARM64 设备** + APatch/KernelPatch。云手机跑不了（无自定义内核 / KPM）。已实测：Pixel 6（oriole），Android 16，kernel `6.1.145-android14` GKI，**KernelPatch 0.13.3**（经免鉴权的 `SUPERCALL_KERNELPATCH_VER` 现场查得；`kver` 同时回报 `6.1.145` 对得上）。
-
-> ⚠️ 本机 Pixel 6 的 **superkey 已于 2026-07-24 移除/迁移**，`shctl` 认证方式已变——用前先与用户确认。`shpte` 现支持 init 时自动开桥，用户态 agent 经 sysinfo bridge 无 superkey 驱动。
->
-> ⚠️ 无开机自动加载（`/data/adb/kpms` 空），每次开机手动从 `/data/local/tmp/shpte.kpm` 加载。开发期把设备 supercall 都包在 `timeout N` 里，且 **`unload` 前务必先 `unhook`/`disarm`**（需要目标存活）。`shctl`/靶子重启后仍在，改完 `.kpm` 要重推。
-
-```powershell
-adb push kpm/shpte.kpm /data/local/tmp/ ; adb push cli/shctl /data/local/tmp/
-adb shell su -c 'chmod 755 /data/local/tmp/shctl'
-
-# KEY = APatch superkey（若已迁移，见上）
-adb shell su -c '/data/local/tmp/shctl KEY load /data/local/tmp/shpte.kpm'
-adb shell su -c '/data/local/tmp/shctl KEY control shpte probe'    # 解析内核符号
-adb shell su -c '/data/local/tmp/shctl KEY control shpte bridge'   # 开无 superkey 桥
-adb shell su -c '/data/local/tmp/shctl KEY control shpte dump'     # 诊断
-```
-
-内核侧 `logki`/`logke` 输出进内核日志（`adb shell su -c 'dmesg'`），不到 `shctl` stdout——`shctl` 只打印 `KPM_CTL0` 应答缓冲。各阶段端到端 harness 见 `tools/run_*.sh`（它们用 `shctl KEY control` 驱动，需 superkey）。
-
-### 经桥端到端（无 superkey，已实测）
-
-一旦 `shpte` 已加载且桥已开（init 自动开，或 `control shpte bridge`），**任意进程都能不用 superkey 驱动整个 KPM**——`bridgetool` 就是这么做的：`syscall(179 /*sysinfo*/, "SHPTBRDG", cmd, len, out, outlen)`，真 `sysinfo(&info)` 调用（arg0≠magic）原样放行。`tools/run_*.sh` 里凡是 `shctl KEY control shpte "<cmd>"` 都可等价替换成 `bridgetool "<cmd>"`。
-
-```bash
-# 先探测：KPM 是否已加载 + 桥是否已开（纯 syscall，未加载则空返回，安全）
-adb push tools/bridgetool /data/local/tmp/ ; adb shell chmod 755 /data/local/tmp/bridgetool
-adb shell /data/local/tmp/bridgetool probe   # 已开则回全部已解析内核符号；rc=0
-adb shell /data/local/tmp/bridgetool dump    # 看当前 armed slot / npg / redirects / maps_hidden
-
-# 旗舰 RV-2 端到端：rgntool 经桥「自 hook」一个跨页函数（不需 shctl/superkey）
-adb push tools/rgntool /data/local/tmp/ ; adb shell chmod 755 /data/local/tmp/rgntool
-adb shell /data/local/tmp/rgntool            # 自 hook -> 验证 -> 自 unhook（自清理）
-```
-
-`rgntool` 期望：`[R span] n=k -> backup=1100+k`（跨页函数**整体**从 region 克隆跑通）、页邻居 `nbfn(n)=n*2` 正常、`unhook: 1`。同理 `kpmhooktool`（L1a 每页多 override，仿 LSPlant 调用模式）也经 `lib/kpmhook` 自 hook。
-
-> 实测（Pixel 6，superkey 已移除）：`shpte` 已在内核运行、桥已开；`bridgetool probe` 回全部符号；`rgntool` 全项 OK、自清理干净。`dump` 还可能显示该机上已有其它会话——若干 region（含数十页的）挂在真实进程上、`.text` 不动、`maps_hidden` 非零（即 L1d/L1e 真机应用内无痕 hook）。⚠️ 若 `dump` 显示已有存量 slot，说明设备上已有其它测试会话——自 hook 类测试（rgntool/kpmhooktool）用自己的 slot 且自清理是安全的，但别对存量 slot 跑 `pgdisarm`/`unbridge`/`unload`。
-
 ## 版本耦合（必须与设备一致）
 
 两个独立的版本 pin 必须与设备匹配，否则 load/supercall 会**静默失败**：
 
-- `vendor/KernelPatch` checkout 在 tag **0.13.1**，提供 kpm SDK 头。设备实际是 **0.13.3**（现场查得），两者 **ABI 兼容**——当前加载的 `shpte` KPM 实测正常工作，故 SDK 头无需强行对齐到 0.13.3。真正必须匹配的是 SDK 头的 ABI，不是那个数字。
-- `cli/shctl.c` 的 `KP_VER_CODE`（现为 `0.13.3`）会打进每次 supercall 的 `vcmd` 高位，**但 0.13.x 的 supercall 分发器只取 `cmd = arg1 & 0xFFFF`、忽略版本高位**（`vendor/KernelPatch/.../supercall.c` 里 `// todo: from 0.10.5` 那段被注释掉了），所以它是**运行时无效的装饰值**——查询版本时我压根没传高位，supercall 照样生效即为铁证。升级 KP 时按需对齐 SDK 头 tag 即可，`KP_VER_CODE` 改不改都不影响运行。
-
-## 硬核教训（别再用血踩一遍）
-
-1. **clang `-O2` 对 KP 加载器 miscompile** → 运行期 SP/PC 对齐 panic + 重启。KPM 必须 `-O0`（`build.ps1` 已锁），外加 `-mbranch-protection=bti`。
-2. **绝不在 supercall/control 上下文或断点异常 handler 里调阻塞/perf 内核 API**。对远端 task 调 `register/unregister/modify_user_hw_breakpoint` 会卡 D-state + 持 KernelPatch 锁 → 后续 supercall 全挂 → 只能物理重启。修法：一切 perf 调用经 `task_work_add` 推迟到目标任务自己的上下文。
-3. arm64 只有在 perf event 用**默认** overflow handler 时才会对执行断点自动单步；用了自定义 handler（为捕获寄存器）就不会 → 裸执行断点无限重触发。解法：**entry↔return 状态机**（入口把断点移到 LR，返回时移回入口）。
-4. `pgrep -f <path>` 会匹配到它自己的命令行——用 `ps -A` / `pgrep -x <comm>` 计数。
+- `vendor/KernelPatch` checkout 在 tag **0.13.1**，提供 kpm SDK 头。设备实际是 **0.13.3**，两者 **ABI 兼容**——当前加载的 `shpte` KPM 实测正常工作，故 SDK 头无需强行对齐到 0.13.3。真正必须匹配的是 SDK 头的 ABI，不是那个数字。
+- `cli/shctl.c` 的 `KP_VER_CODE`（现为 `0.13.3`）会打进每次 supercall 的 `vcmd` 高位，**但 0.13.x 的 supercall 分发器只取 `cmd = arg1 & 0xFFFF`、忽略版本高位**，所以它是**运行时无效的装饰值**。升级 KP 时按需对齐 SDK 头 tag 即可，`KP_VER_CODE` 改不改都不影响运行。
 
 ## 产品化：LSPlant / Vector（及未来的 Frida-Gum 无痕后端）
 
