@@ -45,13 +45,13 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 | **P4.2** | VMA-less **ghost memory**: inject a PTE for the clone with **no VMA** (`vmalloc`+`vmalloc_to_pfn`+`apply_to_page_range`); step A = inject+read (invisible to `maps`/`mincore`), step B = execute the DBI clone from the ghost page (`sync_icache`) — complete no-trace hook, no maps-hide hook needed | ✅ verified |
 | **P5** | Productization groundwork for LSPlant/Vector (and a future Frida-Gum stealth backend): `lib/libdbi` (reusable recompiler) · **HWBP-redirect `inline_hooker`** for real non-page-isolated funcs (`hwhookto`) + UXN variant (`hookto`) with ghost `backup` · no-superkey **syscall bridge** · **TracerPid spoof** (anti-debug) | ✅ verified |
 | **L1a** | LSPlant `inline_hooker` carrier: `pghook` scaled to **many overrides per page** (`MAX_OV`, barrier-safe sentinel table) across **`MAX_PG=24`** pages + `pgunhook` (per-fn `inline_unhooker`); **`lib/kpmhook`** userspace glue maps LSPlant's `InitInfo` callbacks onto the bridge (whole-page DBI clone per page, mmap RX). ~20 simultaneous libart-style hooks, several sharing a page, all from one no-superkey agent | ✅ verified |
-| **L1b** | **Vector wiring** (`../Vector`): `native_api.h` `HookInline`/`UnhookInline` (the funnel for both `lsplant::InitInfo` sites + the `NativeAPIEntries` ABI) try `kpm_inline_hooker`/`unhooker` first, **fall back to Dobby** when the bridge is unarmed; `lib/kpmhook`+`lib/dbi` vendored into `native/src/kpm`; `:zygisk:assembleDebug` → `libzygisk.so` | ✅ runtime-verified (live on GCash + LSPosed manager — see L1d/L1e) |
+| **L1b** | **Vector wiring** (`../Vector`): `native_api.h` `HookInline`/`UnhookInline` (the funnel for both `lsplant::InitInfo` sites + the `NativeAPIEntries` ABI) try `kpm_inline_hooker`/`unhooker` first, **fall back to Dobby** when the bridge is unarmed; `lib/kpmhook`+`lib/dbi` vendored into `native/src/kpm`; `:zygisk:assembleDebug` → `libzygisk.so` | ✅ runtime-verified (live on the LSPosed manager — see L1d/L1e) |
 | **L1c** | **Page-span census** (`tools/libartcensus.c`, zero-risk on-disk ELF scan): real libart `.text` has **12.2% of functions spanning page boundaries (lower bound), 46.5% of code bytes in spanning runs, max fn ~27 pages** → the single-page whole-page clone is **unusable for real libart**; **multi-page clones are mandatory** (scopes RV-2) | ✅ measured |
 | **RV-2** | **Clean-bounded multi-page region clones**: a `pghook` slot now traps a contiguous page **region** whose `R_hi` falls in an inter-function gap, cloned in one piece — so a function spanning a page boundary (or a page-neighbor that does) is wholly in the clone and `RET`s normally. Region-relative routing + `fn_vmalloc`'d offmap in the KPM; clean-`R_hi` scan + region clone in `lib/kpmhook`. Verified by `tools/rgntool.c`: a ~1100-insn page-spanning fn runs its FULL body via a 2-page clone (backup returns `n+1100`), its 2nd-page neighbor runs normally; single-page (`npages=1`) regressions stay green | ✅ verified |
 | **L1d** | **LIVE in-app traceless hook of real libart**: the custom Vector routes the **LSPosed manager**'s libart hooks through our KPM — `dump` shows **6-page and 11-page region clones** of real ART code (`redirects=39823`), manager UI fully functional, `.text` untouched. Required: bridge carrier moved `personality`→**`sysinfo`** (Android app seccomp arg-filters `personality`); gate moved cmdline→**UID** (cmdline is still `zygote64` at `LSPlant::Init` time); deploy via `apd module install` (device anti-tamper blocks direct module writes) | ✅ verified |
 | **L1e** | **100% inline-hook coverage**: the manager installs **6** simultaneous libart inline hooks; at `MAX_RGN=16` only **2/6** found a clean region boundary (clean ends — a function RET landing exactly on a page boundary — are sparse in dense libart). Raising **`MAX_RGN` 16→64** brings **all 6** through as region clones (6/39/19/11/25/39 pages; the 4 ex-Dobby ones needed 19/25/39/39), `dump npg=6`, manager fully functional, zero crash, zero Dobby fallback | ✅ verified |
 | **SSOL** | **Traceless Java hooking via single-step-out-of-line** (Layer 2 for dense framework JIT). Keeps the original code at its original address and executes it one instruction at a time out-of-line (XOL), *simulating* PC-relative insns and fixing mid-step faults — so ART's PC→method map / stack unwind / GC / deopt all work unchanged (region-clone can't: literal pools → SIGILL, clone return addresses → SIGSEGV). It is "traceless uprobes": uprobes' XOL machinery triggered by our **UXN execute-fault** instead of a code-writing `BRK`. KPM side done — entry-override + call-original bypass, multi-target SSOL region (N overrides/page), snapshot-staleness guard + drift refresh, dead-process GC, auto-hidden xol scratch page; `hookdemo` all 5 surfaces CLEAN | ✅ verified (KPM side) |
-| **fs-hide** | **Kernel-side filesystem anti-detection** (`fshide`): `vfs_statfs` spoofs the gated process's overlay `f_type` back to the underlying fs (erofs), and `show_mountinfo` SKIPs the overlay/magisk mount lines — a **reader-gate** (tgid/uid hide-set), so only the target process is fooled while root's own `mount`/`df` stay honest. Kills Duck Detector's Mount / hidden-overlayfs "Danger" verdict without any userspace hook | ✅ M1+M2 verified |
+| **fs-hide** | **Kernel-side filesystem anti-detection** (`fshide`): `vfs_statfs` spoofs the gated process's overlay `f_type` back to the underlying fs (erofs), and `show_mountinfo` SKIPs the overlay/magisk mount lines — a **reader-gate** (tgid/uid hide-set), so only the target process is fooled while root's own `mount`/`df` stay honest. Kills a commercial root/mount-detector's Mount / hidden-overlayfs "Danger" verdict without any userspace hook | ✅ M1+M2 verified |
 | **Rev1/Rev2** | **Ghost main-path** (Rev1 ①): the `pghook` host clone itself now lives in VMA-less ghost memory. **Fork safety** (Rev2 ②): forked children are un-trapped so their own-`.text` execute faults never false-hit | ✅ verified |
 
 ## Requirements
@@ -164,7 +164,7 @@ adb shell /data/local/tmp/dbi_test      # expect: libdbi: ALL TESTS PASSED
 adb shell /data/local/tmp/ssol_test     # expect: [native cross-check enabled] / ssol: ALL TESTS PASSED
 ```
 
-Last run on Pixel 6 (`1C091FDF6008DN`): both exit 0, `ALL TESTS PASSED`.
+Last run on Pixel 6: both exit 0, `ALL TESTS PASSED`.
 
 ## End-to-end over the bridge (no superkey — verified)
 
@@ -189,11 +189,11 @@ adb shell /data/local/tmp/rgntool            # self-hook -> verify -> self-unhoo
 region clone), the page-neighbor `nbfn(n)=n*2` normal, `unhook: 1`. `kpmhooktool` (L1a, many overrides
 per page, mimics LSPlant) likewise self-hooks via `lib/kpmhook`.
 
-> Verified on Pixel 6 (`1C091FDF6008DN`, superkey removed): `shpte` already running in-kernel, bridge
-> armed; `bridgetool probe` returned all symbols; `rgntool` all-green + clean self-teardown. `dump` also
-> showed a **live production session** — 7 region clones (one 63 pages) on a real process, `.text`
-> untouched, `maps_hidden=388` (i.e. L1d/L1e live in-app traceless-hook of real libart). ⚠️ If `dump`
-> shows existing slots, the device is in production use — self-hooking tests (rgntool/kpmhooktool) are
+> Verified on Pixel 6 (superkey removed): `shpte` already running in-kernel, bridge
+> armed; `bridgetool probe` returned all symbols; `rgntool` all-green + clean self-teardown. `dump` may
+> also show other pre-existing sessions — some region clones (tens of pages) on a real process, `.text`
+> untouched, `maps_hidden` non-zero (i.e. L1d/L1e live in-app traceless-hook of real libart). ⚠️ If `dump`
+> shows existing slots, the device already has other test sessions — self-hooking tests (rgntool/kpmhooktool) are
 > safe (own slot + self-cleanup), but never run `pgdisarm`/`unbridge`/`unload` against live slots.
 
 ## Build & run (P1.5 demo)
@@ -269,8 +269,12 @@ TracerPid spoof). Anti-detection coverage: CRC + maps scan + ptrace/TracerPid + 
 ### Productization: LSPlant/Vector (and a future Frida-Gum stealth backend)
 The intended end-product is a modified **Vector** (JingMatrix's Zygisk ART-hook framework; cloned at
 `../Vector`) whose hook backend is our KPM. Findings:
-- Vector's `inline_hooker(target, hooker) → backup` maps **exactly** onto `hwhookto` (HWBP, since
-  real libart funcs share pages) + ghost backup; `inline_unhooker` → `hwunhook` + `ghostfree`.
+- ~~Vector's `inline_hooker(target, hooker) → backup` maps **exactly** onto `hwhookto` (HWBP)~~ —
+  this was the INITIAL P5 finding but is **superseded**: the shipped backend is the multi-page RV-2
+  **region clone (`pghook`/`pghookg`)** + **SSOL**, not HWBP. `hwhookto`/`hookto` (HWBP + single-slot
+  ghost) were never adopted for production (HWBP is entry-only with ≤~4 hw slots) and now live behind
+  the `SHPTE_POC_LADDER` compile switch (off by default). `lib/kpmhook.c` only ever sends
+  `pghook`/`pghookg` (+ `ssolhook`) — audited.
 - JingMatrix's LSPlant `InitInfo` has **no `mem_map`** → the article's `alloc_ghost` is unnecessary.
 - **Layer 1** (native libart hooks at LSPlant init): swap Vector's `inline_hooker`/`unhooker` to call
   our KPM via the syscall bridge. LSPlant installs **~20 simultaneous** libart inline hooks (more than
@@ -384,7 +388,7 @@ selfstep/dump    自测/诊断
 | **P5** | 产品化原语：可复用 `lib/dbi`、HWBP/UXN `inline_hooker`（`hwhookto`/`hookto` + ghost backup）、无 superkey syscall bridge、TracerPid 伪造 | ✅ |
 | **L1a–L1e** | LSPlant `inline_hooker` 载体：`pghook` 扩到每页多 override（barrier-safe sentinel 表）× 多页；`lib/kpmhook` 把 LSPlant `InitInfo` 回调映射到桥；**RV-2 干净边界多页 region 克隆**（页跨越函数整体在克隆里、正常 `RET`）；把 `MAX_RGN` 提到 64 后，LSPosed 管理器 **6 个** libart inline hook 全部走 region 克隆（零 Dobby 回退），**真机应用内实测无痕 hook 真实 libart**、`.text` 不动 | ✅ 真机实测 |
 | **SSOL** | **单步出线（single-step out of line）Java 无痕 hook**：把原始代码留在原地、逐指令 XOL 执行——PC 始终在原始地址，ART 的 PC→method 映射/栈回溯/GC/deopt 全部照常工作，解决稠密框架 JIT 上 region 克隆的「代码/数据交织」「克隆返回地址」两大结构性脆弱点。相当于「用 UXN 陷阱触发的 uprobes」。KPM 侧核心 + 多目标 region + 抗漂移 guard + 死进程 GC 已实现，hookdemo 五个面全 CLEAN | ✅ 真机实测（KPM 侧） |
-| **fs-hide** | 内核态文件系统反检测：`vfs_statfs` 把 gated 进程看到的 overlay `f_type` 伪装成底层 fs、`show_mountinfo` SKIP 掉 overlay/magisk 挂载行（reader-gate，只骗要骗的进程）。触发场景：Duck Detector 把 Mount/hidden-overlayfs 判 Danger | ✅ M1+M2 |
+| **fs-hide** | 内核态文件系统反检测：`vfs_statfs` 把 gated 进程看到的 overlay `f_type` 伪装成底层 fs、`show_mountinfo` SKIP 掉 overlay/magisk 挂载行（reader-gate，只骗要骗的进程）。触发场景：某商业 root/mount 检测器把 Mount/hidden-overlayfs 判 Danger | ✅ M1+M2 |
 
 ## 目录结构
 
@@ -480,7 +484,7 @@ adb shell /data/local/tmp/dbi_test     # 期望: libdbi: ALL TESTS PASSED
 adb shell /data/local/tmp/ssol_test    # 期望: [native cross-check enabled] / ssol: ALL TESTS PASSED
 ```
 
-> 最近一次在 Pixel 6（`1C091FDF6008DN`）实测：两者 exit 0、`ALL TESTS PASSED`。
+> 最近一次在 Pixel 6 实测：两者 exit 0、`ALL TESTS PASSED`。
 
 ## 部署与运行（真机）
 
@@ -520,7 +524,7 @@ adb shell /data/local/tmp/rgntool            # 自 hook -> 验证 -> 自 unhook�
 
 `rgntool` 期望：`[R span] n=k -> backup=1100+k`（跨页函数**整体**从 region 克隆跑通）、页邻居 `nbfn(n)=n*2` 正常、`unhook: 1`。同理 `kpmhooktool`（L1a 每页多 override，仿 LSPlant 调用模式）也经 `lib/kpmhook` 自 hook。
 
-> 实测（Pixel 6 `1C091FDF6008DN`，superkey 已移除）：`shpte` 已在内核运行、桥已开；`bridgetool probe` 回全部符号；`rgntool` 全项 OK、自清理干净。`dump` 还显示该机正跑着生产级会话——7 个 region（含 63 页的）挂在一个真实进程上、`.text` 不动、`maps_hidden=388`（即 L1d/L1e 真机应用内无痕 hook）。⚠️ 若 `dump` 显示已有存量 slot，说明设备在生产使用中——自 hook 类测试（rgntool/kpmhooktool）用自己的 slot 且自清理是安全的，但别对存量 slot 跑 `pgdisarm`/`unbridge`/`unload`。
+> 实测（Pixel 6，superkey 已移除）：`shpte` 已在内核运行、桥已开；`bridgetool probe` 回全部符号；`rgntool` 全项 OK、自清理干净。`dump` 还可能显示该机上已有其它会话——若干 region（含数十页的）挂在真实进程上、`.text` 不动、`maps_hidden` 非零（即 L1d/L1e 真机应用内无痕 hook）。⚠️ 若 `dump` 显示已有存量 slot，说明设备上已有其它测试会话——自 hook 类测试（rgntool/kpmhooktool）用自己的 slot 且自清理是安全的，但别对存量 slot 跑 `pgdisarm`/`unbridge`/`unload`。
 
 ## 版本耦合（必须与设备一致）
 
@@ -540,7 +544,7 @@ adb shell /data/local/tmp/rgntool            # 自 hook -> 验证 -> 自 unhook�
 
 目标成品是一个改造版 **Vector**（`../Vector`），其 hook 后端换成本仓 KPM。要点：
 
-- Vector 的 `inline_hooker(target, hooker) → backup` **精确对应** `hwhookto`（HWBP，因真实 libart 函数共享页）+ ghost backup；`inline_unhooker` → `hwunhook` + `ghostfree`。
+- ~~Vector 的 `inline_hooker → backup` **精确对应** `hwhookto`（HWBP）~~ —— 这是 P5 初期结论，**已被取代**：生产后端是多页 RV-2 **region 克隆（`pghook`/`pghookg`）+ SSOL**，**不是 HWBP**。`hwhookto`/`hookto`（HWBP + 单槽 ghost）从未在生产采用（HWBP 仅入口、hw 槽 ≤~4），现已移到 `SHPTE_POC_LADDER` 编译开关之后（默认关）。`lib/kpmhook.c` 只发 `pghook`/`pghookg`（+ `ssolhook`）—— 已审计。
 - **Layer 1**（LSPlant init 时的 native libart hook）：把 Vector 的 `inline_hooker`/`unhooker` 换成经 syscall bridge 调 KPM。载体是扩到每页多 override、跨多页的 **UXN `pghook`**（RV-2 region 克隆）。L1a–L1e 已完成并**真机应用内实测**：LSPosed 管理器 6 个 libart inline hook 全走 region 克隆、零 Dobby 回退、`.text` 不动。
 - **Layer 2**（Java 方法）：**SSOL** 是稠密框架 JIT 的正确+可扩展路径（region 克隆保留给 L1 native 与简单 app 的 Java hook）。
 - **Frida-Gum**（可选、更大）：用 `hwhookto` 重做 Gum 的 `Interceptor`、用 ghost 内存重做 Stalker 代码缓存；同一 KPM、不同前端。
