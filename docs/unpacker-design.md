@@ -96,7 +96,7 @@ Earlier framing ("DBI needs to scale to thousands of methods") is wrong after re
 - The stealth hook pins **1 libart function (the choke point), not thousands of app methods.**
   That is the L1 case (equivalent to the existing ~20 libart traps) and runs the
   **DBI-on-libart** path (`oat_census`-validated) — **NOT** the M-C **DBI-on-JIT** path.
-- The **2026-06-13 SIGILL (DBI mis-compiles dense JIT code) is OFF this critical path** — the
+- The **DBI-mis-compiles-dense-JIT-code SIGILL failure mode is OFF this critical path** — the
   unpacker does not per-method KPM-trap app methods; it compiles/invokes them to trigger restore,
   it does not clone their JIT bodies.
 - **The only real DBI cost is one item:** make lib/dbi correctly clone *the chosen choke-point

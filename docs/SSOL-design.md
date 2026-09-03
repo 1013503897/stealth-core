@@ -170,7 +170,7 @@ fixup.)
   is NO clone: `backup` is just **M's original entry, but entered in a mode that SKIPS the entry
   override** (so it doesn't re-trap into the hook). Implement as a tiny per-thread "bypass next entry
   hit" flag, or a second alias VA. M's body then runs entirely via SSOL → original addresses on the
-  stack → ART-intact. (This is the path that the clone got *wrong* on katana.)
+  stack → ART-intact. (This is the path that the clone got *wrong* on device.)
 - ArtMethod stays 100% pristine (we never touched it — same as the clone path). Surfaces 1/3/4 clean
   by construction; 2 (maps/smaps) — SSOL's only anon-exec footprint is the tiny XOL scratch pages
   (a few pages), hidden by the existing `kpm_hide_region` / anon-exec maps-hide. 5 (ptrace) unaffected.
@@ -237,10 +237,10 @@ Every in-page instruction = 1 fault (simulate) or 1 fault + 1 step-exception (XO
 4. **P3 — call-original bypass** (§7) + LSPlant integration: `traceless_inline_hooker` registers an
    SSOL region instead of a DBI clone.
 5. **P4 — device bring-up on a REAL app** with the detector probe; expect all 5 surfaces CLEAN and
-   STABLE on katana (the clone's failure case). Then hybrid-clone for hot simple methods (P5,
+   STABLE on device (the clone's failure case). Then hybrid-clone for hot simple methods (P5,
    optional).
 
-Validate each phase with `[[kpm-device-test-workflow]]` + the probe; commit per phase.
+Validate each phase on device with the detection probe; commit per phase.
 
 ---
 
