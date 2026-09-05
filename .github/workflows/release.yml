@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup NDK r26b (26.1.10909125)
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26b
+          local-cache: false
+
+      - name: Build shpte.kpm (product build, -O0 locked)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: ./kpm/build.ps1 -Src shpte.c
+
+      - name: Build shctl (android arm64)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: ./cli/build_shctl.ps1
+
+      - name: Stage artifacts
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item kpm/shpte.kpm dist/
+          Copy-Item cli/shctl      dist/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: stealth-poc-${{ github.ref_name }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish release
+        if: ${{ github.ref_type == 'tag' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: stealth-poc ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            kpm/shpte.kpm
+            cli/shctl

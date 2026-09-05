@@ -10,10 +10,11 @@
 # Device-side scratch
 *.out
 
-# External dependency: KernelPatch is checked out separately at tag 0.13.1
-# (see README "Requirements"). Not vendored into this repo to avoid an
-# embedded git repo; re-clone github.com/bmax121/KernelPatch at 0.13.1.
-/vendor/
+# External dependency: KernelPatch is a git submodule at vendor/KernelPatch,
+# pinned to upstream tag 0.13.2. After cloning: git submodule update --init --recursive.
+# Ignore any other vendor/ scratch but keep the submodule tracked.
+/vendor/*
+!/vendor/KernelPatch/
 
 # device-deploy artifacts (contain the APatch superkey -- never commit)
 _kpmboot/

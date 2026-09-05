@@ -3,11 +3,16 @@
 # resolves their relocations at load time. We target aarch64-none-elf (bare metal)
 # and link with -r, mirroring the upstream gcc-based Makefile but using clang.
 #
-# Usage: build.ps1 [-Src shpoc.c]   (default: shpoc.c)
-param([string]$Src = "shpoc.c")
+# Usage: build.ps1 [-Src shpoc.c] [-PocLadder]   (default: shpoc.c, product build)
+#   -PocLadder  define SHPTE_POC_LADDER to re-include the P2..P5 regression ladder
+#               (arm/redirect/redirectmap/pagehook/hookto/hwhookto/ghost*) for the
+#               tools/run_*.sh harnesses. The DEFAULT (product) build OMITS the ladder
+#               -- the Vector glue only uses pghook/pghookg + ssolhook.
+param([string]$Src = "shpoc.c", [switch]$PocLadder)
 $ErrorActionPreference = "Stop"
 
-$ndk   = "C:\Users\Administrator\AppData\Local\Android\Sdk\ndk\26.1.10909125"
+# NDK: honour ANDROID_NDK_HOME (set by CI) and fall back to the local dev default.
+$ndk   = if ($env:ANDROID_NDK_HOME) { $env:ANDROID_NDK_HOME } else { "C:\Users\Administrator\AppData\Local\Android\Sdk\ndk\26.1.10909125" }
 $bin   = Join-Path $ndk "toolchains\llvm\prebuilt\windows-x86_64\bin"
 $clang = Join-Path $bin "clang.exe"
 $readelf = Join-Path $bin "llvm-readelf.exe"
@@ -34,6 +39,7 @@ $cflags = @(
     # -O0 is verified-good; do not raise without re-testing on device.
     "-O0", "-Wall", "-Wno-unused-parameter", "-Wno-unused-function"
 )
+if ($PocLadder) { $cflags += "-DSHPTE_POC_LADDER" }
 
 $stem = [System.IO.Path]::GetFileNameWithoutExtension($Src)
 $src = Join-Path $here $Src

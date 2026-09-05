@@ -1,0 +1,3 @@
+[submodule "vendor/KernelPatch"]
+	path = vendor/KernelPatch
+	url = https://github.com/bmax121/KernelPatch.git

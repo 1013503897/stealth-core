@@ -1,7 +1,8 @@
 # Build the shctl KPM-control CLI as an Android arm64 executable using NDK clang.
 $ErrorActionPreference = "Stop"
 
-$ndk   = "C:\Users\Administrator\AppData\Local\Android\Sdk\ndk\26.1.10909125"
+# NDK: honour ANDROID_NDK_HOME (set by CI) and fall back to the local dev default.
+$ndk   = if ($env:ANDROID_NDK_HOME) { $env:ANDROID_NDK_HOME } else { "C:\Users\Administrator\AppData\Local\Android\Sdk\ndk\26.1.10909125" }
 $bin   = Join-Path $ndk "toolchains\llvm\prebuilt\windows-x86_64\bin"
 $clang = Join-Path $bin "clang.exe"
 
