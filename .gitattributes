@@ -1,0 +1,7 @@
+# Normalize line endings so cross-repo diffs against the Vector vendored copy
+# (hook-lab/Vector/native/src/kpm/*) are not drowned in CRLF/LF noise. The C
+# sources are stored LF in-index in both repos; this keeps the working tree LF too.
+# After adding this file, run `git add --renormalize .` to apply it to already-tracked files.
+*.c   text eol=lf
+*.h   text eol=lf
+*.md  text eol=lf

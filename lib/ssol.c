@@ -2,38 +2,23 @@
 /* libssol: AArch64 SSOL simulator. See ssol.h / docs/SSOL-design.md §3a. */
 
 #include "ssol.h"
+#include "aarch64_decode.h" /* shared classifiers (same source as dbi.c / shpte.c) */
 
-/* ---- ported from dbi.c (verbatim): sext + PC-relative classifiers + btarget.
- * dbi.c emits a relocated instruction; here we reuse the SAME decode to compute
- * the architectural effect. dbi.c itself is left unchanged. ---- */
-static int64_t sext(int64_t v, int bits) { int s = 64 - bits; return (v << s) >> s; }
-
-static int is_adr(uint32_t i) { return (i & 0x9F000000u) == 0x10000000u; }
-static int is_adrp(uint32_t i) { return (i & 0x9F000000u) == 0x90000000u; }
-static int is_b(uint32_t i) { return (i & 0xFC000000u) == 0x14000000u; }
-static int is_bl(uint32_t i) { return (i & 0xFC000000u) == 0x94000000u; }
-static int is_bcond(uint32_t i) { return (i & 0xFF000010u) == 0x54000000u; }
-static int is_cbz(uint32_t i) { return (i & 0x7E000000u) == 0x34000000u; }   /* CBZ / CBNZ */
-static int is_tbz(uint32_t i) { return (i & 0x7E000000u) == 0x36000000u; }   /* TBZ / TBNZ */
-/* LDR/LDRSW (literal), integer or SIMD, opc 00/01/10 (exclude PRFM opc=11) */
-static int is_ldrlit(uint32_t i) { return (i & 0x3B000000u) == 0x18000000u && ((i >> 30) & 3) != 3; }
-
-/* absolute branch target for any immediate branch-ish insn at pc (ported) */
-static uint64_t btarget(uint32_t insn, uint64_t pc)
-{
-    if (is_b(insn) || is_bl(insn)) return pc + ((uint64_t)sext(insn & 0x03ffffff, 26) << 2);
-    if (is_bcond(insn) || is_cbz(insn)) return pc + ((uint64_t)sext((insn >> 5) & 0x7ffff, 19) << 2);
-    if (is_tbz(insn)) return pc + ((uint64_t)sext((insn >> 5) & 0x3fff, 14) << 2);
-    return 0;
-}
-
-/* ---- new for SSOL (dbi.c emits these verbatim; SSOL must simulate them) ---- */
-
-/* Unconditional branch (register): plain BR/BLR/RET only. PAC variants
- * (BRAA/BLRAA/RETAA...) set extra bits and DON'T match -> fall through to XOL. */
-static int is_br(uint32_t i) { return (i & 0xFFFFFC1Fu) == 0xD61F0000u; }  /* BR  Xn */
-static int is_blr(uint32_t i) { return (i & 0xFFFFFC1Fu) == 0xD63F0000u; } /* BLR Xn */
-static int is_ret(uint32_t i) { return (i & 0xFFFFFC1Fu) == 0xD65F0000u; } /* RET {Xn=30} */
+/* Use the consolidated classifiers under this file's historical names. Same classify +
+ * immediate math as dbi.c; here we compute the architectural effect instead of emitting. */
+#define sext a64_sext
+#define is_adr a64_is_adr
+#define is_adrp a64_is_adrp
+#define is_b a64_is_b
+#define is_bl a64_is_bl
+#define is_bcond a64_is_bcond
+#define is_cbz a64_is_cbz
+#define is_tbz a64_is_tbz
+#define is_ldrlit a64_is_ldrlit
+#define is_br a64_is_br
+#define is_blr a64_is_blr
+#define is_ret a64_is_ret
+#define btarget a64_btarget
 
 /* ARM ConditionHolds. NZCV = pstate bits 31/30/29/28. cond[3:1] selects the
  * base test; cond[0] inverts it (except 0b1111 = NV, which is "always" in A64). */

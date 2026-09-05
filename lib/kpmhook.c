@@ -518,6 +518,15 @@ void *kpm_inline_hooker(void *target, void *hooker)
         /* surface the KPM's exact reject reply to logcat (e.g. "error: ghost inject failed
          * rc=-6") -- the one diagnostic worth having when a device test can't be re-run cheaply */
         __android_log_print(ANDROID_LOG_WARN, KPM_LOG_TAG, "hook reject: cmd=[%s] reply=[%s]", cmd, out);
+        /* If this region was FRESHLY made for this hook (no live overrides yet), the KPM never
+         * armed it -- release the clone mmap + offmap and free the registry slot so a rejected hook
+         * doesn't leak a region. A REUSED region (nov>0) still backs other live hooks -> keep it.
+         * `clone` is an mmap in both legacy and ghost mode, so munmap is always correct. */
+        if (e->nov == 0) {
+            munmap(e->clone, e->clone_sz);
+            free(e->offmap);
+            e->used = 0;
+        }
         backup = 0;
         goto out;
     }

@@ -45,6 +45,7 @@
 #include <asm/ptrace.h>
 #include <syscall.h>
 #include <stdint.h>
+#include "../lib/aarch64_decode.h" /* shared AArch64 classifiers (freestanding-safe, stdint-only) */
 
 KPM_NAME("shpte");
 KPM_VERSION("0.6.6");
@@ -74,7 +75,12 @@ static volatile int g_vma_mm_calibrated = 0;
 #define GHOST_MAGIC 0xDEADBEEFCAFEF00DULL
 #define PFN_MASK 0x0000FFFFFFFFF000ULL /* PTE output-address bits [47:12] */
 
-/* ---- minimal perf / hw_breakpoint ABI (HWBP-redirect inline_hooker) ---- */
+/* ---- minimal perf / hw_breakpoint ABI (HWBP-redirect inline_hooker) ----
+ * POC LADDER: the HWBP inline_hooker (hwhookto) is DEAD in production -- the Vector
+ * kpmhook glue only ever sends pghook/pghookg (region clone), never hwhookto (audited:
+ * lib/kpmhook.c has no hwhookto path). Kept behind SHPTE_POC_LADDER for the tools/
+ * regression harnesses (run_hwhook_test.sh). Default product build omits it. */
+#ifdef SHPTE_POC_LADDER
 #define PERF_TYPE_BREAKPOINT 5u
 #define HW_BREAKPOINT_X 4u
 #define HW_BREAKPOINT_LEN_4 4u
@@ -105,6 +111,7 @@ struct kp_perf_event_attr {
     uint32_t __res3;
     uint64_t sig_data;
 };
+#endif /* SHPTE_POC_LADDER */
 struct kp_callback_head {
     struct kp_callback_head *next;
     void (*func)(struct kp_callback_head *);
@@ -319,12 +326,20 @@ static volatile int g_ghost_pid = 0;
  * cheap. A real sysinfo(arg0!=magic) passes straight through. */
 #define BRIDGE_MAGIC 0x5348505442524447ULL /* "SHPTBRDG" */
 #define BRIDGE_NR 179                       /* __NR_sysinfo on arm64 (asm-generic) */
+/* Bridge protocol version for the `version` handshake (see do_version + docs/bridge-protocol.md).
+ * Bump when the wire contract of any bridge command changes incompatibly. The Vector-side
+ * kpmhook client reads this at init and asserts (proto match + its compile-time capacity
+ * constants <= the KPM's) before arming any hook. Pure read-only query, no side effects. */
+#define BRIDGE_PROTO_VER 1
 static volatile int g_bridge_hooked = 0;
+/* task_work_add is SHARED (fork-follow tw_forkfix + HWBP defer) -- always compiled. */
+static int (*fn_task_work_add)(void *, void *, int) = 0;
 /* HWBP-redirect inline_hooker: per-instruction trap, so it doesn't disturb other
- * functions sharing the target's page (real libart funcs aren't page-isolated) */
+ * functions sharing the target's page (real libart funcs aren't page-isolated).
+ * POC LADDER only (dead in production -- see the perf-ABI note above). */
+#ifdef SHPTE_POC_LADDER
 static void *(*fn_reg_hwbp)(struct kp_perf_event_attr *, void *, void *, void *) = 0;
 static void (*fn_unreg_hwbp)(void *) = 0;
-static int (*fn_task_work_add)(void *, void *, int) = 0;
 static struct kp_perf_event_attr g_hwbp_attr;
 static void *g_hwbp = 0;
 static void *g_hwbp_task = 0;
@@ -332,6 +347,7 @@ static volatile uint64_t g_hwbp_replace = 0;
 static struct kp_callback_head g_hwbp_tw_install, g_hwbp_tw_remove;
 static volatile int g_hwbp_armed = 0;
 static volatile long g_hw_redirects = 0;
+#endif /* SHPTE_POC_LADDER */
 
 /* ---- tiny freestanding string/number helpers ---- */
 static char *apps(char *p, char *e, const char *s)
@@ -430,8 +446,88 @@ static int pte_cb(void *pte, unsigned long addr, void *data)
     return 0;
 }
 
+/* ---- balanced task-ref release (fixes the "leak a task ref per lookup" PoC) ----
+ * find_get_task_by_vpid elevates task->usage; put_task_struct (the balancing release) is
+ * a STATIC INLINE, not an exported symbol, so we replicate it: refcount_dec_and_test on
+ * task->usage, then __put_task_struct (which IS resolvable) if it hit zero.
+ *
+ * The one unknown is task->usage's byte offset (config-dependent -- unsafe to hardcode in
+ * a freestanding module: a wrong offset would decrement a random task_struct field and
+ * crash). So we SELF-CALIBRATE it once, read-only: take 3 extra refs on `current` (alive
+ * + pinned) and find the SINGLE 4-byte word that rises by exactly +1 on each of the three
+ * gets, within a bounded, plausible refcount range. If it can't be uniquely identified the
+ * whole mechanism stays DISABLED and put_task() is a no-op -- i.e. we fall back to the old
+ * (leak-but-safe) behavior. The only write is a single balanced atomic sub at the VALIDATED
+ * offset. Sleepable (supercall/bridge) context only. */
+static void (*fn___put_task_struct)(void *task) = 0;
+static volatile int g_usage_off = -1;      /* task_struct->usage byte offset, -1 = unknown/disabled */
+static volatile int g_usage_calibrated = 0;
+
+/* fetch-and-sub on a 32-bit atomic (refcount_t wraps atomic_t). Inline LL/SC so the
+ * freestanding link never needs a libatomic call. Returns the OLD value. */
+static inline int kp_atomic_fetch_sub(volatile int *p, int v)
+{
+    int old, nv, st;
+    asm volatile("1: ldaxr %w0, [%3]\n"
+                 "   sub   %w1, %w0, %w4\n"
+                 "   stlxr %w2, %w1, [%3]\n"
+                 "   cbnz  %w2, 1b\n"
+                 : "=&r"(old), "=&r"(nv), "=&r"(st)
+                 : "r"(p), "r"(v)
+                 : "memory");
+    return old;
+}
+
+static void calibrate_usage_off(void)
+{
+    if (g_usage_calibrated) return;
+    g_usage_calibrated = 1; /* attempt exactly once, whatever the outcome */
+    if (!fn_find_get_task_by_vpid || !fn___put_task_struct || !fn_task_pid_nr_ns) return;
+    int pid = fn_task_pid_nr_ns((void *)get_current(), PIDTYPE_PID, 0);
+    if (pid <= 0) return;
+    void *t = fn_find_get_task_by_vpid(pid); /* +1; t == current (alive, pinned by us) */
+    if (is_err_or_null(t)) return;
+    enum { CAL_LO = 8, CAL_HI = 0x300, CAL_N = (CAL_HI - CAL_LO) / 4 };
+    uint32_t v0[CAL_N];
+    for (int k = 0; k < CAL_N; k++) v0[k] = *(volatile uint32_t *)((char *)t + CAL_LO + k * 4);
+    void *t2 = fn_find_get_task_by_vpid(pid); /* +1 */
+    char cand[CAL_N];
+    for (int k = 0; k < CAL_N; k++)
+        cand[k] = (*(volatile uint32_t *)((char *)t + CAL_LO + k * 4) == v0[k] + 1);
+    void *t3 = fn_find_get_task_by_vpid(pid); /* +1 */
+    (void)t2;
+    (void)t3;
+    int found = -1, nf = 0;
+    for (int k = 0; k < CAL_N; k++)
+        if (cand[k] && *(volatile uint32_t *)((char *)t + CAL_LO + k * 4) == v0[k] + 2) {
+            found = CAL_LO + k * 4;
+            nf++;
+        }
+    if (nf == 1) {
+        uint32_t base = v0[(found - CAL_LO) / 4];
+        if (base >= 2 && base < 0x40000000u) { /* plausible live refcount */
+            g_usage_off = found;
+            kp_atomic_fetch_sub((volatile int *)((char *)t + found), 3); /* release t,t2,t3 */
+            return;
+        }
+    }
+    /* ambiguous/implausible -> disabled; the 3 calibration refs leak once (negligible) */
+}
+
+/* put_task_struct equivalent: balances one find_get_task_by_vpid. No-op (safe leak) until
+ * the usage offset is calibrated; never double-frees (only calls __put_task_struct when the
+ * refcount transitions to 0, exactly like the kernel's put_task_struct). */
+static inline void put_task(void *task)
+{
+    if (is_err_or_null(task)) return;
+    if (!g_usage_calibrated) calibrate_usage_off();
+    if (g_usage_off < 0 || !fn___put_task_struct) return; /* fail-safe: keep the old leak */
+    int old = kp_atomic_fetch_sub((volatile int *)((char *)task + g_usage_off), 1);
+    if (old == 1) fn___put_task_struct(task);
+}
+
 /* resolve the leaf PTE for VA `base` in process `pid`; returns ptep/val via out.
- * Leaks the task ref (PoC); releases the mm ref. */
+ * Balances the task ref (put_task) and releases the mm ref. */
 static int resolve_pte(uint64_t pid, uint64_t base, struct pte_out *o)
 {
     o->ptep = 0;
@@ -440,9 +536,13 @@ static int resolve_pte(uint64_t pid, uint64_t base, struct pte_out *o)
     void *task = fn_find_get_task_by_vpid((int)pid);
     if (is_err_or_null(task)) return -1;
     void *mm = fn_get_task_mm(task);
-    if (is_err_or_null(mm)) return -2;
+    if (is_err_or_null(mm)) {
+        put_task(task);
+        return -2;
+    }
     int rc = fn_apply_existing(mm, base, 0x1000, (void *)pte_cb, o);
     fn_mmput(mm);
+    put_task(task);
     if (o->n == 0) return -3;
     (void)rc;
     return 0;
@@ -463,51 +563,47 @@ static int resolve_pte(uint64_t pid, uint64_t base, struct pte_out *o)
 enum ssol_action { SSOL_SIMULATED = 0, SSOL_XOL = 1 };
 
 /* LDR-literal pool reads come from the trapped region's kernel-side instruction
- * snapshot (set by before_pf right before each ssol_simulate call) -- so the fault
- * path never does a PAN-unsafe user deref. Out-of-region literals return 0 (P1 keeps
- * literals in-region; P2 adds a PAN-safe user read for cross-region pools). NOTE:
- * these globals are single-fault-at-a-time correct; concurrent faults on different
- * CPUs would race them -- fine for the P1 single-thread self-test, made per-fault
- * safe in P2. */
-static const uint32_t *volatile g_rd_insns = 0;
-static volatile uint64_t g_rd_base = 0;
-static volatile int g_rd_n = 0;
-static uint32_t ssol_rd32(uintptr_t a)
+ * snapshot -- so the fault path never does a PAN-unsafe user deref. Out-of-region
+ * literals return 0 (P1 keeps literals in-region; P2 adds a PAN-safe user read for
+ * cross-region pools). The read context is a small struct built on the FAULTING
+ * THREAD'S STACK and passed into ssol_simulate/ssol_rd*: concurrent faults on
+ * different CPUs each have their own copy, so there is no cross-CPU race (the old
+ * globals g_rd_insns/g_rd_base/g_rd_n could be stomped by a second CPU mid-simulate). */
+struct ssol_rdctx {
+    const uint32_t *insns; /* region snapshot base */
+    uint64_t base;         /* region base VA (snapshot[0] == *base) */
+    int n;                 /* words in the snapshot (npages*1024) */
+};
+static uint32_t ssol_rd32(const struct ssol_rdctx *rc, uintptr_t a)
 {
-    if (g_rd_insns && a >= g_rd_base && a + 4 <= g_rd_base + (uint64_t)g_rd_n * 4)
-        return g_rd_insns[(a - g_rd_base) / 4];
+    if (rc->insns && a >= rc->base && a + 4 <= rc->base + (uint64_t)rc->n * 4)
+        return rc->insns[(a - rc->base) / 4];
     return 0;
 }
-static uint64_t ssol_rd64(uintptr_t a)
+static uint64_t ssol_rd64(const struct ssol_rdctx *rc, uintptr_t a)
 {
-    if (g_rd_insns && a >= g_rd_base && a + 8 <= g_rd_base + (uint64_t)g_rd_n * 4) {
-        uint64_t i = (a - g_rd_base) / 4;
-        return (uint64_t)g_rd_insns[i] | ((uint64_t)g_rd_insns[i + 1] << 32);
+    if (rc->insns && a >= rc->base && a + 8 <= rc->base + (uint64_t)rc->n * 4) {
+        uint64_t i = (a - rc->base) / 4;
+        return (uint64_t)rc->insns[i] | ((uint64_t)rc->insns[i + 1] << 32);
     }
     return 0;
 }
 
-static int64_t ssol_sext(int64_t v, int bits) { int s = 64 - bits; return (v << s) >> s; }
-
-static int ssol_is_adr(uint32_t i) { return (i & 0x9F000000u) == 0x10000000u; }
-static int ssol_is_adrp(uint32_t i) { return (i & 0x9F000000u) == 0x90000000u; }
-static int ssol_is_b(uint32_t i) { return (i & 0xFC000000u) == 0x14000000u; }
-static int ssol_is_bl(uint32_t i) { return (i & 0xFC000000u) == 0x94000000u; }
-static int ssol_is_bcond(uint32_t i) { return (i & 0xFF000010u) == 0x54000000u; }
-static int ssol_is_cbz(uint32_t i) { return (i & 0x7E000000u) == 0x34000000u; }   /* CBZ/CBNZ */
-static int ssol_is_tbz(uint32_t i) { return (i & 0x7E000000u) == 0x36000000u; }   /* TBZ/TBNZ */
-static int ssol_is_ldrlit(uint32_t i) { return (i & 0x3B000000u) == 0x18000000u && ((i >> 30) & 3) != 3; }
-static int ssol_is_br(uint32_t i) { return (i & 0xFFFFFC1Fu) == 0xD61F0000u; }  /* BR  Xn */
-static int ssol_is_blr(uint32_t i) { return (i & 0xFFFFFC1Fu) == 0xD63F0000u; } /* BLR Xn */
-static int ssol_is_ret(uint32_t i) { return (i & 0xFFFFFC1Fu) == 0xD65F0000u; } /* RET {Xn=30} */
-
-static uint64_t ssol_btarget(uint32_t insn, uint64_t pc)
-{
-    if (ssol_is_b(insn) || ssol_is_bl(insn)) return pc + ((uint64_t)ssol_sext(insn & 0x03ffffff, 26) << 2);
-    if (ssol_is_bcond(insn) || ssol_is_cbz(insn)) return pc + ((uint64_t)ssol_sext((insn >> 5) & 0x7ffff, 19) << 2);
-    if (ssol_is_tbz(insn)) return pc + ((uint64_t)ssol_sext((insn >> 5) & 0x3fff, 14) << 2);
-    return 0;
-}
+/* The classifiers are now shared via lib/aarch64_decode.h (was a drifting 3rd copy).
+ * Keep the ssol_-prefixed names as thin aliases so the simulator body below is unchanged. */
+#define ssol_sext a64_sext
+#define ssol_is_adr a64_is_adr
+#define ssol_is_adrp a64_is_adrp
+#define ssol_is_b a64_is_b
+#define ssol_is_bl a64_is_bl
+#define ssol_is_bcond a64_is_bcond
+#define ssol_is_cbz a64_is_cbz
+#define ssol_is_tbz a64_is_tbz
+#define ssol_is_ldrlit a64_is_ldrlit
+#define ssol_is_br a64_is_br
+#define ssol_is_blr a64_is_blr
+#define ssol_is_ret a64_is_ret
+#define ssol_btarget a64_btarget
 
 /* ARM ConditionHolds. NZCV = pstate bits 31/30/29/28. */
 static int ssol_eval_cond(uint32_t cond, uint64_t pstate)
@@ -540,7 +636,7 @@ static void ssol_reg_write(struct pt_regs *regs, int idx, uint64_t val, int is64
     regs->regs[idx] = is64 ? val : (val & 0xffffffffu);
 }
 
-static enum ssol_action ssol_simulate(struct pt_regs *regs, uint32_t insn)
+static enum ssol_action ssol_simulate(struct pt_regs *regs, uint32_t insn, const struct ssol_rdctx *rc)
 {
     uint64_t pc = regs->pc;
 
@@ -596,9 +692,9 @@ static enum ssol_action ssol_simulate(struct pt_regs *regs, uint32_t insn)
         int64_t off = ssol_sext((int64_t)((insn >> 5) & 0x7ffff), 19) << 2;
         uintptr_t addr = (uintptr_t)(pc + (uint64_t)off);
         uint64_t val;
-        if (opc == 1) val = ssol_rd64(addr);
-        else if (opc == 2) val = (uint64_t)(int64_t)(int32_t)ssol_rd32(addr); /* LDRSW: sign-extend */
-        else val = (uint64_t)ssol_rd32(addr);                                  /* 32-bit: zero-extend */
+        if (opc == 1) val = ssol_rd64(rc, addr);
+        else if (opc == 2) val = (uint64_t)(int64_t)(int32_t)ssol_rd32(rc, addr); /* LDRSW: sign-extend */
+        else val = (uint64_t)ssol_rd32(rc, addr);                                  /* 32-bit: zero-extend */
         ssol_reg_write(regs, rt, val, opc != 0);
         regs->pc = pc + 4;
         return SSOL_SIMULATED;
@@ -751,24 +847,27 @@ static inline uint32_t ssol_read_live_u32(uint64_t uaddr, int *ok)
     *ok = 1;
     return v;
 }
-/* Re-read the region's live bytes into the snapshot (enforce-mode drift recovery). Only
- * pages whose cached leaf PTE is still valid are refreshed; a not-present page is left as
- * is and re-triggers later. One IRQ-off/PAN window per page bounds the masked interval to
- * a single 4K copy. */
-static void ssol_refresh_region(struct ssol_rgn *s)
+/* Re-read the drifted page's live bytes into the snapshot (enforce-mode drift recovery).
+ * Only the SINGLE page containing `far` is refreshed -- NOT the whole region: a large
+ * (up to MAX_RGN=64-page) region would otherwise copy up to 256 KiB inside the fault
+ * handler (64 IRQ-off/PAN windows), a latency spike on the hottest kernel path. The
+ * faulting word (and its typically co-located near literal pool) is what the current
+ * step needs; any other page re-reads itself when IT next drifts/faults. Skips a
+ * not-present page (left as is, re-triggers later). One 4K copy, one IRQ-off window. */
+static void ssol_refresh_region(struct ssol_rgn *s, uint64_t far)
 {
-    for (int j = 0; j < s->npages; j++) {
-        uint64_t pte = *(volatile uint64_t *)s->ptep[j];
-        if (!(pte & PTE_VALID)) continue;
-        uint64_t uva = s->page + (uint64_t)j * 0x1000UL;
-        uint32_t *dst = s->insns + (uint64_t)j * 1024;
-        unsigned long f = ssol_irq_save();
-        asm volatile(".inst 0xd500409f" ::: "memory");
-        for (int w = 0; w < 1024; w++)
-            dst[w] = ((const volatile uint32_t *)(uintptr_t)uva)[w];
-        asm volatile(".inst 0xd500419f" ::: "memory");
-        ssol_irq_restore(f);
-    }
+    int j = (int)((far - s->page) >> 12);
+    if (j < 0 || j >= s->npages || !s->ptep[j]) return;
+    uint64_t pte = *(volatile uint64_t *)s->ptep[j];
+    if (!(pte & PTE_VALID)) return;
+    uint64_t uva = s->page + (uint64_t)j * 0x1000UL;
+    uint32_t *dst = s->insns + (uint64_t)j * 1024;
+    unsigned long f = ssol_irq_save();
+    asm volatile(".inst 0xd500409f" ::: "memory");
+    for (int w = 0; w < 1024; w++)
+        dst[w] = ((const volatile uint32_t *)(uintptr_t)uva)[w];
+    asm volatile(".inst 0xd500419f" ::: "memory");
+    ssol_irq_restore(f);
 }
 
 static struct ssol_ctx *ctx_by_tid(int tid)
@@ -790,12 +889,13 @@ static struct ssol_ctx *ctx_free(void)
  * bypasses exactly the one whose original is being called. */
 static volatile int g_byp_tid[MAX_SSOL_CTX];        /* tid, 0 = empty slot */
 static volatile uint64_t g_byp_entry[MAX_SSOL_CTX]; /* entry VA armed to bypass once for that tid */
-static void byp_arm(int tid, uint64_t entry)
+static int byp_arm(int tid, uint64_t entry) /* 1 = armed, 0 = table full */
 {
     for (int i = 0; i < MAX_SSOL_CTX; i++)
-        if (g_byp_tid[i] == tid) { g_byp_entry[i] = entry; return; } /* re-arm existing */
+        if (g_byp_tid[i] == tid) { g_byp_entry[i] = entry; return 1; } /* re-arm existing */
     for (int i = 0; i < MAX_SSOL_CTX; i++)
-        if (g_byp_tid[i] == 0) { g_byp_entry[i] = entry; g_byp_tid[i] = tid; return; }
+        if (g_byp_tid[i] == 0) { g_byp_entry[i] = entry; g_byp_tid[i] = tid; return 1; }
+    return 0; /* bypass table full */
 }
 static int byp_take(int tid, uint64_t entry) /* 1 + consume if armed for (tid,entry) */
 {
@@ -986,7 +1086,12 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
             for (int k = 0; k < MAX_SSOL_OV; k++) {
                 if (s->ov_off[k] == OV_NONE || !s->ov_bk[k] || far != s->ov_bk[k]) continue;
                 uint64_t entry = s->page + s->ov_off[k];
-                byp_arm(tid, entry);
+                /* If the one-shot bypass table is full we must NOT redirect pc to the entry:
+                 * without an armed bypass the entry would re-fault, take the hook, and the
+                 * hook's call-original would hit bk_va again -> livelock. Instead don't claim
+                 * the fault -- let the real do_page_fault surface the unmapped-bk_va fault
+                 * (a VISIBLE failure) rather than spinning silently. */
+                if (!byp_arm(tid, entry)) break;
                 regs->pc = entry;
                 s->n_orig++;
                 fargs->skip_origin = 1;
@@ -1000,6 +1105,16 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
             if (!s->active) continue;
             if (fpage < s->page || fpage >= s->page + (uint64_t)s->npages * 0x1000UL) continue;
             if (s->pid && tgid != s->pid) continue; /* same VA in another process -> not ours */
+            /* ESR gate for the SSOL BODY (not the bk_va dispatch above, which intentionally
+             * fires on translation faults at its unmapped call-original VAs). Only an EL0
+             * instruction-abort + permission fault is our UXN execute trap. A data abort here,
+             * or a TRANSLATION fault on a reclaimed file-backed .text page (is_xtrap==false),
+             * is NOT ours: claiming it would fall through to the staleness guard's
+             * ssol_read_live_u32(far), which dereferences `far` with IRQs off + PAN cleared --
+             * and `far` is NOT mapped on a translation fault -> EL1 die_kernel_fault. Pass it
+             * through to the real do_page_fault (demand-page it) instead, mirroring the pghook
+             * clone path. Un-traps that page until re-armed (benign vs. the crash). */
+            if (!is_xtrap) { g_pf_passthru++; break; }
             uint64_t roff = far - s->page;
             uint32_t insn = s->insns[roff >> 2];
 
@@ -1019,7 +1134,7 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
                     g_ssol_drift++;
                     s->n_drift++;
                     if (g_ssol_guard == SSOL_GUARD_ENFORCE) {
-                        ssol_refresh_region(s);
+                        ssol_refresh_region(s, far);
                         insn = s->insns[roff >> 2];
                         g_ssol_refresh++;
                         s->n_refresh++;
@@ -1059,11 +1174,10 @@ static void before_pf(hook_fargs3_t *fargs, void *udata)
                 return;
             }
 
-            /* PC-relative -> simulate in place (literal pool read from the snapshot) */
-            g_rd_base = s->page;
-            g_rd_insns = s->insns;
-            g_rd_n = s->npages * 1024;
-            if (ssol_simulate(regs, insn) == SSOL_SIMULATED) {
+            /* PC-relative -> simulate in place (literal pool read from the snapshot).
+             * The read context is on THIS fault's stack -> per-CPU-safe (no shared globals). */
+            struct ssol_rdctx rc = { s->insns, s->page, s->npages * 1024 };
+            if (ssol_simulate(regs, insn, &rc) == SSOL_SIMULATED) {
                 s->n_sim++;
                 fargs->skip_origin = 1;
                 fargs->ret = 0;
@@ -1127,6 +1241,40 @@ static void maybe_unhook_pf(void)
         hook_unwrap(g_addr_pf, (void *)before_pf, 0);
         g_pf_hooked = 0;
     }
+}
+
+/* ---- seq_file layout guard (BTF-hardcoded offset防呆) ----
+ * SEQ_COUNT_OFF/SEQ_PAD_OFF and buf@+0 are hardcoded from THIS device's kernel BTF.
+ * Every seq-rewrite path below (maps/smaps hide, TracerPid spoof, mountinfo filter)
+ * WRITES seq_file->count / ->pad_until at those offsets; if a different kernel moved
+ * them, a blind rewind would corrupt an arbitrary process's /proc output. Unlike vm_mm
+ * (self-learned in vma_owned_by), seq_file has no in-object anchor to learn from, so we
+ * VALIDATE the assumed offsets ONCE against a live seq_file's structural invariants
+ * (buf a kernel ptr; from/count/pad_until <= size; size sane). On mismatch the rewrite
+ * paths no-op (hide silently disabled) rather than writing blind. Read-only; runs in the
+ * sleepable seq-show context. NOT full self-calibration (per the task) -- a fail-safe
+ * assertion that refuses to write when the layout looks wrong. */
+static volatile int g_seq_calibrated = 0;
+static volatile int g_seq_ok = 0;
+static int seq_layout_ok(void *m)
+{
+    if (g_seq_calibrated) return g_seq_ok;
+    int ok = 0;
+    if (m) {
+        void *buf = *(void *volatile *)((char *)m + 0);
+        uint64_t size = *(volatile uint64_t *)((char *)m + 8);
+        uint64_t from = *(volatile uint64_t *)((char *)m + 16);
+        uint64_t count = *(volatile uint64_t *)((char *)m + SEQ_COUNT_OFF);
+        uint64_t pad = *(volatile uint64_t *)((char *)m + SEQ_PAD_OFF);
+        /* seq_file: char *buf(+0); size_t size(+8), from(+16), count(+24), pad_until(+32).
+         * Invariants that only hold if the offsets are right for this kernel. */
+        if ((uint64_t)buf >= 0xffff000000000000ULL && size > 0 && size <= 0x400000ULL &&
+            from <= size && count <= size && (pad == 0 || pad <= size))
+            ok = 1;
+    }
+    g_seq_ok = ok;
+    g_seq_calibrated = 1;
+    return ok;
 }
 
 /* ---- P4.1: hide the clone VMA from /proc/pid/{maps,smaps} ----
@@ -1207,6 +1355,7 @@ static int maps_hide_vma(hook_fargs2_t *fargs)
     if (!hit) return 0;
 
     void *m = (void *)fargs->arg0;
+    if (!seq_layout_ok(m)) return 0; /* offsets look wrong for this kernel -> don't corrupt */
     *(volatile uint64_t *)((char *)m + SEQ_COUNT_OFF) = fargs->local.data0; /* rewind */
     *(volatile uint64_t *)((char *)m + SEQ_PAD_OFF) = 0;                    /* pad_until=0 */
     fargs->ret = SEQ_SKIP;
@@ -1274,6 +1423,7 @@ static void after_status(hook_fargs4_t *fargs, void *udata)
     (void)udata;
     if (!g_tracer_hooked) return;
     void *m = (void *)fargs->arg0;
+    if (!seq_layout_ok(m)) return; /* BTF offset guard: refuse to scan/write on a wrong layout */
     char *buf = *(char **)((char *)m + 0); /* seq_file.buf @ +0 */
     if (!buf) return;
     uint64_t start = fargs->local.data0;
@@ -1400,6 +1550,7 @@ static void after_mountinfo(hook_fargs2_t *fargs, void *udata)
     if (!g_mountinfo_hooked || !g_fshide_on || !g_fs_mountinfo_on) return;
     if (!fs_caller_gated()) return;                        /* reader-gate: hide-set apps only */
     void *m = (void *)fargs->arg0;
+    if (!seq_layout_ok(m)) return; /* BTF offset guard: refuse to write on a wrong layout */
     char *buf = *(char **)((char *)m + 0);                 /* seq_file.buf @ +0 */
     if (!buf) return;
     uint64_t start = fargs->local.data0;
@@ -1576,8 +1727,10 @@ static void resolve_syms(void)
     if (!fn_vmalloc) fn_vmalloc = (void *)kallsyms_lookup_name("vmalloc");
     if (!fn_vfree) fn_vfree = (void *)kallsyms_lookup_name("vfree");
     if (!fn_vmalloc_to_pfn) fn_vmalloc_to_pfn = (void *)kallsyms_lookup_name("vmalloc_to_pfn");
+#ifdef SHPTE_POC_LADDER
     if (!fn_reg_hwbp) fn_reg_hwbp = (void *)kallsyms_lookup_name("register_user_hw_breakpoint");
     if (!fn_unreg_hwbp) fn_unreg_hwbp = (void *)kallsyms_lookup_name("unregister_hw_breakpoint");
+#endif
     if (!fn_task_work_add) fn_task_work_add = (void *)kallsyms_lookup_name("task_work_add");
     if (!g_addr_wake) g_addr_wake = (void *)kallsyms_lookup_name("wake_up_new_task"); /* Rev2-(2) fork fix */
     if (!fn_register_user_step_hook)
@@ -1588,8 +1741,11 @@ static void resolve_syms(void)
         fn_user_enable_single_step = (void *)kallsyms_lookup_name("user_enable_single_step");
     if (!fn_user_disable_single_step)
         fn_user_disable_single_step = (void *)kallsyms_lookup_name("user_disable_single_step");
+    if (!fn___put_task_struct) /* balances find_get_task_by_vpid (see put_task) */
+        fn___put_task_struct = (void *)kallsyms_lookup_name("__put_task_struct");
 }
 
+#ifdef SHPTE_POC_LADDER
 /* HWBP overflow handler: reroute the trapped target entry to `replace`. No perf
  * calls here (would wedge); just set PC. Backup is a ghost clone, so calling the
  * original from `replace` does NOT re-trip this breakpoint (no livelock). */
@@ -1625,6 +1781,7 @@ static void tw_hwremove(struct kp_callback_head *h)
     }
     logki("shpte: hwbp removed redirects=%ld\n", g_hw_redirects);
 }
+#endif /* SHPTE_POC_LADDER */
 
 /* apply_to_page_range callback: write a hand-crafted PTE value (*data) */
 static int inject_cb(void *ptep, unsigned long addr, void *data)
@@ -1646,6 +1803,17 @@ static void sync_icache(void *addr, unsigned long size)
     asm volatile("dsb ish\nisb" ::: "memory");
 }
 
+/* ===================== POC LADDER (SHPTE_POC_LADDER) =====================
+ * The single-slot ghost demo (ghosttest/ghostredirect/ghostfree), the UXN/HWBP
+ * inline_hooker primitives (hookto/hwhookto), and the single-page redirect state
+ * machine (arm/redirect/redirectmap/pagehook/disarm) are the P2..P5 regression LADDER
+ * used by tools/run_*.sh. Production hooking goes exclusively through the multi-page
+ * REGION path (pghook/pghookg) + SSOL (ssolhook) -- the Vector kpmhook glue never sends
+ * any of these verbs (audited: lib/kpmhook.c). Gated OUT of the default product build;
+ * build.ps1 with -DSHPTE_POC_LADDER re-includes them for the harnesses. The small
+ * single-page/ghost state GLOBALS stay compiled (inert -- never armed in product) because
+ * the shared do_state(`dump`) + shpte_exit read them; only the verb CODE is gated. */
+#ifdef SHPTE_POC_LADDER
 /* P4.2: inject a kernel page at a no-VMA user VA. Attributes are copied from an
  * existing user page (template_va) so memory type/AP/SH/AttrIndx/UXN exactly
  * match a known-good page -- no hard-coded MAIR index. The page is mapped to the
@@ -1901,6 +2069,7 @@ static int ghost_inject(int pid, void *task, void *mm, uint64_t ghost_va, uint64
     g_ghost_pid = pid;
     return 0;
 }
+#endif /* SHPTE_POC_LADDER (single-slot ghost + hookto group) */
 
 /* Rev1-(1): multi-page VMA-less ghost clone for the pghook MAIN path (per-slot, unlike
  * the single-slot g_ghost_* above which stays for the legacy hookto/ghostredirect). vmalloc
@@ -1993,6 +2162,7 @@ static void ghost_region_free(struct pghook *s)
     s->ghost_npages = 0;
 }
 
+#ifdef SHPTE_POC_LADDER
 /* inline_hooker primitive (for LSPlant): route `target`'s entry to `replace`, and
  * stash a ghost clone of `target` at ghost_va as the `backup` the caller can call
  * to run the original. target.text is never modified; backup lives in VMA-less
@@ -2137,6 +2307,7 @@ static long do_hwunhook(char *p, char *e)
     g_hwbp_replace = 0;
     return 0;
 }
+#endif /* SHPTE_POC_LADDER (hookto/hwhookto/hwunhook group) */
 
 static long do_hidemaps(uint64_t page, char *p, char *e)
 {
@@ -2194,6 +2365,24 @@ static int hide_add_locked(void *mm, uint64_t page)
     return 0; /* hide-set full */
 }
 
+/* remove (mm,page) from the general maps-hide set. The counterpart to hide_add_locked:
+ * without it the set (MAX_HIDE=64) fills with stale xol-scratch entries as SSOL regions
+ * arm/disarm repeatedly, so eventually a fresh clone/xol can't be hidden (add returns 0).
+ * Called when an SSOL region frees its auto-hidden xol scratch (do_ssoldisarm/do_ssolunhook).
+ * Serialized bridge/supercall context. */
+static void hide_del_locked(void *mm, uint64_t page)
+{
+    if (!mm) return;
+    page &= ~0xFFFUL;
+    for (int i = 0; i < MAX_HIDE; i++)
+        if (g_hide[i].mm == mm && g_hide[i].page == page) {
+            g_hide[i].mm = 0;
+            g_hide[i].page = 0;
+            if (g_nhide > 0) g_nhide--;
+            return;
+        }
+}
+
 /* hidergn <pid> <addr>: add the page containing `addr` (in pid's mm) to the general hide-set,
  * so an in-process maps/smaps scan never sees it. Used by the glue to hide the LSPlant
  * trampoline pool (rwxp anon). mm-gated like the clone hide; auto-cleared when the process is
@@ -2212,10 +2401,12 @@ static long do_hidergn(uint64_t pid, uint64_t addr, char *p, char *e)
     }
     void *mm = fn_get_task_mm(task);
     if (is_err_or_null(mm)) {
+        put_task(task);
         apps(p, e, "error: no mm\n");
         return -1;
     }
     fn_mmput(mm); /* pointer used for equality only, never dereferenced */
+    put_task(task);
     uint64_t page = addr & ~0xFFFUL;
     int hr = hide_add_locked(mm, page);
     if (hr == 0) {
@@ -2305,7 +2496,9 @@ static long do_pte(uint64_t pid, uint64_t addr, char *p, char *e)
     return 0;
 }
 
-/* shared arm path: mode = MODE_SELFHEAL or MODE_REDIRECT (clone used iff redirect) */
+#ifdef SHPTE_POC_LADDER
+/* shared arm path: mode = MODE_SELFHEAL or MODE_REDIRECT (clone used iff redirect).
+ * POC LADDER: single-page redirect state machine (arm/redirect/redirectmap/pagehook). */
 static long arm_common(uint64_t pid, uint64_t addr, int mode, uint64_t clone, char *p, char *e)
 {
     resolve_syms();
@@ -2451,6 +2644,7 @@ static long do_pagehook(uint64_t pid, uint64_t page, uint64_t clone, uint64_t ma
     apps(q, e, "\n");
     return rc;
 }
+#endif /* SHPTE_POC_LADDER (single-page arm/redirect/redirectmap/pagehook group) */
 
 /* Rev2-(2): task_work run in the CHILD's own context after a fork of a hooked process --
  * clear the UXN the child inherited on the forker's hooked .text pages, so the child executes
@@ -2559,7 +2753,7 @@ static int gc_dead_slots_locked(void)
         struct pghook *s = &g_pg[i];
         if (!s->active) continue;
         void *task = fn_find_get_task_by_vpid ? fn_find_get_task_by_vpid(s->pid) : 0;
-        if (!is_err_or_null(task)) continue; /* alive (ref leaked -- rare, acceptable) */
+        if (!is_err_or_null(task)) { put_task(task); continue; } /* alive -> release the ref */
         void *dead_mm = s->mm;
         s->active = 0;                        /* publish inert before freeing (before_pf skips) */
         s->npages = 0;
@@ -2942,7 +3136,8 @@ static long do_pgunhook(uint64_t pid, uint64_t page, uint64_t off, char *p, char
     return -1;
 }
 
-static long do_disarm(char *p, char *e)
+#ifdef SHPTE_POC_LADDER
+static long do_disarm(char *p, char *e) /* single-page ladder teardown */
 {
     g_armed = 0;
     if (g_ptep) {
@@ -2964,6 +3159,7 @@ static long do_disarm(char *p, char *e)
     g_nmap = 0;
     return 0;
 }
+#endif /* SHPTE_POC_LADDER (do_disarm) */
 
 static long do_state(char *p, char *e)
 {
@@ -3004,10 +3200,12 @@ static long do_state(char *p, char *e)
     p = appdec(p, e, g_tracer_hooked);
     p = apps(p, e, " ghost_va=");
     p = apphex(p, e, g_ghost_va);
+#ifdef SHPTE_POC_LADDER
     p = apps(p, e, " hwbp_armed=");
     p = appdec(p, e, g_hwbp_armed);
     p = apps(p, e, " hw_redirects=");
     p = appdec(p, e, g_hw_redirects);
+#endif
     p = apps(p, e, " npg=");
     p = appdec(p, e, g_npg);
     for (int i = 0; i < MAX_PG; i++) {
@@ -3078,6 +3276,31 @@ static int ssol_inject_xol(void *mm, uint64_t xol_va, uint64_t template_va, uint
     return 0;
 }
 
+/* Undo ssol_inject_xol: clear the injected VMA-less XOL scratch PTE in `pid`'s mm (only
+ * if the process is still alive -- a dead process already dropped it with its page tables)
+ * then vfree the kernel-side vmalloc backing it. Factored out so the do_ssolarm late-failure
+ * paths (xol already injected, slot not yet published) and the do_ssoldisarm/do_ssolunhook
+ * teardown all use one reversal -- previously the failure paths only vfree'd the snapshot and
+ * leaked the ghost xol page + its vmalloc. Sleepable (bridge/supercall) context only. */
+static void ssol_free_xol(int pid, uint64_t xol_va, uint64_t xol_kaddr)
+{
+    if (!xol_kaddr) return;
+    if (fn_find_get_task_by_vpid && fn_get_task_mm && fn_mmput && fn_apply_existing) {
+        void *task = fn_find_get_task_by_vpid(pid);
+        if (!is_err_or_null(task)) {
+            void *mm = fn_get_task_mm(task);
+            if (!is_err_or_null(mm)) {
+                uint64_t zero = 0;
+                fn_apply_existing(mm, xol_va & ~0xFFFUL, 0x1000, (void *)inject_cb, &zero);
+                flush_tlb_all();
+                fn_mmput(mm);
+            }
+            put_task(task);
+        }
+    }
+    if (fn_vfree) fn_vfree((void *)xol_kaddr);
+}
+
 /* GC SSOL region slots whose owning process has exited (find_get_task_by_vpid -> NULL).
  * The SSOL analogue of gc_dead_slots_locked (clone path): runs only in the serialized,
  * sleepable supercall context (do_ssolarm / `ssolgc`), so it can vfree and never races
@@ -3096,7 +3319,7 @@ static int gc_dead_ssol_locked(void)
         struct ssol_rgn *s = &g_ssol[i];
         if (!s->active) continue;
         void *task = fn_find_get_task_by_vpid ? fn_find_get_task_by_vpid(s->pid) : 0;
-        if (!is_err_or_null(task)) continue; /* alive (ref leaked -- rare, acceptable) */
+        if (!is_err_or_null(task)) { put_task(task); continue; } /* alive -> release the ref */
         void *dead_mm = s->mm;
         s->active = 0; /* publish inert before freeing (before_pf skips) */
         if (s->insns && fn_vfree) fn_vfree(s->insns);
@@ -3273,10 +3496,12 @@ static long do_ssolarm(uint64_t pid, uint64_t base, uint64_t npages, uint64_t xo
     }
     if (ensure_pf_hooked(p, e) != 0) {
         fn_vfree(insns);
+        ssol_free_xol((int)pid, xol_va, xol_kaddr); /* undo the injected xol ghost page + vmalloc */
         return -1;
     }
     if (ssol_ensure_step_hook()) {
         fn_vfree(insns);
+        ssol_free_xol((int)pid, xol_va, xol_kaddr);
         apps(p, e, "error: step hook register failed\n");
         return -1;
     }
@@ -3365,19 +3590,10 @@ static long do_ssoldisarm(char *p, char *e)
         if (s->insns && fn_vfree) fn_vfree(s->insns);
         s->insns = 0;
         if (s->xol_kaddr) {
-            void *task = fn_find_get_task_by_vpid ? fn_find_get_task_by_vpid(s->pid) : 0;
-            if (task && !is_err_or_null(task) && fn_get_task_mm) {
-                void *mm = fn_get_task_mm(task);
-                if (!is_err_or_null(mm)) {
-                    uint64_t zero = 0;
-                    fn_apply_existing(mm, s->xol_va, 0x1000, (void *)inject_cb, &zero);
-                    flush_tlb_all();
-                    fn_mmput(mm);
-                }
-            }
-            if (fn_vfree) fn_vfree((void *)s->xol_kaddr);
+            ssol_free_xol(s->pid, s->xol_va, s->xol_kaddr);
             s->xol_kaddr = 0;
         }
+        hide_del_locked(s->mm, s->xol_va); /* drop the auto-added xol-scratch maps-hide entry */
     }
     g_nssol = 0;
     for (int i = 0; i < MAX_SSOL_CTX; i++) g_ctx[i].active = 0;
@@ -3430,19 +3646,10 @@ static long do_ssolunhook(uint64_t pid, uint64_t base, uint64_t entry, char *p, 
         if (s->insns && fn_vfree) fn_vfree(s->insns);
         s->insns = 0;
         if (s->xol_kaddr) {
-            void *task = fn_find_get_task_by_vpid ? fn_find_get_task_by_vpid(s->pid) : 0;
-            if (task && !is_err_or_null(task) && fn_get_task_mm) {
-                void *mm = fn_get_task_mm(task);
-                if (!is_err_or_null(mm)) {
-                    uint64_t zero = 0;
-                    fn_apply_existing(mm, s->xol_va, 0x1000, (void *)inject_cb, &zero);
-                    flush_tlb_all();
-                    fn_mmput(mm);
-                }
-            }
-            if (fn_vfree) fn_vfree((void *)s->xol_kaddr);
+            ssol_free_xol(s->pid, s->xol_va, s->xol_kaddr);
             s->xol_kaddr = 0;
         }
+        hide_del_locked(s->mm, s->xol_va); /* drop the auto-added xol-scratch maps-hide entry */
         if (g_nssol > 0) g_nssol--;
         /* leave do_page_fault + the step hook installed: other SSOL/pghook regions may
          * still be live, and the step hook is module-lifetime by design (teardown rule). */
@@ -3564,6 +3771,40 @@ static long do_ssolstat(char *p, char *e)
             p = apphex(p, e, s->ov_bk[k]);
         }
     }
+    apps(p, e, "\n");
+    return 0;
+}
+
+/* version: bridge-protocol handshake. Emits the protocol version + every capacity constant
+ * the Vector-side client needs to size its own tables against. Pure read-only, no side
+ * effects (same safety class as the sysinfo passthrough). The wire contract (command string,
+ * reply prefix, field order, values) is frozen in docs/bridge-protocol.md -- the client parses
+ * `key=value` tokens, so appending NEW keys at the end is backward-compatible; changing an
+ * existing key/order requires a BRIDGE_PROTO_VER bump. */
+static long do_version(char *p, char *e)
+{
+    p = apps(p, e, "ok: shptbridge proto=");
+    p = appdec(p, e, BRIDGE_PROTO_VER);
+    p = apps(p, e, " MAX_RGN=");
+    p = appdec(p, e, MAX_RGN);
+    p = apps(p, e, " MAX_PG=");
+    p = appdec(p, e, MAX_PG);
+    p = apps(p, e, " MAX_OV=");
+    p = appdec(p, e, MAX_OV);
+    p = apps(p, e, " MAX_GHOST_PG=");
+    p = appdec(p, e, MAX_GHOST_PG);
+    p = apps(p, e, " MAX_SSOL_RGN=");
+    p = appdec(p, e, MAX_SSOL_RGN);
+    p = apps(p, e, " MAX_SSOL_OV=");
+    p = appdec(p, e, MAX_SSOL_OV);
+    p = apps(p, e, " MAX_SSOL_CTX=");
+    p = appdec(p, e, MAX_SSOL_CTX);
+    p = apps(p, e, " MAX_HIDE=");
+    p = appdec(p, e, MAX_HIDE);
+    p = apps(p, e, " MAX_FSHIDE=");
+    p = appdec(p, e, MAX_FSHIDE);
+    p = apps(p, e, " OFFMAP_MAX=");
+    p = appdec(p, e, OFFMAP_MAX);
     apps(p, e, "\n");
     return 0;
 }
@@ -3698,6 +3939,8 @@ static long shpte_run(const char *args, char *buf, int bufcap)
 
     if (starts(a, "probe")) {
         rc = do_probe(p, e);
+    } else if (starts(a, "version")) {
+        rc = do_version(p, e);
     } else if (starts(a, "selfstep")) {
         rc = do_selfstep(p, e);
     } else if (starts(a, "ssolstat")) {
@@ -3747,6 +3990,7 @@ static long shpte_run(const char *args, char *buf, int bufcap)
             apps(p, e, "usage: pte <pid> <hexaddr>\n"), rc = -1;
         else
             rc = do_pte(pid, addr, p, e);
+#ifdef SHPTE_POC_LADDER
     } else if (starts(a, "disarm")) {
         rc = do_disarm(p, e);
     } else if (starts(a, "redirectmap")) {
@@ -3775,6 +4019,7 @@ static long shpte_run(const char *args, char *buf, int bufcap)
                 rc = -1;
         else
             rc = do_pagehook(pid, page, clone, map, n, toff, rep, p, e);
+#endif /* SHPTE_POC_LADDER (disarm/redirectmap/pagehook dispatch) */
     } else if (starts(a, "pggc")) {
         int n = gc_dead_slots_locked();
         p = apps(p, e, "ok: pggc reaped ");
@@ -3877,6 +4122,7 @@ static long shpte_run(const char *args, char *buf, int bufcap)
                 rc = -1;
         else
             rc = do_pghook(pid, page, clone, map, n, toff, rep, 0 /*ghost*/, 0, 0, p, e);
+#ifdef SHPTE_POC_LADDER
     } else if (starts(a, "redirect")) {
         uint64_t pid = 0, addr = 0, clone = 0;
         const char *s = parse_ull(a + 8, &pid);
@@ -3894,6 +4140,7 @@ static long shpte_run(const char *args, char *buf, int bufcap)
             apps(p, e, "usage: arm <pid> <hexaddr>\n"), rc = -1;
         else
             rc = do_arm(pid, addr, p, e);
+#endif /* SHPTE_POC_LADDER (redirect/arm dispatch) */
     } else if (starts(a, "hidergn")) {
         uint64_t pid = 0, addr = 0;
         const char *s = parse_ull(a + 7, &pid);
@@ -3912,6 +4159,7 @@ static long shpte_run(const char *args, char *buf, int bufcap)
         rc = do_hidetracer(p, e);
     } else if (starts(a, "unhidetracer")) {
         rc = do_unhidetracer(p, e);
+#ifdef SHPTE_POC_LADDER
     } else if (starts(a, "ghostredirect")) {
         uint64_t pid = 0, fn = 0, gva = 0, cb = 0, nc = 0, mp = 0, ni = 0, tv = 0;
         const char *s = parse_ull(a + 13, &pid);
@@ -3972,6 +4220,7 @@ static long shpte_run(const char *args, char *buf, int bufcap)
             rc = do_hwhookto(pid, tgt, rep, cb, nc, tv, gv, p, e);
     } else if (starts(a, "hwunhook")) {
         rc = do_hwunhook(p, e);
+#endif /* SHPTE_POC_LADDER (ghost + hookto/hwhookto/hwunhook dispatch) */
     } else if (starts(a, "unbridge")) {
         rc = do_unbridge(p, e);
     } else if (starts(a, "bridge")) {
@@ -3982,9 +4231,14 @@ static long shpte_run(const char *args, char *buf, int bufcap)
         rc = do_state(p, e);
     } else {
         apps(p, e,
-             "usage: probe | pte | arm | redirect | redirectmap | pagehook | "
-             "pghook | pgunhook | pgdisarm | hookto | hwhookto | hidemaps | unhidemaps | "
-             "ghosttest | ghostredirect | ghostfree | bridge | unbridge | fshide | disarm | dump\n");
+             "usage: probe | version | pte | pghook | pgunhook | pgdisarm | ssolhook | ssolunhook | "
+             "ssoldisarm | hidergn | hidemaps | unhidemaps | hidetracer | fshide | bridge | unbridge | "
+             "dump"
+#ifdef SHPTE_POC_LADDER
+             " | arm | redirect | redirectmap | pagehook | hookto | hwhookto | hwunhook | "
+             "ghosttest | ghostredirect | ghostfree | disarm"
+#endif
+             "\n");
         rc = -1;
     }
     return rc;
@@ -4004,6 +4258,13 @@ static long shpte_control0(const char *args, char *__user out_msg, int outlen)
 
 static long shpte_exit(void *__user reserved)
 {
+    /* NOTE: by design this NEVER runs in production. KernelPatch runs module exit
+     * (unload_module) INSIDE rcu_read_lock, so any teardown that would synchronize_rcu
+     * self-deadlocks the kernel -- a live `shctl unload shpte` has HUNG the device
+     * (physical reboot only). Production loads once at boot (bootstrap load;probe;bridge)
+     * and NEVER unloads; a reboot reloads without running exit(). This handler exists only
+     * as a best-effort restore for the DEV live-load path and must stay non-blocking (no
+     * unregister_user_step_hook -- see ssol_remove_step_hook; docs/SSOL-P3-handoff.md §2). */
     /* always restore + unhook so unload can't leave a UXN'd page or live hook */
     g_armed = 0;
     /* restore every SSOL-trapped page + free its snapshot/scratch before unload */
@@ -4090,11 +4351,13 @@ static long shpte_exit(void *__user reserved)
         fp_unhook_syscalln(BRIDGE_NR, (void *)before_bridge, 0);
         g_bridge_hooked = 0;
     }
+#ifdef SHPTE_POC_LADDER
     g_hwbp_armed = 0;
     if (g_hwbp && fn_unreg_hwbp) {
         fn_unreg_hwbp(g_hwbp);
         g_hwbp = 0;
     }
+#endif
     if (g_ghost_kaddr) {
         /* clear the injected PTE then free, so we don't leave a dangling map/leak */
         void *task = fn_find_get_task_by_vpid ? fn_find_get_task_by_vpid(g_ghost_pid) : 0;
