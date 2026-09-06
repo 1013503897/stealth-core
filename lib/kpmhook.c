@@ -256,12 +256,12 @@ static uint64_t next_rgn_base_locked(uint64_t base, uint64_t cap)
 
 /* Bounds of the contiguous READABLE mapping containing `addr` (extends across adjacent
  * readable VMAs): returns the extent END, sets *out_start to the extent START, or 0 if
- * addr is not in a readable mapping. Two uses, both against hardened/packed libs (e.g.
- * GCash's libAPSE) that split their .text with non-readable --xp/---p sub-ranges:
+ * addr is not in a readable mapping. Two uses, both against hardened/packed libs (some
+ * commercial packers) that split their .text with non-readable --xp/---p sub-ranges:
  *   1. cap region expansion at [.,end) so dbi_recompile's [base,end) read stays readable;
  *   2. bound dbi's LDR-literal-pool reads to [start,end) so a bytecode word MISDECODED as
  *      an LDR-literal (obfuscated VM) resolving OUTSIDE the readable extent is SKIPPED, not
- *      read -- that out-of-extent read (e.g. base-486KB, below libAPSE) SIGSEGVs otherwise.
+ *      read -- that out-of-extent read (e.g. base-486KB, below the packed lib) SIGSEGVs otherwise.
  * Reads /proc/self/maps (sleepable install context only, never the fault path); maps are
  * address-sorted. */
 static uint64_t readable_extent(uint64_t addr, uint64_t *out_start)
@@ -351,7 +351,7 @@ static struct rgn *make_rgn_locked(uint64_t target)
     uint64_t collide = next_rgn_base_locked(base, cap);
     if (collide) cap = collide; /* don't overlap an existing region */
     /* never expand into a non-readable page: dbi_recompile reads [base,end) to build the
-     * clone, and packed libs (libAPSE) split .text with non-readable sub-ranges -> a read
+     * clone, and packed libs split .text with non-readable sub-ranges -> a read
      * there SIGSEGVs (the flaky getColorInfo install crash). Cap at base's readable extent
      * and reuse the same [rd_start,rd_end) to bound dbi's literal-pool reads below. */
     uint64_t rd_start = 0;
