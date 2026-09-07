@@ -67,7 +67,6 @@ is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs
 
 ```
 kpm/        shpoc.c     P0 syscall-hook smoke test
-            shhwbp.c    P1.5/P1.6 HWBP hook: per-thread bp table + state machine
             shpte.c     P2/P4/P5/L1/SSOL/fs-hide main module. cmds: pte | arm | redirect |
                         redirectmap | pagehook (whole-page UXN hook) | pghook/pgunhook/pgdisarm
                         (multi-page, multi-override-per-page RV-2 region table) | hookto/hwhookto/
@@ -76,18 +75,14 @@ kpm/        shpoc.c     P0 syscall-hook smoke test
                         Java) | hidemaps/unhidemaps/hidergn | hidetracer | fshide (statfs/mountinfo
                         anti-detect) | bridge/unbridge | disarm | dump
             shmin.c     minimal ctl0 isolation test
-            build.ps1   build a .kpm with NDK clang  (build.ps1 -Src shhwbp.c)
+            build.ps1   build a .kpm with NDK clang  (build.ps1 -Src shpte.c)
 cli/        shctl.c     KPM control CLI (supercall: load/unload/list/info/control)
             build_shctl.ps1
-tools/      hbtarget.c  self-contained single-thread HWBP test target (pid + &tick, loops)
-            mttarget.c  multi-thread target; spawns workers gradually (grow) or churns them (churn)
+tools/      mttarget.c  multi-thread target; spawns workers gradually (grow) or churns them (churn) — used by run_uxn_test.sh
             dbitarget.c        P2.2 target: page-isolated, PC-relative-free tick() + self-clone
             dbitarget2.c       P3.2 target + DBI recompiler: PC-relative hook_me() (ADR+B) → clone
             dbitarget3.c       P3.3 target: work() with a loop (internal B.cond/B) → clone
             dbitarget4.c       P3.4 target: lwork() with an LDR-literal → clone
-            run_mt_test.sh     P1.6 harness (hook every existing thread → dump → unhook → unload)
-            run_grow_test.sh   P1.6b harness (hook t0 threads, watch new threads auto-followed)
-            run_churn_test.sh  P1.6b harness (churn threads, watch slot GC keep the table bounded)
             run_uxn_test.sh    P2.1 harness (UXN + do_page_fault self-heal)
             run_redirect_test.sh    P2.2 harness (UXN net + reroute tick into its verbatim clone)
             run_redirectmap_test.sh P3.1 harness (offset_map routing, identity map)
@@ -294,10 +289,9 @@ selfstep/dump    自测/诊断
 ```
 kpm/        KPM 内核模块 + 构建脚本
   shpoc.c       P0 syscall-hook 冒烟
-  shhwbp.c      P1.5/P1.6 HWBP hook：每线程断点表 + 状态机
   shpte.c       P2/P3/P4/P5/L1/SSOL/fs-hide 主模块（~4100 行，命令集见上）
   shmin.c       最小 ctl0 隔离测试
-  build.ps1     用 NDK clang 编 .kpm（build.ps1 -Src shhwbp.c）
+  build.ps1     用 NDK clang 编 .kpm（build.ps1 -Src shpte.c）
   *.py          elf_syms / scope_db / btf_off / oat_census 等符号解析脚本
   libart*.so    census / 离线分析用的 ART 样本
 
@@ -310,7 +304,7 @@ lib/        可复用用户态库（Vector 链接的就是这里）
   *_test.c      host/device 可跑的单元测试
 
 tools/      测试靶子 + 端到端 harness（各 .c 与 shctl 同法编译）
-  hbtarget/mttarget          单线程 / 多线程 HWBP 靶
+  mttarget                   多线程靶（run_uxn_test 用）
   dbitarget..dbitarget4      P2.2→P3.4 逐级 DBI 靶（逐字→ADR/ADRP/B/BL→分支→LDR-literal）
   ghosttool/ghostexec        P4.2 ghost 内存靶（注入读 / 从 ghost 页执行）
   hooktool/hwhooktool        inline_hooker 靶（UXN 隔离 / HWBP 非隔离）
