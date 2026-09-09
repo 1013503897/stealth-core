@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// shctl: minimal KernelPatch KPM control CLI for the stealth-poc.
+// shctl: minimal KernelPatch KPM control CLI for stealth-core.
 //
 // Self-contained: issues the KernelPatch "supercall" directly via syscall(45,...)
 // using the public ABI constants, so it needs nothing but bionic libc. (We avoid

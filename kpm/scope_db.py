@@ -2,7 +2,7 @@
 # Inspect / edit the Vector (LSPosed-fork) modules_config.db scope table.
 import sqlite3, sys
 
-DB = r"C:\work\git_code\stealth-poc\kpm\mc.db"
+DB = r"C:\work\git_code\stealth-core\kpm\mc.db"
 
 def show():
     d = sqlite3.connect(DB); c = d.cursor()

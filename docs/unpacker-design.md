@@ -135,7 +135,7 @@ default off) so it ships safely inside Vector. **But isolate it for a future ext
 in-process code under `native/src/unpack/` (mirrors how `native/src/kpm/` is isolated) with a thin
 call from the post-init worker. The **offline reassembler** is non-sensitive, zero-coupling
 host tooling → a `tools/dexfixer/` dir now, its own tiny repo later if it proves reusable. This
-design doc lives in **stealth-poc/docs** (private, with the sensitive design) because it leverages
+design doc lives in **stealth-core/docs** (private, with the sensitive design) because it leverages
 the stealth primitive; the *code* lives in Vector per the established split.
 
 | Phase | Content | New code | Notes/risk |

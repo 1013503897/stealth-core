@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * stealth-poc P2 KPM: PTE/UXN "high-voltage net" (article 5.6), step by step.
+ * stealth-core P2 KPM: PTE/UXN "high-voltage net" (article 5.6), step by step.
  *
  *   P2.0  read + decode any process's leaf PTE (no modification).
  *   P2.1  arm: flip the target code page's UXN bit so EL0 execute faults, hook

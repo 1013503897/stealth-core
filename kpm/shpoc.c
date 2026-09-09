@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * stealth-poc P0 KPM: toolchain + KPM bridge + syscall-hook smoke test.
+ * stealth-core P0 KPM: toolchain + KPM bridge + syscall-hook smoke test.
  *
  * Goal: prove on the target device that (a) our NDK-clang build produces a
  * loadable .kpm, (b) APatch/KernelPatch loads it, and (c) a kernel hook fires.

@@ -1,28 +1,19 @@
-# stealth-poc
+# stealth-core
 
 **English** | [中文](#中文说明)
 
-Clean-room PoC for kernel-level **traceless hooking** on Android (ARM64), built on
-APatch / KernelPatch (KPM). Goal: intercept a target's execution **without modifying
-any of its memory** (no `.text` patch, no injected SO, no anonymous executable maps),
-so it survives CRC / maps-scan style anti-tamper checks.
+Kernel-level **traceless hooking** engine on Android (ARM64), built on APatch / KernelPatch (KPM). Intercepts target execution **without modifying code bytes or memory mappings** (no `.text` patch, no injected SO, no anonymous executable maps), bypassing CRC self-checksum and `/proc/*/maps` scans.
 
-### TL;DR
+### Overview
 
-- **What** — intercept a function *without touching its bytes*: no `.text` patch, no injected `.so`, no anonymous executable map.
-- **How** — a kernel module (KPM) sets `PTE_UXN` on the target's code page; the execute-fault is routed into a position-independent **clone** (DBI-recompiled) that lives in VMA-less "ghost" memory. The original page is never modified. Backends: **region clone** (real libart), **HWBP** (entry-only), **SSOL** (Java / dense JIT).
-- **Use** — call `kpm_inline_hooker(target, hooker) → backup` from userspace over a syscall bridge (Vector's `HookInline` funnels into this). Smallest working example: [`tools/demohook.c`](tools/demohook.c) (`105 → hook → 106 → unhook → 105`, `.text` untouched).
-- **Beats** — CRC / self-checksum · `/proc/maps` + `mincore` scans · ptrace/TracerPid · overlayfs mount detection.
+- **Mechanism** — The KPM kernel module marks the target code page with `PTE_UXN`. Execution faults are intercepted and routed to a position-independent clone (recompiled via DBI) executing in VMA-less ghost memory. The original `.text` page remains untouched.
+- **Backends** — Region clone (real libart / native libraries), SSOL (single-step-out-of-line for Java / dense JIT), HWBP (ARM64 hardware breakpoint, entry-only).
+- **Userspace API** — `kpm_inline_hooker(target, hooker) → backup` over a sysinfo syscall bridge (Vector's `HookInline` primary backend). Smallest working example: [`tools/demohook.c`](tools/demohook.c) (`105 → hook → 106 → unhook → 105`, `.text` untouched).
+- **Anti-tamper coverage** — CRC / code self-checksum · `/proc/*/maps` + `mincore` scans · ptrace / TracerPid spoofing · overlayfs mount detection (`fshide`).
 
-**Related project:** this repo is the kernel + userspace-glue **source** of the KPM traceless-hook
-backend used by [**Vector**](https://github.com/1013503897/Vector) — our fork of JingMatrix's Zygisk
-ART-hook framework. Vector vendors `lib/kpmhook` + `lib/dbi` from here and routes its `HookInline`
-through `kpm_inline_hooker` (KPM traceless) first, falling back to Dobby when the KPM bridge is
-unarmed. See the **L1b/L1d/L1e** status rows and the *Productization* section below.
+**Related project:** This repository is the kernel and userspace-glue source for the KPM traceless-hook engine integrated into [**Vector**](https://github.com/1013503897/Vector) (a fork of JingMatrix's Zygisk ART-hook framework). Vector vendors `lib/kpmhook` and `lib/dbi` from this repository.
 
-Reference (concepts only): the kanxue article *Android 内核无痕 Hook 理解和感悟* and
-the public `xiaojianbang-stealth-hook` repo. **No third-party code is copied** — this
-is implemented against the KernelPatch kpm SDK API and the stable Linux/ARM ABIs.
+Reference: Conceptually inspired by the kanxue article *Android 内核无痕 Hook 理解和感悟* and `xiaojianbang-stealth-hook`. Independent clean-room implementation against the KernelPatch SDK API and Linux/ARM64 ABIs.
 
 ## Status
 
@@ -204,38 +195,32 @@ Remaining / future:
 
 ## 中文说明
 
-**中文** | [English](#stealth-poc)
+**中文** | [English](#stealth-core)
 
-Android（ARM64）上**内核级无痕 Hook** 的 clean-room PoC，基于 **APatch / KernelPatch（KPM）**。
+基于 APatch / KernelPatch（KPM）的 Android（ARM64）**内核级无痕 Hook 引擎**。在不改动目标内存原始字节与映射结构（不修改 `.text`、不注入 `.so`、不创建匿名可执行映射）的前提下拦截与接管执行流程，从底层绕过内存 CRC 自校验与 `/proc/*/maps` 内存扫描。
 
-### TL;DR
+### 核心机制与接口
 
-- **做什么** —— 拦截一个函数却*不动它任何字节*：不 patch `.text`、不注入 `.so`、不建匿名可执行映射。
-- **怎么做** —— 内核模块（KPM）给目标代码页置 `PTE_UXN`，执行陷阱被路由进一份位置无关的**克隆**（DBI 重编译），克隆跑在 VMA-less「ghost」内存里；原页从不被改。后端三选：**region 克隆**（真 libart）、**HWBP**（仅入口）、**SSOL**（Java / 稠密 JIT）。
-- **怎么调** —— 用户态经 syscall 桥调 `kpm_inline_hooker(target, hooker) → backup`（Vector 的 `HookInline` 收敛到这里）。最小可跑示例：[`tools/demohook.c`](tools/demohook.c)（`105 →hook→ 106 →unhook→ 105`，`.text` 不动）。
-- **过什么检测** —— CRC / 自校验 · `/proc/maps` + `mincore` 扫描 · ptrace/TracerPid · overlayfs 挂载检测。
+- **执行陷阱与重定向**：KPM 模块将目标代码页 PTE 的 UXN（User Execute-Never）位置位。EL0 执行该页指令时触发 `do_page_fault`，内核异常处理例程将其拦截并重定向到通过 DBI 重编译的位置无关副本（运行于无 VMA 的 ghost 内存）。目标原页面物理字节全程未作修改。
+- **Hook 后端分类**：
+  - **Region 克隆**：针对 libart 等 native 函数，按函数间隙划定整段连续页区域克隆，彻底解决跨页函数执行截断问题。
+  - **SSOL（单步出线）**：针对 Java / 稠密 JIT 代码，保留原始代码在原地址，单步 XOL 模拟执行，保证 ART 方法映射、栈展开与 GC 正常工作。
+  - **HWBP**：ARM64 硬件断点，用于单入口轻量拦截。
+- **用户态接口**：通过无需 superkey 的 sysinfo 桥提供 `kpm_inline_hooker(target, hooker) → backup`（已接入 Vector 的 `HookInline` 主路径）。最小可运行示例参考 [`tools/demohook.c`](tools/demohook.c)（`105 → hook → 106 → unhook → 105`，`.text` 不动）。
+- **反检测覆盖**：代码段 CRC / 自校验 · `/proc/maps` 与 `mincore` 扫描 · ptrace / TracerPid 伪造 · overlayfs 挂载点隐藏（`fshide`）。
 
-**关联项目**：本仓是 [**Vector**](https://github.com/1013503897/Vector)（我们 fork 的 JingMatrix Zygisk ART-hook 框架）所用 **KPM 无痕后端的内核 + 用户态胶水源头**。Vector 从这里 vendored `lib/kpmhook` + `lib/dbi`，其 `HookInline` **先走 `kpm_inline_hooker`**（KPM 无痕）、桥未开时退 Dobby。见下方状态表 **L1b/L1d/L1e** 与《产品化》一节。
+**关联项目**：本仓为 [**Vector**](https://github.com/1013503897/Vector)（Zygisk ART Hook 框架）无痕 Hook 后端的内核与用户态胶水源头。Vector 直接引入本仓的 `lib/kpmhook` 与 `lib/dbi`，其 `HookInline` **优先走 `kpm_inline_hooker`**（KPM 无痕），桥未就绪时自动退回 Dobby。见下方阶段进度表 **L1b/L1d/L1e** 与《产品化集成》一节。
 
-## 这是什么
+概念参考：看雪文章《Android 内核无痕 Hook 理解和感悟》与 `xiaojianbang-stealth-hook` 思路。全量代码基于 KernelPatch kpm SDK API 与 Linux/ARM 体系结构独立实现。
 
-一句话：**在不改动目标任何一个字节内存的前提下，拦截并接管它的执行**。
+## 检测面与对抗方案
 
-- 不 patch 目标 `.text`（过得了 CRC / 自校验）；
-- 不注入 SO、不建匿名可执行映射（过得了 `/proc/*/maps` 扫描）；
-- 重编译后的克隆代码跑在 **连 `/proc/*/maps` 和 `mincore` 都看不见** 的内存里。
-
-它是 Vector（`../Vector`，JingMatrix 的 Zygisk ART-hook 框架）**KPM 无痕后端的内核源头**——Vector 通过 vendored 的 `lib/kpmhook` + `lib/dbi` 经 sysinfo bridge 驱动本仓的 KPM。本仓保持独立 git（remote `github.com/1013503897/stealth-poc`）。
-
-参考（仅概念）：看雪文章《Android 内核无痕 Hook 理解和感悟》与公开的 `xiaojianbang-stealth-hook`。**未拷贝任何第三方代码**——全部对着 KernelPatch kpm SDK API 和稳定的 Linux/ARM ABI 自研实现。
-
-## 无痕的三重保证
-
-| 反检测面 | 常规 hook 的破绽 | 本方案 |
+| 反检测面 | 常规 Hook 破绽 | 本方案实现 |
 |---|---|---|
-| **CRC / 自校验** | inline patch 改了 `.text` 字节 | `.text` 一字不改，靠 PTE 的 UXN 位或硬件断点触发陷阱 |
-| **`/proc/*/maps` 扫描** | 注入 SO / 匿名 RX 段留下映射行 | 克隆跑在 **VMA-less ghost 内存**（无 VMA，maps/mincore 均不可见）；另有 maps-hide 兜底 |
-| **ptrace / 反调试** | 附加调试器改 TracerPid | 无需 ptrace；并提供 `hidetracer` 把 `/proc/*/status` 的 TracerPid 伪造为 0 |
+| **CRC / 代码自校验** | Inline Hook 修改了 `.text` 段物理指令 | `.text` 原始字节一字不改，由 PTE UXN 异常或硬件断点捕获执行入口 |
+| **`/proc/*/maps` 内存扫描** | 注入 `.so` 或匿名 `r-xp` 段留下可检测的 VMA 记录 | 克隆代码置于 **VMA-less ghost 内存**（无对应 VMA，`maps` 与 `mincore` 均不可见）；另备 maps-hide 过滤层兜底 |
+| **ptrace / 调试状态检测** | 附加调试器导致 `TracerPid` 异常 | 无需 ptrace；另提供 `hidetracer` 将目标进程 `/proc/*/status` 中的 `TracerPid` 恒定伪造为 0 |
+| **挂载点检测 (OverlayFS / Magisk)** | 检测 `/proc/mounts` 或 statfs 文件系统类型 | 内核 `fshide` 拦截目标进程的 `vfs_statfs` 与 `show_mountinfo`，按 UID/TGID 白名单屏蔽特征挂载 |
 
 ## 三层架构
 
@@ -321,58 +306,54 @@ docs/       设计文档（SSOL、L2 Java 无痕、fs 隐藏、ghost VA 钉死�
 vendor/     KernelPatch（SDK 头 + 文档；tag 0.13.1）
 ```
 
-## 关键机制（无痕怎么实现的）
+## 核心机制实现
 
-- **UXN「高压网」**：给目标代码页的 PTE 置 `PTE_UXN`，EL0 执行即触发 `do_page_fault`。fault handler **硬门控**（armed + 精确目标页 + faulting `tgid` 匹配），PTE 指针在 arm 期缓存，热路径不做页表遍历。
-- **DBI 重编译器**（在用户态靶/`lib/dbi`，不在 KPM——内核只路由入口 fault）：把 PC 相关指令（`ADR/ADRP/B/BL/B.cond/CBZ/TBZ/LDR-literal`）重编码成位置无关，产出 `offset_map`（原指令 idx → 克隆指令 idx）供内核路由。
-- **RV-2 干净边界多页 region 克隆**：L1c 普查发现真实 libart **46.5% 的代码字节** 落在跨页函数里，单页克隆会截断函数。解决：一个 `pghook` 槽陷阱一段**连续页 region**，其 `R_hi` 落在函数间空隙——每个函数整体在克隆里、正常 `RET`，无需 trampoline。
-- **VMA-less ghost 内存**：`vmalloc` 一页 → `vmalloc_to_pfn` 拿 PFN（**不用** `virt_to_phys`，其 `linear_voffset` 未导出给 KPM）→ 从模板可执行页拷属性 → `apply_to_page_range` 在一个无 VMA 的 VA 注入 PTE → `sync_icache` 后把 UXN 重定向指到这里。ghost 主路径（Rev1 ①）已让 `pghook` 的宿主克隆本身也搬进 ghost 内存。
-- **SSOL 单步出线**：稠密框架 JIT 上，region 克隆有两个结构性坑（① 代码/数据交织，字面量池被当指令执行 → SIGILL；② 克隆返回地址上栈，ART unwinder/GC 认不出 → SIGSEGV）。SSOL 把原码留在原地，只逐指令 XOL、对 PC 相关指令做 simulate、mid-step fault 修正——PC 之间永远在原始地址，ART 全套机制照常。触发用已有的 UXN 执行 fault（不写 BRK，故无痕）。
-- **fork 安全**（Rev2 ②）：给 fork 出的子进程**解陷阱**，子进程在自己 `.text` 上的执行 fault 不再误命中。
+- **PTE_UXN 陷阱与门控**：置位目标代码页 PTE 的 `PTE_UXN` 位，EL0 执行该页代码即触发 `do_page_fault`。异常处理例程实施硬门控（armed 标志、目标页面地址及 faulting `tgid` 校验）；PTE 指针在 arm 阶段完成解析并缓存，热路径免除页表遍历开销。
+- **用户态 DBI 重编译器**（位于 `lib/dbi`，内核仅负责异常路由）：将 PC 相关指令（`ADR/ADRP/B/BL/B.cond/CBZ/TBZ/LDR-literal`）重编码为绝对地址或位置无关指令，并输出 `offset_map`（原指令索引 → 克隆指令索引）供内核异常路由精确跳转。
+- **RV-2 干净边界多页 region 克隆**：实测 libart 中 46.5% 的代码字节落在跨页函数中，单页克隆会截断函数。RV-2 方案令单个 `pghook` 槽管理整段连续代码页 region，其边界 `R_hi` 严格对齐函数间隙，保证跨页函数及其邻接函数在克隆段内完整执行并正常 `RET`。
+- **VMA-less ghost 内存**：调用 `vmalloc` 分配内存并通过 `vmalloc_to_pfn` 获取物理页帧（避开未对 KPM 导出的 `virt_to_phys`），复刻可执行页属性后经 `apply_to_page_range` 将 PTE 注入到未创建 VMA 的地址空间，`sync_icache` 后作为执行重定向目标。该内存无对应 VMA 结构体，`/proc/*/maps` 与 `mincore` 均无法检测。
+- **SSOL 单步出线**：针对 Android 框架 JIT 代码与数据交织、返回地址强校验等特性，SSOL 将原指令保留在原地址，仅在异常触发后单步 out-of-line 模拟执行单条指令，执行间隙 PC 始终维持在原地址，彻底兼容 ART 的 PC→method 映射、异常栈展开、GC 与 deopt。
+- **fork 子进程保护**：子进程派生时主动清理陷阱映射，避免子进程执行自身代码段时引发异常误命中。
 
-### 关键不变量：deferred-work 安全模型
+### 关键约束：deferred-work 安全模型
 
-perf/断点内核 API（`register/unregister/modify_user_hw_breakpoint`）和其它可能阻塞的调用，**不在 supercall/`KPM_CTL0` 上下文或断点异常 handler 里直接跑**——那会让线程卡在不可中断 D-state 同时持有 KernelPatch 锁，阻塞后续 supercall。全仓强制的模式：
+涉及 perf 及断点管理的内核接口（如 `register/unregister/modify_user_hw_breakpoint`）严禁在 supercall、`KPM_CTL0` 回调或异常处理上下文中同步调用，否则会导致线程阻塞在不可中断的 D-state 并持有 KernelPatch 锁。实现中严格遵循以下纪律：
 
-- 断点/fault handler 只**快照寄存器**，然后 `task_work_add(target_task, ..., TWA_RESUME)` 入队；
-- 真正的 perf 调用推迟到**目标任务自己的上下文**（可睡眠、返回用户态前）执行。
+- 断点与缺页异常处理例程仅执行寄存器快照，随后通过 `task_work_add(target_task, ..., TWA_RESUME)` 将耗时操作挂入队列；
+- 实际的断点操作推迟至目标任务自身上下文（在返回用户空间前的可睡眠上下文）异步执行。
 
-任何新碰 perf/调度/可能阻塞内核 API 的代码，必须遵守同样的 defer-to-`task_work` 纪律。
+## 构建说明
 
-## 构建
-
-Windows + NDK clang（无需 WSL/gcc）。构建脚本是 PowerShell。NDK 在脚本里**硬编码为 `26.1.10909125`（clang 17）**，机器不同就改脚本里的 `$ndk`。
+构建环境：Windows + NDK clang（无需 WSL/gcc）。构建脚本为 PowerShell，默认适配 NDK `26.1.10909125`（clang 17）：
 
 ```powershell
-# KPM 内核模块（传任意 kpm/*.c，产出同名 .kpm + .o）
-powershell kpm/build.ps1 -Src shpte.c        # -> kpm/shpte.kpm（默认 Src 是 shpoc.c）
+# 编译 KPM 内核模块（产出 kpm/shpte.kpm 与同名 .o）
+powershell kpm/build.ps1 -Src shpte.c
 
-# shctl 用户态 CLI -> cli/shctl（aarch64-linux-android33）
+# 编译用户态控制 CLI -> cli/shctl（aarch64-linux-android33）
 powershell cli/build_shctl.ps1
 ```
 
-**KPM 构建 flag 是 load-bearing 的，未在真机重测前不要改**：
+**KPM 内核编译参数约束**：
 
-- **只能 `-O0`**（clang `-O2` 对 KP 模块加载器会 miscompile）。
-- **`-mbranch-protection=bti`**——断点 handler 被内核 perf 间接调用，需要 BTI landing pad。
-- `--target=aarch64-none-elf -nostdinc -ffreestanding -mgeneral-regs-only`，再做可重定位链接（`-r -nostdlib`）；`-I` 集镜像上游 kpm Makefile。
+- **强制 `-O0`**：clang `-O2` 优化会导致 KernelPatch 模块加载器重定位解析异常进而引发内核崩溃。
+- **`-mbranch-protection=bti`**：断点处理例程受内核 perf 间接调用，需配备 BTI landing pad。
+- 链接参数：`--target=aarch64-none-elf -nostdinc -ffreestanding -mgeneral-regs-only` 并配合可重定位链接 `-r -nostdlib`。
 
-`tools/*.c` 靶子没有构建脚本，与 `shctl` 同法编译（`--target=aarch64-linux-android33`）。
+测试工具目录 `tools/*.c` 与 `shctl` 编译参数一致（`--target=aarch64-linux-android33`）。
 
-## 版本耦合（必须与设备一致）
+## 版本与 ABI 约束
 
-两个独立的版本 pin 必须与设备匹配，否则 load/supercall 会**静默失败**：
+- **KernelPatch SDK**：仓内依赖 `vendor/KernelPatch` tag 0.13.1 头文件。设备端运行 KernelPatch 0.13.3，两者 ABI 保持向下兼容，加载运行验证通过。
+- **版本校验机制**：`cli/shctl.c` 中的 `KP_VER_CODE` 用于向 supercall 的 `vcmd` 高位写入标记；KernelPatch 0.13.x 分发器仅截取低 16 位（`cmd = arg1 & 0xFFFF`），版本字段不影响实际调用分发。
 
-- `vendor/KernelPatch` checkout 在 tag **0.13.1**，提供 kpm SDK 头。设备实际是 **0.13.3**，两者 **ABI 兼容**——当前加载的 `shpte` KPM 实测正常工作，故 SDK 头无需强行对齐到 0.13.3。真正必须匹配的是 SDK 头的 ABI，不是那个数字。
-- `cli/shctl.c` 的 `KP_VER_CODE`（现为 `0.13.3`）会打进每次 supercall 的 `vcmd` 高位，**但 0.13.x 的 supercall 分发器只取 `cmd = arg1 & 0xFFFF`、忽略版本高位**，所以它是**运行时无效的装饰值**。升级 KP 时按需对齐 SDK 头 tag 即可，`KP_VER_CODE` 改不改都不影响运行。
+## 产品化集成：Vector / LSPlant
 
-## 产品化：LSPlant / Vector（及未来的 Frida-Gum 无痕后端）
+作为 [Vector](https://github.com/1013503897/Vector) 的无痕 Hook 后端，集成架构与分工如下：
 
-目标成品是一个改造版 **Vector**（`../Vector`），其 hook 后端换成本仓 KPM。要点：
+- **后端方案选型**：线上生产后端确立为**多页 RV-2 region 克隆（`pghook`/`pghookg`）+ SSOL**。初期试验的 HWBP（`hwhookto`）受限于硬件断点槽位数量（≤4），仅保留作单入口特殊场景备用；`lib/kpmhook.c` 核心调用全面收敛至 region 克隆与 SSOL 通道。
+- **Layer 1（Native libart Hook）**：替换 Vector 的 `inline_hooker` / `unhooker`，经 sysinfo bridge 路由至 KPM。载体为支持每页多重覆盖的跨页 UXN `pghook`。真机实测验证：LSPosed 管理器注入的 6 处 libart 内联 Hook 全部走通 region 克隆，无 Dobby 回退，原始 `.text` 段保持未修改。
+- **Layer 2（Java 方法 Hook）**：通过 **SSOL** 承接 JIT 稠密指令拦截；Region 克隆保留支持 Native 代码与轻量 Java 方法。
+- **Frida-Gum 后端预留**：可基于同一 KPM 桥接通道，将 Gum `Interceptor` 与 Stalker 代码缓存接入 ghost 内存。
 
-- ~~Vector 的 `inline_hooker → backup` **精确对应** `hwhookto`（HWBP）~~ —— 这是 P5 初期结论，**已被取代**：生产后端是多页 RV-2 **region 克隆（`pghook`/`pghookg`）+ SSOL**，**不是 HWBP**。`hwhookto`/`hookto`（HWBP + 单槽 ghost）从未在生产采用（HWBP 仅入口、hw 槽 ≤~4），现已移到 `SHPTE_POC_LADDER` 编译开关之后（默认关）。`lib/kpmhook.c` 只发 `pghook`/`pghookg`（+ `ssolhook`）—— 已审计。
-- **Layer 1**（LSPlant init 时的 native libart hook）：把 Vector 的 `inline_hooker`/`unhooker` 换成经 syscall bridge 调 KPM。载体是扩到每页多 override、跨多页的 **UXN `pghook`**（RV-2 region 克隆）。L1a–L1e 已完成并**真机应用内实测**：LSPosed 管理器 6 个 libart inline hook 全走 region 克隆、零 Dobby 回退、`.text` 不动。
-- **Layer 2**（Java 方法）：**SSOL** 是稠密框架 JIT 的正确+可扩展路径（region 克隆保留给 L1 native 与简单 app 的 Java hook）。
-- **Frida-Gum**（可选、更大）：用 `hwhookto` 重做 Gum 的 `Interceptor`、用 ghost 内存重做 Stalker 代码缓存；同一 KPM、不同前端。
-
-**剩余 / 未来**：P3.5（`BLRAAZ`/`BRAAZ` PAC 降级）；更多隐藏 hook（进程 `/proc` readdir、端口 `/proc/net/tcp`、线程 `/proc/pid/task`）；ghost VA 钉死防分配器复用、slot 表 RCU 等加固。
+**后续路线**：P3.5（`BLRAAZ`/`BRAAZ` PAC 降级适配）；内核侧隐藏扩展（`/proc` 进程目录遍历过滤、`/proc/net/tcp` 端口隐藏、`/proc/pid/task` 线程隐藏）；ghost 虚拟地址固定以防止分配器冲突。
