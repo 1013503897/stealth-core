@@ -13,7 +13,7 @@ Kernel-level **traceless hooking** engine on Android (ARM64), built on APatch / 
 
 **Related project:** This repository is the kernel and userspace-glue source for the KPM traceless-hook engine integrated into [**Vector**](https://github.com/1013503897/Vector) (a fork of JingMatrix's Zygisk ART-hook framework). Vector vendors `lib/kpmhook` and `lib/dbi` from this repository.
 
-Reference: Conceptually inspired by the kanxue article *Android 内核无痕 Hook 理解和感悟* and `xiaojianbang-stealth-hook`. Independent clean-room implementation against the KernelPatch SDK API and Linux/ARM64 ABIs.
+Reference: Conceptually inspired by the kanxue article [*Android 内核无痕 Hook 理解和感悟*](https://bbs.kanxue.com/thread-290718.htm) and [`xiaojianbang-stealth-hook`](https://github.com/xiaojianbang8888/xiaojianbang-stealth-hook). Independent clean-room implementation against the KernelPatch SDK API and Linux/ARM64 ABIs.
 
 ## Status
 
@@ -211,7 +211,7 @@ Remaining / future:
 
 **关联项目**：本仓为 [**Vector**](https://github.com/1013503897/Vector)（Zygisk ART Hook 框架）无痕 Hook 后端的内核与用户态胶水源头。Vector 直接引入本仓的 `lib/kpmhook` 与 `lib/dbi`，其 `HookInline` **优先走 `kpm_inline_hooker`**（KPM 无痕），桥未就绪时自动退回 Dobby。见下方阶段进度表 **L1b/L1d/L1e** 与《产品化集成》一节。
 
-概念参考：看雪文章《Android 内核无痕 Hook 理解和感悟》与 `xiaojianbang-stealth-hook` 思路。全量代码基于 KernelPatch kpm SDK API 与 Linux/ARM 体系结构独立实现。
+概念参考：看雪文章[《Android 内核无痕 Hook 理解和感悟》](https://bbs.kanxue.com/thread-290718.htm)与 [xiaojianbang-stealth-hook](https://github.com/xiaojianbang8888/xiaojianbang-stealth-hook) 思路。全量代码基于 KernelPatch kpm SDK API 与 Linux/ARM 体系结构独立实现。
 
 ## 检测面与对抗方案
 
