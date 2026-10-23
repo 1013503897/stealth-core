@@ -161,9 +161,24 @@ static void (*fn_user_disable_single_step)(void *task) = 0;
 #define MAX_FSHIDE 64
 #define KSYS_STATFS 43
 #define KSYS_FSTATFS 44
+#define KSYS_EXIT_GROUP 94
+#define KSYS_KILL 129
+#define KSYS_TGKILL 131
+/* arm64 syscall nrs for P3 file-existence hiding (openat/faccessat/faccessat2/newfstatat/statx) */
+#define KSYS_OPENAT 56
+#define KSYS_FACCESSAT 48
+#define KSYS_FACCESSAT2 439
+#define KSYS_NEWFSTATAT 79
+#define KSYS_STATX 291
+#ifndef ENOENT
+#define ENOENT 2
+#endif
 static volatile int g_fshide_on = 0;                    /* master switch (default off) */
 static volatile int g_fs_statfs_on = 1;                 /* P1 sub-switch */
 static volatile int g_fs_mountinfo_on = 1;              /* P2 sub-switch */
+static volatile int g_fs_openhide_on = 1;               /* P3 sub-switch: hide root-file existence */
+static volatile int g_openhide_hooked = 0;
+static volatile long g_openhide_count = 0;              /* open/access/stat calls faked to ENOENT */
 static volatile uint32_t g_fs_spoof_magic = 0xE0F5E1E2; /* EROFS_SUPER_MAGIC_V1; `fshide magic` overrides */
 static int g_fshide_set[MAX_FSHIDE];                    /* hide-set: tgids to spoof for (reader-gate) */
 static volatile int g_fshide_n = 0;
@@ -310,6 +325,15 @@ struct hidereg {
 };
 static struct hidereg g_hide[MAX_HIDE];
 static volatile int g_nhide = 0;
+/* autocloak: per-process (mm) auto-hide of Frida's OWN maps footprint -- the injected
+ * agent's /memfd:, Gum's JIT /memfd:, ART jit-cache /memfd:, and any frida/gum/jvmti/openjdk
+ * .so line. Name-matched on the just-written show_map/show_smap seq line, owner-mm gated, so
+ * it needs no userspace selfCloak sweep and has NO startup / lazy-JIT window. mm is an
+ * equality token only (never dereferenced); cleared per-mm when the process is GC'd. */
+#define MAX_AUTOCLOAK 8
+static void *g_autocloak_mm[MAX_AUTOCLOAK];
+static volatile int g_nautocloak = 0;
+static volatile long g_autocloak_hidden = 0;
 /* TracerPid spoof state (anti-debug / anti-ptrace-detection) */
 static volatile int g_tracer_hooked = 0;
 static volatile long g_tracer_spoofed = 0;
@@ -1308,6 +1332,30 @@ static int vma_owned_by(void *vma, void *mm)
     return 0;
 }
 
+/* freestanding substring scan over the just-written seq line buf[s..e) (no libc strstr). */
+static int buf_has(const char *buf, uint64_t s, uint64_t e, const char *pat)
+{
+    uint64_t pl = 0;
+    while (pat[pl]) pl++;
+    if (e < s || e - s < pl || pl == 0) return 0;
+    for (uint64_t i = s; i + pl <= e; i++) {
+        uint64_t k = 0;
+        for (; k < pl; k++)
+            if (buf[i + k] != pat[k]) break;
+        if (k == pl) return 1;
+    }
+    return 0;
+}
+/* Frida's own footprint on a maps line: any /memfd: mapping (modern Android puts the agent
+ * .so, Gum JIT and ART JIT all in deleted memfds) plus explicit frida/gum/jvmti/openjdk .so
+ * paths -- the exact set the userspace selfCloak matched (kpmhook.c). */
+static int line_has_frida_marker(const char *buf, uint64_t s, uint64_t e)
+{
+    return buf_has(buf, s, e, "/memfd:") || buf_has(buf, s, e, "frida") ||
+           buf_has(buf, s, e, "gum") || buf_has(buf, s, e, "jvmti") ||
+           buf_has(buf, s, e, "openjdk");
+}
+
 /* shared core: returns 1 (and rewinds the seq entry) if `vma` is one of our clones.
  * Gate on the vma's OWNER mm (not the reader): hides the clone whether the host scans
  * its own /proc/self/{maps,smaps} OR an external process scans /proc/<host>/..., while a
@@ -1350,6 +1398,29 @@ static int maps_hide_vma(hook_fargs2_t *fargs)
             if (g_hide[i].mm && !vma_owned_by(vma, g_hide[i].mm)) continue;
             hit = 1;
             break;
+        }
+    }
+    /* autocloak: for an autocloak'd process (owner-mm match), drop any Frida-runtime line
+     * (memfd agent/JIT, gum/jvmti/openjdk). Name-matched on the seq line show_map just wrote,
+     * so lazily-created JIT memfds are hidden live -- no userspace sweep, no startup window.
+     * Owner-mm gate is checked FIRST (cheap) so non-autocloak processes never pay the scan. */
+    if (!hit && g_nautocloak > 0) {
+        int owned = 0;
+        for (int i = 0; i < MAX_AUTOCLOAK; i++) {
+            if (!g_autocloak_mm[i]) continue;
+            if (vma_owned_by(vma, g_autocloak_mm[i])) { owned = 1; break; }
+        }
+        if (owned) {
+            void *m0 = (void *)fargs->arg0;
+            if (seq_layout_ok(m0)) {
+                char *buf = *(char **)((char *)m0 + 0);
+                uint64_t s = fargs->local.data0;
+                uint64_t en = *(volatile uint64_t *)((char *)m0 + SEQ_COUNT_OFF);
+                if (buf && line_has_frida_marker(buf, s, en)) {
+                    hit = 1;
+                    g_autocloak_hidden++;
+                }
+            }
         }
     }
     if (!hit) return 0;
@@ -1398,7 +1469,7 @@ static int ensure_maps_hooked(void)
 }
 static void maybe_unhook_maps(void)
 {
-    if (g_npg != 0 || g_hide_page || g_nhide != 0) return; /* still needed */
+    if (g_npg != 0 || g_hide_page || g_nhide != 0 || g_nautocloak != 0) return; /* still needed */
     if (g_smaps_hooked && g_addr_show_smap) {
         hook_unwrap(g_addr_show_smap, (void *)before_showmap, (void *)after_showsmap);
         g_smaps_hooked = 0;
@@ -1510,6 +1581,247 @@ static void maybe_unhook_sys_statfs(void)
     }
 }
 
+/* ---- P3: root-FILE existence hiding (openat/faccessat/newfstatat/statx), gated readers only ----
+ * The RASP's userspace faccessat/fstatat hooks (Vector) fake ENOENT for /system/bin/su etc., but
+ * openat/statx are NOT hooked in userspace (KPM-cloning the hot __openat page self-crashes Vector's
+ * dex-load) -> Appdome finds /system/bin/su via open()/statx() while access() says ENOENT ->
+ * inconsistency/root detected. Hook the SYSCALLS kernel-side instead: consistent across ALL of the
+ * gated app's file probes, and no libc-page clone -> no self-crash. BEFORE hook: read the path arg
+ * (arg1 for all these; arg0=dirfd), and if it names a root/injection artifact, short-circuit to
+ * -ENOENT so the app sees a clean device. Reader-gated to the hide-set tgids only. */
+static int mem_find(const char *buf, uint64_t start, uint64_t end, const char *pat); /* fwd (defined below) */
+static int path_is_root_artifact(const char *p, int n)
+{
+    if (n <= 0) return 0;
+    if (n >= 3 && p[n - 3] == '/' && p[n - 2] == 's' && p[n - 1] == 'u') return 1; /* .../su */
+    if (n == 2 && p[0] == 's' && p[1] == 'u') return 1;                             /* "su" */
+    return mem_find(p, 0, n, "magisk") || mem_find(p, 0, n, "/data/adb") ||
+           mem_find(p, 0, n, "zygisk") || mem_find(p, 0, n, "supersu") ||
+           mem_find(p, 0, n, "SuperSU") || mem_find(p, 0, n, "/su/bin") ||
+           mem_find(p, 0, n, "apatch") || mem_find(p, 0, n, "kernelsu") ||
+           mem_find(p, 0, n, "/system/xbin/busybox") || mem_find(p, 0, n, "riru") ||
+           mem_find(p, 0, n, "lsposed") || mem_find(p, 0, n, "/debug_ramdisk");
+}
+static void before_openhide(hook_fargs6_t *fargs, void *udata)
+{
+    (void)udata;
+    if (!g_fshide_on || !g_fs_openhide_on) return;
+    if (!fs_caller_gated()) return;                          /* reader-gate: hide-set apps only */
+    uint64_t upath = (uint64_t)syscall_argn(fargs, 1);      /* path = arg1 (dirfd=arg0) */
+    if (!upath || !fn_access_process_vm) return;
+    char buf[272];
+    int got = fn_access_process_vm((void *)get_current(), upath, buf, sizeof(buf) - 1, 0);
+    if (got <= 0) return;
+    if (got > (int)sizeof(buf) - 1) got = (int)sizeof(buf) - 1;
+    buf[got] = 0;
+    int n = 0;
+    while (n < got && buf[n]) n++;                          /* strlen within the copied bytes */
+    if (!path_is_root_artifact(buf, n)) return;
+    fargs->ret = (uint64_t)(-ENOENT);                       /* pretend the file does not exist */
+    fargs->skip_origin = 1;
+    g_openhide_count++;
+}
+static int ensure_openhide_hooked(void)
+{
+    if (g_openhide_hooked) return 0;
+    int ok = 0;
+    if (fp_hook_syscalln(KSYS_OPENAT, 4, (void *)before_openhide, 0, 0) == HOOK_NO_ERR) ok = 1;
+    if (fp_hook_syscalln(KSYS_FACCESSAT, 4, (void *)before_openhide, 0, 0) == HOOK_NO_ERR) ok = 1;
+    if (fp_hook_syscalln(KSYS_FACCESSAT2, 4, (void *)before_openhide, 0, 0) == HOOK_NO_ERR) ok = 1;
+    if (fp_hook_syscalln(KSYS_NEWFSTATAT, 4, (void *)before_openhide, 0, 0) == HOOK_NO_ERR) ok = 1;
+    if (fp_hook_syscalln(KSYS_STATX, 5, (void *)before_openhide, 0, 0) == HOOK_NO_ERR) ok = 1;
+    if (!ok) return -1;
+    g_openhide_hooked = 1;
+    return 0;
+}
+static void maybe_unhook_openhide(void)
+{
+    if (g_fshide_on) return;
+    if (g_openhide_hooked) {
+        fp_unhook_syscalln(KSYS_OPENAT, 0, (void *)before_openhide);
+        fp_unhook_syscalln(KSYS_FACCESSAT, 0, (void *)before_openhide);
+        fp_unhook_syscalln(KSYS_FACCESSAT2, 0, (void *)before_openhide);
+        fp_unhook_syscalln(KSYS_NEWFSTATAT, 0, (void *)before_openhide);
+        fp_unhook_syscalln(KSYS_STATX, 0, (void *)before_openhide);
+        g_openhide_hooked = 0;
+    }
+}
+
+/* ---- exit_group neutralize (no-ptrace suicide kill) --------------------------------------
+ * Appdome's tamper self-exit funnels through libloader's static-libc exit_group stub
+ * (RE: sub_34C274 = syscall(94); reached from sub_44CC30->44ADF0->44C0B8->44C69C). All those
+ * end in the exit_group(94) SYSCALL. We swallow exit_group ONLY for an explicitly-set target
+ * tgid (g_exit_target; 0 = disabled) so the process cannot self-exit -> no ptrace guard needed
+ * -> ART's signal-based implicit checks run natively -> interaction is stable.
+ * SAFETY: gated to one tgid; never touches system processes. Default OFF (g_exit_target=0). */
+static volatile int g_exit_target = 0;   /* tgid to protect; 0 = disabled */
+static int g_exit_hooked = 0;
+static long g_exit_skips = 0;
+static void (*fn_do_exit)(long) = 0;      /* kernel do_exit: terminate ONE thread (not the group) */
+/* Appdome's self-kill funnels through exit_group(94) from a monitor/response THREAD. Merely skipping
+ * it (skip_origin) makes the caller sub_44C69C run its post-exit dead code (sub_44C770) in a corrupt
+ * state -> SIGSEGV (device-confirmed 3 ways). Instead, for the target tgid we do_exit(0) the CALLING
+ * thread only: that thread terminates cleanly (kernel tears it down, never returns to userspace, dead
+ * code never runs), and the PROCESS survives (do_exit != do_group_exit). The BC-SHA monitor mesh keeps
+ * respawning + re-deciding every ~5s; each death-thread just self-terminates. If do_exit is unresolved
+ * we fall back to the old skip (which crashes, but is better than nothing). */
+static void before_exit_group(hook_fargs1_t *fargs, void *udata)
+{
+    (void)udata;
+    int tgt = g_exit_target;
+    if (!tgt || !fn_task_pid_nr_ns) return;
+    if (fn_task_pid_nr_ns((void *)get_current(), PIDTYPE_TGID, 0) != tgt) return;
+    g_exit_skips++;
+    if (fn_do_exit) {
+        fargs->skip_origin = 1;          /* we handle termination ourselves */
+        fn_do_exit(0);                   /* noreturn: kills ONLY this thread; process lives */
+        /* not reached */
+    }
+    fargs->ret = 0;
+    fargs->skip_origin = 1;              /* fallback: swallow (may crash via dead code) */
+}
+/* ---- self-kill(9)/tgkill(6/9) diagnostic+block: is the ~15s SIGKILL an Appdome tamper response
+ * (GCash kill(getpid(),9)/tgkill) that do_exit(exit_group) can't catch, or an external system reap?
+ * For the target tgid, count+block SELF-directed lethal signals. kill_skips>0 => GCash IS self-killing
+ * via kill/tgkill (Appdome kill-9 response) => detection fired even minimal => KP/env root.
+ * SELF = kill(pid==tgid|0|-tgid) or tgkill(tgid_arg==our tgid). Only sig 9(SIGKILL)/6(SIGABRT). */
+static long g_kill_skips = 0;
+static int g_kill_hooked = 0;
+/* UPDATE 2026-09-25: ftrace signal_generate + kprobe __arm64_sys_kill PROVED the clean-state
+ * (injection-free, pure APatch root) ~14s killer is the GCash MAIN THREAD self-calling kill(getpid(),9)
+ * grp=1 via the FRAMEWORK Process.killProcess/Os.kill (lr in boot.oat), NOT exit_group (skips=0) and NOT
+ * tgkill. So we now install before_kill (KSYS_KILL=129) ONLY. The earlier ~228ms regression was from
+ * ALSO hooking before_tgkill (KSYS_TGKILL=131) — tgkill IS the pthread_kill hot path (thread mgmt);
+ * kill(129) is NOT hot (occasional zygote child mgmt), so kill-only + tight tgid gate is safe.
+ * before_tgkill stays DISABLED. */
+static void before_kill(hook_fargs6_t *fargs, void *udata)
+{
+    (void)udata;
+    int tgt = g_exit_target;
+    if (!tgt || !fn_task_pid_nr_ns) return;
+    int tgid = fn_task_pid_nr_ns((void *)get_current(), PIDTYPE_TGID, 0);
+    if (tgid != tgt) return;
+    long kpid = (long)syscall_argn(fargs, 0);
+    long sig = (long)syscall_argn(fargs, 1);
+    if ((sig == 9 || sig == 6) && (kpid == tgid || kpid == 0 || kpid == -tgid)) {
+        g_kill_skips++;
+        fargs->ret = 0;
+        fargs->skip_origin = 1;           /* swallow the self-directed lethal signal */
+    }
+}
+__attribute__((unused))
+static void before_tgkill(hook_fargs6_t *fargs, void *udata)
+{
+    (void)udata;
+    int tgt = g_exit_target;
+    if (!tgt || !fn_task_pid_nr_ns) return;
+    int tgid = fn_task_pid_nr_ns((void *)get_current(), PIDTYPE_TGID, 0);
+    if (tgid != tgt) return;
+    long tgid_arg = (long)syscall_argn(fargs, 0);
+    long sig = (long)syscall_argn(fargs, 2);
+    if ((sig == 9 || sig == 6) && (tgid_arg == tgt || tgid_arg == tgid)) {
+        g_kill_skips++;
+        fargs->ret = 0;
+        fargs->skip_origin = 1;
+    }
+}
+static long do_exittarget(uint64_t pid, char *p, char *e)
+{
+    g_exit_target = (int)pid;
+    if (pid && !g_exit_hooked) {
+        if (fp_hook_syscalln(KSYS_EXIT_GROUP, 1, (void *)before_exit_group, 0, 0) != HOOK_NO_ERR) {
+            g_exit_target = 0;
+            apps(p, e, "error: hook_syscalln(exit_group) failed\n");
+            return -1;
+        }
+        /* before_kill(129) ONLY — catches the proven main-thread self kill(getpid(),9) framework
+         * self-destruct. tgkill(131) stays UNHOOKED (pthread hot path -> earlier regression). Non-fatal
+         * if it fails: exit_group protection is still armed. */
+        if (fp_hook_syscalln(KSYS_KILL, 2, (void *)before_kill, 0, 0) == HOOK_NO_ERR) {
+            g_kill_hooked = 1;
+        }
+        g_exit_hooked = 1;
+    }
+    p = apps(p, e, "ok: exit_group+kill9-skip target tgid=");
+    p = appdec(p, e, g_exit_target);
+    p = apps(p, e, " exitskips=");
+    p = appdec(p, e, g_exit_skips);
+    p = apps(p, e, " killskips=");
+    p = appdec(p, e, g_kill_skips);
+    p = apps(p, e, " killhook=");
+    p = appdec(p, e, g_kill_hooked);
+    apps(p, e, "\n");
+    return 0;
+}
+
+/* ---- mprotect logger: catch the Appdome "function sabotage" writer ----------------------
+ * The sabotage overwrites specific libc/libsqlite function 1st-insns with 0xf8601800; to write
+ * into r-x code the writer must first mprotect(PROT_WRITE). We log every writable mprotect by the
+ * target tgid with the userspace caller (LR) -> maps to the sabotage routine's library+offset.
+ * has_syscall_wrapper: fargs->args[0] IS the struct pt_regs* (same as syscall_args uses). */
+#define KSYS_MPROTECT 226
+#ifndef PROT_WRITE
+#define PROT_WRITE 2
+#endif
+#define MPROT_RING 32
+struct mprot_ev { uint64_t addr, len, prot, pc, lr; };
+static struct mprot_ev g_mprot_ring[MPROT_RING];
+static volatile int g_mprot_head = 0;
+static volatile int g_mprot_target = 0;   /* tgid to log; 0 = off */
+static volatile int g_mprot_hooked = 0;
+static volatile long g_mprot_count = 0;
+static void before_mprotect(hook_fargs6_t *fargs, void *udata)
+{
+    (void)udata;
+    if (!g_mprot_target) return;
+    int tgid = fn_task_pid_nr_ns ? fn_task_pid_nr_ns((void *)get_current(), PIDTYPE_TGID, 0) : 0;
+    if (tgid != g_mprot_target) return;
+    uint64_t prot = (uint64_t)syscall_argn(fargs, 2);
+    if (!(prot & PROT_WRITE)) return;                         /* only writable mprotects */
+    int i = g_mprot_head;
+    g_mprot_head = (i + 1) % MPROT_RING;
+    g_mprot_ring[i].addr = (uint64_t)syscall_argn(fargs, 0);
+    g_mprot_ring[i].len  = (uint64_t)syscall_argn(fargs, 1);
+    g_mprot_ring[i].prot = prot;
+    g_mprot_ring[i].pc = 0; g_mprot_ring[i].lr = 0;
+    if (has_syscall_wrapper) {
+        struct pt_regs *regs = (struct pt_regs *)((hook_fargs0_t *)fargs)->args[0];
+        if (regs) { g_mprot_ring[i].pc = regs->pc; g_mprot_ring[i].lr = regs->regs[30]; }
+    }
+    g_mprot_count++;
+}
+static long do_mproblog(uint64_t pid, char *p, char *e)
+{
+    if (pid) {
+        g_mprot_target = (int)pid;
+        if (!g_mprot_hooked) {
+            if (fp_hook_syscalln(KSYS_MPROTECT, 3, (void *)before_mprotect, 0, 0) != HOOK_NO_ERR) {
+                g_mprot_target = 0;
+                apps(p, e, "error: hook_syscalln(mprotect) failed\n");
+                return -1;
+            }
+            g_mprot_hooked = 1;
+        }
+    }
+    p = apps(p, e, "ok: mproblog target tgid=");
+    p = appdec(p, e, g_mprot_target);
+    p = apps(p, e, " count=");
+    p = appdec(p, e, g_mprot_count);
+    apps(p, e, "\n");
+    /* dump the ring: writable mprotect events with caller LR (the sabotage writer) */
+    for (int k = 0; k < MPROT_RING; k++) {
+        struct mprot_ev *ev = &g_mprot_ring[k];
+        if (!ev->addr && !ev->lr) continue;
+        p = apps(p, e, "  addr=");   p = apphex(p, e, ev->addr);
+        p = apps(p, e, " len=");     p = apphex(p, e, ev->len);
+        p = apps(p, e, " prot=");    p = apphex(p, e, ev->prot);
+        p = apps(p, e, " pc=");      p = apphex(p, e, ev->pc);
+        p = apps(p, e, " lr=");      p = apphex(p, e, ev->lr);
+        apps(p, e, "\n");
+    }
+    return 0;
+}
+
 /* ---- P2: drop overlay/magisk mount lines from /proc/pid/mountinfo + /proc/pid/mounts ----
  * show_mountinfo/show_vfsmnt(seq_file*, void*) are reached via seq_operations->show (an indirect
  * call -> NOT inlined, unlike vfs_statfs), so the maps-hide technique applies verbatim: before
@@ -1535,7 +1847,13 @@ static int mount_line_is_artifact(const char *buf, uint64_t s, uint64_t e)
 {
     return mem_find(buf, s, e, "/data/adb") || mem_find(buf, s, e, "overlay") ||
            mem_find(buf, s, e, "magisk") || mem_find(buf, s, e, "KSU") ||
-           mem_find(buf, s, e, "worker");
+           mem_find(buf, s, e, "worker") ||
+           /* Zygisk module magic-mounts leak the module name + dex2oat override into
+            * /proc/<pid>/mountinfo (RE 2026-09-23: GCash sees "/adb/modules/zygisk_vector/bin/
+            * dex2oat32 -> /apex/.../dex2oat32"). A dex2oat *mount* + "zygisk"/"/adb/modules" appear
+            * only under a module loader on a stock-looking device -> hide them too. */
+           mem_find(buf, s, e, "zygisk") || mem_find(buf, s, e, "/adb/modules") ||
+           mem_find(buf, s, e, "dex2oat");
 }
 static void before_mountinfo(hook_fargs2_t *fargs, void *udata)
 {
@@ -1620,12 +1938,26 @@ static long do_fshide(const char *sub, char *p, char *e)
             apps(p, e, "error: hook show_mountinfo failed\n");
             return -1;
         }
+        if (g_fs_openhide_on && ensure_openhide_hooked() != 0) {
+            apps(p, e, "error: hook openat/faccessat/statx failed\n");
+            return -1;
+        }
         apps(p, e, "ok: fshide on\n");
     } else if (starts(sub, "off")) {
         g_fshide_on = 0;
         maybe_unhook_sys_statfs();
         maybe_unhook_mountinfo();
+        maybe_unhook_openhide();
         apps(p, e, "ok: fshide off\n");
+    } else if (starts(sub, "openhide")) {
+        const char *v = skipsp(sub + 8);
+        g_fs_openhide_on = starts(v, "off") ? 0 : 1;
+        if (g_fshide_on && g_fs_openhide_on) ensure_openhide_hooked();
+        p = apps(p, e, "ok: openhide sub=");
+        p = appdec(p, e, g_fs_openhide_on);
+        p = apps(p, e, " count=");
+        p = appdec(p, e, g_openhide_count);
+        apps(p, e, "\n");
     } else if (starts(sub, "statfs")) {
         const char *v = skipsp(sub + 6);
         g_fs_statfs_on = starts(v, "off") ? 0 : 1;
@@ -1716,6 +2048,7 @@ static void resolve_syms(void)
         fn_apply_existing = (void *)kallsyms_lookup_name("apply_to_existing_page_range");
     if (!fn_task_pid_nr_ns) fn_task_pid_nr_ns = (void *)kallsyms_lookup_name("__task_pid_nr_ns");
     if (!fn_access_process_vm) fn_access_process_vm = (void *)kallsyms_lookup_name("access_process_vm");
+    if (!fn_do_exit) fn_do_exit = (void *)kallsyms_lookup_name("do_exit");
     if (!g_addr_pf) g_addr_pf = (void *)kallsyms_lookup_name("do_page_fault");
     if (!g_addr_show_map) g_addr_show_map = (void *)kallsyms_lookup_name("show_map");
     if (!g_addr_show_smap) g_addr_show_smap = (void *)kallsyms_lookup_name("show_smap");
@@ -2451,6 +2784,82 @@ static long do_unhidetracer(char *p, char *e)
     return 0;
 }
 
+/* autocloak <pid>: mark pid's mm so show_map/show_smap drops every Frida-runtime line
+ * (memfd agent/JIT, gum/jvmti/openjdk) from its /proc/<pid>/{maps,smaps} -- for self-scans
+ * AND external readers, defeating the raw-syscall maps scanner without a userspace sweep.
+ * Replaces (and out-windows) traceless-frida's selfCloak. Auto-cleared when pid dies. */
+static long do_autocloak(uint64_t pid, char *p, char *e)
+{
+    resolve_syms();
+    if (!fn_find_get_task_by_vpid || !fn_get_task_mm || !fn_mmput) {
+        apps(p, e, "error: symbols not resolved\n");
+        return -1;
+    }
+    void *task = fn_find_get_task_by_vpid((int)pid);
+    if (is_err_or_null(task)) {
+        apps(p, e, "error: task not found\n");
+        return -1;
+    }
+    void *mm = fn_get_task_mm(task);
+    if (is_err_or_null(mm)) {
+        put_task(task);
+        apps(p, e, "error: no mm\n");
+        return -1;
+    }
+    fn_mmput(mm); /* pointer used for equality only, never dereferenced */
+    put_task(task);
+    int slot = -1, present = 0;
+    for (int i = 0; i < MAX_AUTOCLOAK; i++) {
+        if (g_autocloak_mm[i] == mm) { present = 1; break; }
+        if (slot < 0 && !g_autocloak_mm[i]) slot = i;
+    }
+    if (!present) {
+        if (slot < 0) {
+            apps(p, e, "error: autocloak-set full\n");
+            return -1;
+        }
+        g_autocloak_mm[slot] = mm;
+        g_nautocloak++;
+    }
+    if (ensure_maps_hooked() != 0) {
+        apps(p, e, "error: show_map hook failed\n");
+        return -1;
+    }
+    p = apps(p, e, present ? "ok: autocloak already on mm=" : "ok: autocloak on mm=");
+    p = apphex(p, e, (uint64_t)mm);
+    p = apps(p, e, " n=");
+    p = appdec(p, e, g_nautocloak);
+    apps(p, e, "\n");
+    return 0;
+}
+static long do_unautocloak(uint64_t pid, char *p, char *e)
+{
+    resolve_syms();
+    void *mm = 0;
+    if (fn_find_get_task_by_vpid && fn_get_task_mm && fn_mmput) {
+        void *task = fn_find_get_task_by_vpid((int)pid);
+        if (!is_err_or_null(task)) {
+            void *m = fn_get_task_mm(task);
+            if (!is_err_or_null(m)) { fn_mmput(m); mm = m; }
+            put_task(task);
+        }
+    }
+    if (mm)
+        for (int i = 0; i < MAX_AUTOCLOAK; i++)
+            if (g_autocloak_mm[i] == mm) {
+                g_autocloak_mm[i] = 0;
+                if (g_nautocloak > 0) g_nautocloak--;
+                break;
+            }
+    maybe_unhook_maps();
+    p = apps(p, e, "ok: autocloak off n=");
+    p = appdec(p, e, g_nautocloak);
+    p = apps(p, e, " hidden=");
+    p = appdec(p, e, g_autocloak_hidden);
+    apps(p, e, "\n");
+    return 0;
+}
+
 static char *decode_pte(char *p, char *e, uint64_t v)
 {
     p = apps(p, e, v & PTE_VALID ? " VALID" : " !VALID");
@@ -2771,6 +3180,13 @@ static int gc_dead_slots_locked(void)
                     g_hide[j].mm = 0;
                     g_hide[j].page = 0;
                     if (g_nhide > 0) g_nhide--;
+                }
+        /* same for the autocloak set (equality-token mm, same reuse hazard) */
+        if (dead_mm)
+            for (int j = 0; j < MAX_AUTOCLOAK; j++)
+                if (g_autocloak_mm[j] == dead_mm) {
+                    g_autocloak_mm[j] = 0;
+                    if (g_nautocloak > 0) g_nautocloak--;
                 }
     }
     if (freed) {
@@ -3861,6 +4277,15 @@ static long shpte_init(const char *args, const char *event, void *__user reserve
         do_bridge(b, b + sizeof(b));
         logki("shpte: auto-bridge armed=%d\n", g_bridge_hooked);
     }
+    /* Auto-arm TracerPid spoof at load too (keyless APatch: no control channel to send
+     * `hidetracer`; APatch Control doesn't reach KPM_CTL0 and the superkey supercall is gone).
+     * Defeats /proc/self/status TracerPid anti-debug (e.g. GCash/Appdome sub_2542B4) so a ptrace
+     * guard/tracer no longer leaks TracerPid. Same safe init-time hook pattern as auto-bridge. */
+    {
+        char b[96];
+        do_hidetracer(b, b + sizeof(b));
+        logki("shpte: auto-hidetracer armed=%d\n", g_tracer_hooked);
+    }
     return 0;
 }
 
@@ -4159,6 +4584,22 @@ static long shpte_run(const char *args, char *buf, int bufcap)
         rc = do_hidetracer(p, e);
     } else if (starts(a, "unhidetracer")) {
         rc = do_unhidetracer(p, e);
+    } else if (starts(a, "exittarget")) {
+        uint64_t pid = 0;
+        parse_ull(a + 10, &pid);
+        rc = do_exittarget(pid, p, e);   /* exittarget <tgid> ; 0 = disable */
+    } else if (starts(a, "mproblog")) {
+        uint64_t pid = 0;
+        parse_ull(a + 8, &pid);
+        rc = do_mproblog(pid, p, e);     /* mproblog <tgid> arm+dump ; mproblog 0 just dump */
+    } else if (starts(a, "unautocloak")) {
+        uint64_t pid = 0;
+        parse_ull(a + 11, &pid);
+        rc = do_unautocloak(pid, p, e);
+    } else if (starts(a, "autocloak")) {
+        uint64_t pid = 0;
+        parse_ull(a + 9, &pid);
+        rc = do_autocloak(pid, p, e);
 #ifdef SHPTE_POC_LADDER
     } else if (starts(a, "ghostredirect")) {
         uint64_t pid = 0, fn = 0, gva = 0, cb = 0, nc = 0, mp = 0, ni = 0, tv = 0;
